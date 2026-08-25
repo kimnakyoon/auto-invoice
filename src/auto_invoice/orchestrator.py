@@ -16,7 +16,7 @@ from . import rate_limit
 from .config import load_settings
 from .report import RunReport
 from .shopmine import excel_io
-from .suppliers.base import AdapterError, TrackingNotAvailableYet
+from .suppliers.base import AdapterError, BlockedError, TrackingNotAvailableYet
 from .suppliers.registry import get_adapter
 
 ProgressCallback = Callable[[int, int, str, str], None]
@@ -42,6 +42,9 @@ def run(
 
     with sync_playwright() as p:
         supplier_contexts: dict[str, tuple] = {}
+        # 로그인 자체가 막힌 사이트는 주문마다 몇 분씩 다시 로그인 대기를
+        # 반복하지 않도록, 한 번 막히면 이후 주문은 바로 스킵한다.
+        blocked_sites: dict[str, str] = {}
 
         for i, order in enumerate(orders, start=1):
             message = ""
@@ -53,6 +56,11 @@ def run(
                     continue
 
                 site_key = adapter.SITE_KEY
+                if site_key in blocked_sites:
+                    message = f"건너뜀: {blocked_sites[site_key]}"
+                    report.skip(order.order_id, message)
+                    continue
+
                 if site_key not in supplier_contexts:
                     supplier_contexts[site_key] = browser_mod.get_context(p, site_key, headless=headless)
                 _, supplier_context = supplier_contexts[site_key]
@@ -63,6 +71,9 @@ def run(
                     message = "아직 송장번호 미발급 - 건너뜀"
                     report.skip(order.order_id, "아직 송장번호 미발급")
                     continue
+                except BlockedError as e:
+                    blocked_sites[site_key] = str(e)
+                    raise
 
                 upload_rows.append((order.order_id, result.tracking_no, result.courier))
                 report.success(order.order_id, result.courier, result.tracking_no)

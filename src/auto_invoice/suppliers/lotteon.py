@@ -33,6 +33,8 @@ SITE_KEY = "lotteon"
 
 DEFAULT_COURIER = "롯데택배"  # 화면에서 택배사명을 못 읽었을 때만 쓰는 기본값
 
+LOGIN_WAIT_TIMEOUT_MS = 5 * 60 * 1000  # 로그인 대기 최대 5분
+
 # 배송정보 상세를 여는 버튼 텍스트들 (실제 확인된 텍스트: "배송상세조회")
 TRACKING_BUTTON_TEXTS = ["배송상세조회", "배송조회", "배송 조회", "송장조회", "배송추적"]
 
@@ -76,6 +78,29 @@ def _prefill_login_id(page) -> None:
         locator.fill(lotteon_id)
     except Exception:
         pass
+
+
+def _safe_print(message: str) -> None:
+    """GUI(pythonw)로 실행하면 콘솔이 없어 stdout이 없을 수 있다 - 그 경우 조용히 무시한다."""
+    try:
+        print(message)
+    except Exception:
+        pass
+
+
+def _wait_for_manual_login(page) -> bool:
+    """비밀번호 입력창이 사라질 때까지(=로그인 완료) 화면 상태를 폴링하며 대기한다.
+
+    GUI(pythonw)로 실행할 때는 콘솔이 없어 input()으로 "로그인 후 Enter"를
+    받을 수 없다 (stdin이 없어 예외가 나거나 그대로 멈춘다). 그래서 사람이
+    직접 로그인 버튼을 눌러 페이지가 바뀌는 것을 감지하는 방식으로 바꿨다.
+    """
+    elapsed_ms = 0
+    while elapsed_ms < LOGIN_WAIT_TIMEOUT_MS:
+        if not _looks_like_login_page(page):
+            return True
+        elapsed_ms += 1500  # _looks_like_login_page 내부에서 1500ms 대기함
+    return False
 
 
 def _click_tracking_button(page) -> None:
@@ -129,9 +154,10 @@ def get_tracking(context: BrowserContext, product_url: str, headless: bool = Tru
                     "롯데온 로그인이 필요합니다. 먼저 --headless 없이 실행해 수동으로 로그인해주세요."
                 )
             _prefill_login_id(page)
-            print("[lotteon] 아이디는 자동으로 입력했습니다. 비밀번호만 입력하고 로그인해주세요.")
-            print("[lotteon] 완료되면 이 터미널에서 Enter를 누르세요.")
-            input()
+            _safe_print("[lotteon] 아이디는 자동으로 입력했습니다. 뜬 브라우저 창에서 비밀번호를 입력하고 로그인해주세요.")
+            _safe_print("[lotteon] 로그인이 완료되면 자동으로 이어서 진행합니다 (최대 5분 대기).")
+            if not _wait_for_manual_login(page):
+                raise BlockedError("로그인 대기 시간(5분)이 지났습니다. 로그인 후 다시 실행해주세요.")
             page.goto(product_url, wait_until="domcontentloaded")
             if _looks_like_login_page(page):
                 raise BlockedError("로그인 후에도 여전히 로그인 페이지입니다.")

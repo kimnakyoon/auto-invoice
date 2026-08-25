@@ -3,9 +3,9 @@
 실행:
     python scripts/test_lotteon_adapter.py
 
-최초 실행 시 브라우저 창이 뜨면 직접 롯데온에 로그인한 뒤 터미널에서 Enter를
-누르세요. 로그인 세션은 auth/lotteon_state.json 에 저장되어 다음 실행부터는
-다시 로그인하지 않아도 됩니다.
+최초 실행 시 브라우저 창이 뜨면 직접 롯데온에 로그인하세요. 로그인이 완료되면
+자동으로 감지해서 이어서 진행합니다. 로그인 세션은 auth/lotteon_state.json 에
+저장되어 다음 실행부터는 다시 로그인하지 않아도 됩니다.
 """
 
 import sys
