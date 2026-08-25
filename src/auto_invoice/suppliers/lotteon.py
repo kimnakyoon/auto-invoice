@@ -14,13 +14,19 @@
 
 from __future__ import annotations
 
+import os
 import re
 from urllib.parse import parse_qs, urlparse
 
+from dotenv import load_dotenv
 from playwright.sync_api import BrowserContext
 
 from ..models import TrackingResult
 from .base import BlockedError, ParseError, TrackingNotAvailableYet
+
+load_dotenv()
+
+LOGIN_ID_SELECTOR = "#inId"
 
 DOMAINS = {"lotteon.com", "www.lotteon.com"}
 SITE_KEY = "lotteon"
@@ -56,6 +62,20 @@ def _looks_like_login_page(page) -> bool:
     if "login" not in page.url.lower():
         return False
     return page.locator("input[type='password']").count() > 0
+
+
+def _prefill_login_id(page) -> None:
+    """비밀번호는 절대 자동 입력하지 않는다 - 아이디만 채워서 타이핑을 줄인다."""
+    lotteon_id = os.environ.get("LOTTEON_ID")
+    if not lotteon_id:
+        return
+    locator = page.locator(LOGIN_ID_SELECTOR)
+    if locator.count() == 0:
+        return
+    try:
+        locator.fill(lotteon_id)
+    except Exception:
+        pass
 
 
 def _click_tracking_button(page) -> None:
@@ -108,7 +128,9 @@ def get_tracking(context: BrowserContext, product_url: str, headless: bool = Tru
                 raise BlockedError(
                     "롯데온 로그인이 필요합니다. 먼저 --headless 없이 실행해 수동으로 로그인해주세요."
                 )
-            print("[lotteon] 브라우저 창에서 직접 로그인해주세요. 완료되면 이 터미널에서 Enter를 누르세요.")
+            _prefill_login_id(page)
+            print("[lotteon] 아이디는 자동으로 입력했습니다. 비밀번호만 입력하고 로그인해주세요.")
+            print("[lotteon] 완료되면 이 터미널에서 Enter를 누르세요.")
             input()
             page.goto(product_url, wait_until="domcontentloaded")
             if _looks_like_login_page(page):
