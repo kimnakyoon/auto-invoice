@@ -1,0 +1,50 @@
+import argparse
+import sys
+from datetime import date
+from pathlib import Path
+
+if sys.platform == "win32":
+    sys.stdout.reconfigure(encoding="utf-8")
+    sys.stderr.reconfigure(encoding="utf-8")
+
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
+
+from auto_invoice.orchestrator import run  # noqa: E402
+
+
+def default_output_path() -> str:
+    filename = f"송장자동화_{date.today():%Y%m%d}.csv"
+    return str(Path.home() / "Desktop" / filename)
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(
+        description="샵마인 '발송대상' 엑셀을 읽어 공급사 송장번호를 조회하고, "
+        "'발송정보일괄등록(수정용)' 형식의 엑셀을 생성합니다."
+    )
+    parser.add_argument("--input", required=True, help="샵마인 [주문관리 > 발송대상 > 엑셀파일생성]으로 받은 엑셀 경로")
+    parser.add_argument(
+        "--output",
+        default=None,
+        help="생성할 업로드용 CSV 경로 (기본: 바탕화면\\송장자동화_YYYYMMDD.csv)",
+    )
+    parser.add_argument("--limit", type=int, default=None, help="한 번에 처리할 주문 수 제한")
+    parser.add_argument(
+        "--headless", action="store_true", help="브라우저 창 없이 실행합니다. 최초 로그인 이후에만 사용하세요."
+    )
+    args = parser.parse_args()
+    output_path = args.output or default_output_path()
+
+    report = run(args.input, output_path, limit=args.limit, headless=args.headless)
+
+    counts = report.summary()
+    print(f"완료: 성공 {counts['success']} / 실패 {counts['fail']} / 스킵 {counts['skip']}")
+    report_path = report.save()
+    print(f"상세 리포트: {report_path}")
+    if counts["success"] > 0:
+        print(f"업로드용 파일: {output_path}")
+        print("이 파일을 검토한 뒤 샵마인 [발송정보일괄등록(수정용)]으로 직접 업로드해주세요.")
+
+
+if __name__ == "__main__":
+    main()
