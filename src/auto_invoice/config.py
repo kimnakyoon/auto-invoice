@@ -12,6 +12,8 @@ class Settings:
     delay_max: float
     lotteon_id: str | None
     gmarket_id: str | None
+    ssg_id: str | None
+    ssg_pw: str | None
 
 
 def load_settings() -> Settings:
@@ -20,4 +22,6 @@ def load_settings() -> Settings:
         delay_max=float(os.environ.get("AUTO_INVOICE_DELAY_MAX", "4.0")),
         lotteon_id=os.environ.get("LOTTEON_ID"),
         gmarket_id=os.environ.get("GMARKET_ID"),
+        ssg_id=os.environ.get("SSG_ID"),
+        ssg_pw=os.environ.get("SSG_PW"),
     )

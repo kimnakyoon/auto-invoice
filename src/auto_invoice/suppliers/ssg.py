@@ -1,0 +1,157 @@
+"""SSG.COM 공급사 어댑터.
+
+리버스엔지니어링 결과:
+- 주문상세 URL: https://pay.ssg.com/myssg/orderInfoDetail.ssg?orordNo=<주문번호(하이픈 제거)>
+- 롯데온/지마켓과 달리 "배송조회" 버튼을 누를 필요가 없다 - "배송상세현황
+  보기" 바로 다음 줄에 "택배사 / 송장번호 상태문구" 형태로 이미 렌더링되어
+  있다 (예: "CJ대한통운 / 585642147431 배송완료"). 상태문구는 배송중/
+  배송출발/배송완료 등 여러 값이 나올 수 있어(처음엔 배송중·배송완료만
+  보고 정규식에 그 둘만 하드코딩했다가 배송출발 상태인 주문을 전부
+  "미발급"으로 잘못 스킵한 적이 있다) 상태문구 자체는 매칭하지 않고
+  "택배사 / 숫자" 패턴만 본다. 아직 발송 전이면 이 자리에 "판매자에게
+  주문이 전달되었습니다." 같은 상태 문구만 있고 송장 패턴이 없다.
+- 로그인이 풀려 있으면 이 URL이 그대로 member.ssg.com/member/login.ssg로
+  리다이렉트되고, 로그인 폼은 롯데온/지마켓처럼 팝업이 아니라 같은 탭에 뜬다.
+  로그인 성공 시 로그인 폼의 retURL 파라미터로 원래 페이지로 자동
+  복귀하는 것까지 확인했다.
+- 사용자가 SSG는 쿠키(storage_state) 기반 자동 로그인에 더해, 세션이
+  끊겼을 때도 사람 개입 없이 완전 자동으로 재로그인되길 원했다 (요청 사항).
+  롯데온/지마켓은 보안상 비밀번호를 절대 자동 입력하지 않도록 만들었지만,
+  SSG는 명시적으로 요청받아 SSG_ID/SSG_PW 환경변수로 완전 자동 로그인한다.
+  두 사이트와 다른 이 사이트만의 예외이니 다른 어댑터에 이 패턴을
+  그대로 옮기지 말 것.
+"""
+
+from __future__ import annotations
+
+import os
+import re
+from urllib.parse import parse_qs, urlparse
+
+from dotenv import load_dotenv
+from playwright.sync_api import BrowserContext
+
+from ..models import TrackingResult
+from .base import BlockedError, ParseError, TrackingNotAvailableYet
+
+load_dotenv()
+
+LOGIN_ID_SELECTOR = "#mem_id"
+LOGIN_PW_SELECTOR = "#mem_pw"
+
+DOMAINS = {"ssg.com", "www.ssg.com", "pay.ssg.com"}
+SITE_KEY = "ssg"
+
+LOGIN_WAIT_TIMEOUT_MS = 30 * 1000  # 자동 로그인 후 리다이렉트 대기 최대 30초
+
+TRACKING_ANCHOR = "배송상세현황 보기"
+TRACKING_LINE_PATTERN = re.compile(r"([가-힣A-Za-z]{2,10})\s*/\s*([0-9][0-9\-]{7,})")
+NOT_YET_PATTERNS = [
+    "전달되었습니다",
+    "시작하였습니다",
+    "시작되었습니다",
+    "결제완료",
+    "상품준비중",
+    "배송준비중",
+]
+
+# CJ대한통운은 화면에 "대한통운"으로 짧게 나오는 경우가 많아, 정식 명칭으로
+# 맞춰 넣는다 (지마켓 어댑터와 동일한 정규화 규칙).
+COURIER_NORMALIZATION = [
+    ("대한통운", "CJ대한통운"),
+    ("CJ", "CJ대한통운"),
+    ("롯데", "롯데택배"),
+]
+
+
+def _normalize_courier(raw: str) -> str:
+    for keyword, canonical in COURIER_NORMALIZATION:
+        if keyword in raw:
+            return canonical
+    return raw
+
+
+def extract_order_no(product_url: str) -> str:
+    parsed = urlparse(product_url)
+    qs = parse_qs(parsed.query)
+    values = qs.get("orordNo")
+    if not values:
+        raise ParseError(f"URL에서 orordNo 파라미터를 찾을 수 없습니다: {product_url}")
+    return values[0]
+
+
+def _looks_like_login_page(page) -> bool:
+    page.wait_for_timeout(1500)
+    if "member.ssg.com" not in page.url and "login" not in page.url.lower():
+        return False
+    return page.locator("input[type='password']").count() > 0
+
+
+def _safe_print(message: str) -> None:
+    """GUI(pythonw)로 실행하면 콘솔이 없어 stdout이 없을 수 있다 - 그 경우 조용히 무시한다."""
+    try:
+        print(message)
+    except Exception:
+        pass
+
+
+def _auto_login(page) -> bool:
+    """SSG_ID/SSG_PW로 완전 자동 로그인한다 (사용자 명시 요청 - 다른 사이트와 다름)."""
+    ssg_id = os.environ.get("SSG_ID")
+    ssg_pw = os.environ.get("SSG_PW")
+    if not ssg_id or not ssg_pw:
+        raise BlockedError(
+            "SSG 로그인이 필요하지만 SSG_ID/SSG_PW 환경변수가 설정되어 있지 않습니다. .env에 추가해주세요."
+        )
+
+    page.fill(LOGIN_ID_SELECTOR, ssg_id)
+    page.fill(LOGIN_PW_SELECTOR, ssg_pw)
+    page.get_by_role("button", name="로그인", exact=True).first.click()
+
+    elapsed_ms = 0
+    while elapsed_ms < LOGIN_WAIT_TIMEOUT_MS:
+        if not _looks_like_login_page(page):
+            return True
+        elapsed_ms += 1500  # _looks_like_login_page 내부에서 1500ms 대기함
+    return False
+
+
+def _scrape_tracking_from_page(page, order_no: str) -> TrackingResult:
+    body_text = page.inner_text("body")
+
+    # "택배사 / 숫자" 패턴이 본문 다른 곳(사업자번호 등)에서도 우연히 매칭될
+    # 가능성을 줄이기 위해 "배송상세현황 보기" 바로 뒤 구간만 본다.
+    anchor_idx = body_text.find(TRACKING_ANCHOR)
+    window = body_text[anchor_idx : anchor_idx + 120] if anchor_idx >= 0 else body_text
+
+    tracking_match = TRACKING_LINE_PATTERN.search(window)
+    if not tracking_match:
+        if any(p in window for p in NOT_YET_PATTERNS):
+            raise TrackingNotAvailableYet(f"아직 송장번호가 발급되지 않았습니다 (orordNo={order_no}).")
+        raise ParseError(f"화면에서 송장번호 텍스트를 찾지 못했습니다 (orordNo={order_no}).")
+
+    courier = _normalize_courier(tracking_match.group(1).strip())
+    tracking_no = re.sub(r"[^0-9]", "", tracking_match.group(2))
+
+    return TrackingResult(tracking_no=tracking_no, courier=courier)
+
+
+def get_tracking(context: BrowserContext, product_url: str, headless: bool = True) -> TrackingResult:
+    order_no = extract_order_no(product_url)
+    page = context.new_page()
+    try:
+        page.goto(product_url, wait_until="domcontentloaded")
+
+        if _looks_like_login_page(page):
+            _safe_print("[ssg] 로그인 세션이 없어 자동 로그인을 시도합니다.")
+            if not _auto_login(page):
+                raise BlockedError("SSG 자동 로그인 후에도 로그인 페이지에서 벗어나지 못했습니다.")
+            if _looks_like_login_page(page):
+                raise BlockedError("SSG 로그인 후에도 여전히 로그인 페이지입니다.")
+            page.goto(product_url, wait_until="domcontentloaded")
+            if _looks_like_login_page(page):
+                raise BlockedError("SSG 로그인 후에도 여전히 로그인 페이지입니다.")
+
+        return _scrape_tracking_from_page(page, order_no)
+    finally:
+        page.close()
