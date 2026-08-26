@@ -14,6 +14,7 @@ class Settings:
     gmarket_id: str | None
     ssg_id: str | None
     ssg_pw: str | None
+    fashionplus_id: str | None
 
 
 def load_settings() -> Settings:
@@ -24,4 +25,5 @@ def load_settings() -> Settings:
         gmarket_id=os.environ.get("GMARKET_ID"),
         ssg_id=os.environ.get("SSG_ID"),
         ssg_pw=os.environ.get("SSG_PW"),
+        fashionplus_id=os.environ.get("FASHIONPLUS_ID"),
     )

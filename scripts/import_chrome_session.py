@@ -55,6 +55,10 @@ SITES = {
         "domains": ["ssg.com"],
         "check_url": "https://member.ssg.com/",
     },
+    "fashionplus": {
+        "domains": ["fashionplus.co.kr"],
+        "check_url": "https://www.fashionplus.co.kr/mypage",
+    },
 }
 NAVER_DOMAINS = ["naver.com"]
 NAVER_CHECK_URL = "https://new.pay.naver.com/home/my"
