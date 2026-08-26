@@ -66,7 +66,9 @@ def run(
                 _, supplier_context = supplier_contexts[site_key]
 
                 try:
-                    result = adapter.get_tracking(supplier_context, order.product_url, headless=headless)
+                    result = adapter.get_tracking(
+                        supplier_context, order.product_url, headless=headless, order_option=order.order_option
+                    )
                 except TrackingNotAvailableYet:
                     message = "아직 송장번호 미발급 - 건너뜀"
                     report.skip(order.order_id, "아직 송장번호 미발급")
@@ -81,10 +83,14 @@ def run(
 
             except AdapterError as e:
                 message = f"실패: {e}"
-                report.fail(order.order_id, str(e))
+                if order.recipient_name:
+                    message += f" (수령인: {order.recipient_name})"
+                report.fail(order.order_id, str(e), recipient_name=order.recipient_name)
             except Exception as e:  # noqa: BLE001 - 배치 전체가 죽지 않도록 광범위하게 잡는다
                 message = f"예상치 못한 오류: {e}"
-                report.fail(order.order_id, message)
+                if order.recipient_name:
+                    message += f" (수령인: {order.recipient_name})"
+                report.fail(order.order_id, message, recipient_name=order.recipient_name)
             finally:
                 if on_progress is not None:
                     on_progress(i, total, order.order_id, message)

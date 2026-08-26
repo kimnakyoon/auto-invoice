@@ -41,7 +41,7 @@ from playwright.sync_api import BrowserContext
 
 from .. import browser as browser_mod
 from ..models import TrackingResult
-from .base import BlockedError, OrderNotFound, ParseError, TrackingNotAvailableYet
+from .base import BlockedError, OrderNotFound, ParseError, TrackingNotAvailableYet, normalize_option
 
 load_dotenv()
 
@@ -173,7 +173,29 @@ def _ensure_logged_in(page, headless: bool, naver_id_env: str, account_label: st
     return True
 
 
-def _scrape_tracking_from_page(page, order_no: str) -> TrackingResult:
+def _select_by_order_option(body_text: str, matches: list, order_option: str | None):
+    """샵마인 엑셀의 "주문옵션" 값이 어느 송장번호 근처(보통 상품명/옵션은
+    송장번호보다 앞에 나온다) 텍스트에만 유일하게 나타나면 그 매치를 쓴다.
+    0개(표기가 안 맞음) 또는 2개 이상(애매함) 매칭되면 None - 호출자가
+    기존 방식(사람 확인 요청)으로 넘어간다."""
+    if len(matches) <= 1 or not order_option:
+        return None
+    target = normalize_option(order_option)
+    if not target:
+        return None
+    candidates = []
+    prev_end = 0
+    for m in matches:
+        # window 시작을 이전 매치 끝 이후로 묶어서, 앞 상품의 옵션 텍스트가
+        # 다음 상품 판단에 섞여 들어가지(bleed) 않게 한다.
+        window = body_text[max(prev_end, m.start() - 400) : m.start()]
+        if target in normalize_option(window):
+            candidates.append(m)
+        prev_end = m.end()
+    return candidates[0] if len(candidates) == 1 else None
+
+
+def _scrape_tracking_from_page(page, order_no: str, order_option: str | None = None) -> TrackingResult:
     button = page.get_by_text(TRACK_BUTTON_TEXT, exact=True)
     if button.count() == 0:
         body_text = page.inner_text("body")
@@ -188,12 +210,21 @@ def _scrape_tracking_from_page(page, order_no: str) -> TrackingResult:
     page.wait_for_timeout(2000)
 
     body_text = page.inner_text("body")
-    match = COURIER_TRACKING_PATTERN.search(body_text)
-    if not match:
+    matches = list(COURIER_TRACKING_PATTERN.finditer(body_text))
+    if not matches:
         if any(p in body_text for p in NOT_YET_PATTERNS):
             raise TrackingNotAvailableYet(f"아직 송장번호가 발급되지 않았습니다 (주문번호={order_no}).")
         raise ParseError(f"화면에서 송장번호 텍스트를 찾지 못했습니다 (주문번호={order_no}).")
 
+    distinct_tracking_nos = {re.sub(r"[^0-9]", "", m.group(2)) for m in matches}
+    match = _select_by_order_option(body_text, matches, order_option)
+    if match is None:
+        if len(distinct_tracking_nos) > 1:
+            # 한 주문이 상품별로 나눠 배송되어 서로 다른 송장번호가 여러 개
+            # 보이는 경우다 - 어느 걸 써야 하는지 확신할 수 없어 사람이
+            # 확인하게 한다 (무신사 어댑터와 동일한 안전 규칙).
+            raise ParseError(f"한 주문에 서로 다른 송장번호가 여러 개 있습니다 (주문번호={order_no}) - 상품별로 나눠 배송된 것으로 보입니다.")
+        match = matches[0]
     courier = _normalize_courier(match.group(1).strip())
     tracking_no = re.sub(r"[^0-9]", "", match.group(2))
 
@@ -201,7 +232,12 @@ def _scrape_tracking_from_page(page, order_no: str) -> TrackingResult:
 
 
 def _get_tracking_from_account(
-    context: BrowserContext, order_no: str, headless: bool, naver_id_env: str, account_label: str
+    context: BrowserContext,
+    order_no: str,
+    headless: bool,
+    naver_id_env: str,
+    account_label: str,
+    order_option: str | None,
 ) -> TrackingResult:
     page = context.new_page()
     try:
@@ -222,18 +258,20 @@ def _get_tracking_from_account(
         if _redirected_away(page):
             raise OrderNotFound(f"이 계정({account_label})에서 주문을 찾을 수 없습니다 (주문번호={order_no}).")
 
-        return _scrape_tracking_from_page(page, order_no)
+        return _scrape_tracking_from_page(page, order_no, order_option)
     finally:
         page.close()
 
 
-def get_tracking(context: BrowserContext, product_url: str, headless: bool = True) -> TrackingResult:
+def get_tracking(
+    context: BrowserContext, product_url: str, headless: bool = True, order_option: str | None = None
+) -> TrackingResult:
     order_no = extract_order_no(product_url)
 
     try:
-        return _get_tracking_from_account(context, order_no, headless, "NAVER_ID", "1")
+        return _get_tracking_from_account(context, order_no, headless, "NAVER_ID", "1", order_option)
     except OrderNotFound:
         pass
 
     second_context = _get_second_context(context, headless)
-    return _get_tracking_from_account(second_context, order_no, headless, "NAVER_ID2", "2")
+    return _get_tracking_from_account(second_context, order_no, headless, "NAVER_ID2", "2", order_option)

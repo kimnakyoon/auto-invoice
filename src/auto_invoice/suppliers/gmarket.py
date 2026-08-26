@@ -25,7 +25,7 @@ from dotenv import load_dotenv
 from playwright.sync_api import BrowserContext
 
 from ..models import TrackingResult
-from .base import BlockedError, ParseError, TrackingNotAvailableYet
+from .base import BlockedError, ParseError, TrackingNotAvailableYet, normalize_option
 
 load_dotenv()
 
@@ -154,7 +154,29 @@ def _read_tracking_frame_text(page) -> str:
     return ""
 
 
-def _scrape_tracking_from_page(page, order_id: str) -> TrackingResult:
+def _select_by_order_option(lines: list[str], matched_line_indices: list[int], order_option: str | None):
+    """샵마인 엑셀의 "주문옵션" 값이 어느 송장번호 줄 근처(보통 상품명/옵션은
+    송장번호 줄보다 앞에 나온다)에만 유일하게 나타나면 그 인덱스를 쓴다.
+    0개(표기가 안 맞음) 또는 2개 이상(애매함) 매칭되면 None - 호출자가
+    기존 방식(사람 확인 요청)으로 넘어간다."""
+    if len(matched_line_indices) <= 1 or not order_option:
+        return None
+    target = normalize_option(order_option)
+    if not target:
+        return None
+    candidates = []
+    prev_idx = -1
+    for idx in matched_line_indices:
+        # window 시작을 이전 매치 줄 이후로 묶어서, 앞 상품의 옵션 텍스트가
+        # 다음 상품 판단에 섞여 들어가지(bleed) 않게 한다.
+        window = "\n".join(lines[max(prev_idx + 1, idx - 15) : idx])
+        if target in normalize_option(window):
+            candidates.append(idx)
+        prev_idx = idx
+    return candidates[0] if len(candidates) == 1 else None
+
+
+def _scrape_tracking_from_page(page, order_id: str, order_option: str | None = None) -> TrackingResult:
     clicked = _click_tracking_button(page)
     if not clicked:
         body_text = page.inner_text("body")
@@ -166,24 +188,38 @@ def _scrape_tracking_from_page(page, order_id: str) -> TrackingResult:
     if not frame_text:
         raise ParseError(f"배송조회 모달(iframe)에서 내용을 읽지 못했습니다 (orderId={order_id}).")
 
-    tracking_match = None
-    for line in frame_text.splitlines():
+    lines = frame_text.splitlines()
+    tracking_matches: dict[int, re.Match] = {}
+    for idx, line in enumerate(lines):
         m = TRACKING_LINE_PATTERN.search(line.strip())
         if m:
-            tracking_match = m
+            tracking_matches[idx] = m
 
-    if not tracking_match:
+    if not tracking_matches:
         if any(p in frame_text for p in NOT_YET_PATTERNS):
             raise TrackingNotAvailableYet(f"아직 송장번호가 발급되지 않았습니다 (orderId={order_id}).")
         raise ParseError(f"모달에서 송장번호 텍스트를 찾지 못했습니다 (orderId={order_id}).")
 
+    distinct_tracking_nos = {re.sub(r"[^0-9]", "", m.group(2)) for m in tracking_matches.values()}
+    matched_idx = _select_by_order_option(lines, list(tracking_matches.keys()), order_option)
+    if matched_idx is None:
+        if len(distinct_tracking_nos) > 1:
+            # 한 주문이 상품별로 나눠 배송되어 서로 다른 송장번호가 여러 개
+            # 보이는 경우다 - 어느 걸 써야 하는지 확신할 수 없어 사람이
+            # 확인하게 한다 (무신사 어댑터와 동일한 안전 규칙).
+            raise ParseError(f"한 주문에 서로 다른 송장번호가 여러 개 있습니다 (orderId={order_id}) - 상품별로 나눠 배송된 것으로 보입니다.")
+        matched_idx = max(tracking_matches)  # 기존 동작(마지막 매치) 유지
+
+    tracking_match = tracking_matches[matched_idx]
     courier = _normalize_courier(tracking_match.group(1).strip() or DEFAULT_COURIER)
     tracking_no = re.sub(r"[^0-9]", "", tracking_match.group(2))
 
     return TrackingResult(tracking_no=tracking_no, courier=courier)
 
 
-def get_tracking(context: BrowserContext, product_url: str, headless: bool = True) -> TrackingResult:
+def get_tracking(
+    context: BrowserContext, product_url: str, headless: bool = True, order_option: str | None = None
+) -> TrackingResult:
     order_id = extract_order_id(product_url)
     page = context.new_page()
     try:
@@ -213,6 +249,6 @@ def get_tracking(context: BrowserContext, product_url: str, headless: bool = Tru
             if _looks_like_login_page(page):
                 raise BlockedError("로그인 후에도 여전히 로그인 페이지입니다.")
 
-        return _scrape_tracking_from_page(page, order_id)
+        return _scrape_tracking_from_page(page, order_id, order_option)
     finally:
         page.close()

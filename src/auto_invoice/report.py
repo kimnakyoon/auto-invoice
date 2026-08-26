@@ -12,7 +12,10 @@ LOG_DIR = Path("logs")
 class RunReport:
     """한 번의 실행 결과(성공/실패/스킵)를 모아 리포트 파일로 저장한다.
 
-    개인정보(고객명/주소/전화번호 등)는 절대 기록하지 않는다.
+    개인정보(고객명/주소/전화번호 등)는 원칙적으로 기록하지 않는다. 유일한
+    예외는 실패 건의 수령인 이름이다 - 사람이 샵마인에서 그 주문을 직접 찾아
+    확인해야 하는데, 마켓 주문번호만으로는 찾기 번거롭다는 요청이 있어
+    fail()에 한해서만 남긴다 (success/skip에는 남기지 않는다).
     """
 
     def __init__(self) -> None:
@@ -23,8 +26,10 @@ class RunReport:
             ReportEntry(order_id=order_id, status="success", courier=courier, tracking_no=tracking_no)
         )
 
-    def fail(self, order_id: str, reason: str) -> None:
-        self.entries.append(ReportEntry(order_id=order_id, status="fail", reason=reason))
+    def fail(self, order_id: str, reason: str, recipient_name: str | None = None) -> None:
+        self.entries.append(
+            ReportEntry(order_id=order_id, status="fail", reason=reason, recipient_name=recipient_name or None)
+        )
 
     def skip(self, order_id: str, reason: str) -> None:
         self.entries.append(ReportEntry(order_id=order_id, status="skip", reason=reason))

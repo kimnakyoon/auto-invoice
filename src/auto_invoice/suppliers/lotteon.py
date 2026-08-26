@@ -22,7 +22,7 @@ from dotenv import load_dotenv
 from playwright.sync_api import BrowserContext
 
 from ..models import TrackingResult
-from .base import BlockedError, ParseError, TrackingNotAvailableYet
+from .base import BlockedError, ParseError, TrackingNotAvailableYet, normalize_option
 
 load_dotenv()
 
@@ -118,17 +118,48 @@ def _click_tracking_button(page) -> None:
     # 페이지에 바로 송장번호가 보이는 경우가 있어, 아래 텍스트 스캔에 맡긴다.
 
 
-def _scrape_tracking_from_page(page, od_no: str) -> TrackingResult:
+def _select_by_order_option(body_text: str, matches: list, order_option: str | None):
+    """샵마인 엑셀의 "주문옵션" 값이 어느 송장번호 근처(보통 상품명/옵션은
+    송장번호보다 앞에 나온다) 텍스트에만 유일하게 나타나면 그 매치를 쓴다.
+    0개(표기가 안 맞음) 또는 2개 이상(애매함) 매칭되면 None - 호출자가
+    기존 방식(사람 확인 요청)으로 넘어간다."""
+    if len(matches) <= 1 or not order_option:
+        return None
+    target = normalize_option(order_option)
+    if not target:
+        return None
+    candidates = []
+    prev_end = 0
+    for m in matches:
+        # window 시작을 이전 매치 끝 이후로 묶어서, 앞 상품의 옵션 텍스트가
+        # 다음 상품 판단에 섞여 들어가지(bleed) 않게 한다.
+        window = body_text[max(prev_end, m.start() - 400) : m.start()]
+        if target in normalize_option(window):
+            candidates.append(m)
+        prev_end = m.end()
+    return candidates[0] if len(candidates) == 1 else None
+
+
+def _scrape_tracking_from_page(page, od_no: str, order_option: str | None = None) -> TrackingResult:
     _click_tracking_button(page)
 
     body_text = page.inner_text("body")
 
-    tracking_match = TRACKING_NO_PATTERN.search(body_text)
-    if not tracking_match:
+    tracking_matches = list(TRACKING_NO_PATTERN.finditer(body_text))
+    if not tracking_matches:
         if any(p in body_text for p in NOT_YET_PATTERNS):
             raise TrackingNotAvailableYet(f"아직 송장번호가 발급되지 않았습니다 (odNo={od_no}).")
         raise ParseError(f"화면에서 송장번호 텍스트를 찾지 못했습니다 (odNo={od_no}).")
 
+    distinct_tracking_nos = {re.sub(r"[^0-9]", "", m.group(1)) for m in tracking_matches}
+    tracking_match = _select_by_order_option(body_text, tracking_matches, order_option)
+    if tracking_match is None:
+        if len(distinct_tracking_nos) > 1:
+            # 한 주문이 상품별로 나눠 배송되어 서로 다른 송장번호가 여러 개
+            # 보이는 경우다 - 어느 걸 써야 하는지 확신할 수 없어 사람이
+            # 확인하게 한다 (무신사 어댑터와 동일한 안전 규칙).
+            raise ParseError(f"한 주문에 서로 다른 송장번호가 여러 개 있습니다 (odNo={od_no}) - 상품별로 나눠 배송된 것으로 보입니다.")
+        tracking_match = tracking_matches[0]
     tracking_no = re.sub(r"[^0-9]", "", tracking_match.group(1))
 
     # "택배사"는 페이지 여기저기(예: "상품이 없을 경우 택배사에 문의해 주세요")에도
@@ -142,7 +173,9 @@ def _scrape_tracking_from_page(page, od_no: str) -> TrackingResult:
     return TrackingResult(tracking_no=tracking_no, courier=courier)
 
 
-def get_tracking(context: BrowserContext, product_url: str, headless: bool = True) -> TrackingResult:
+def get_tracking(
+    context: BrowserContext, product_url: str, headless: bool = True, order_option: str | None = None
+) -> TrackingResult:
     od_no = extract_od_no(product_url)
     page = context.new_page()
     try:
@@ -162,6 +195,6 @@ def get_tracking(context: BrowserContext, product_url: str, headless: bool = Tru
             if _looks_like_login_page(page):
                 raise BlockedError("로그인 후에도 여전히 로그인 페이지입니다.")
 
-        return _scrape_tracking_from_page(page, od_no)
+        return _scrape_tracking_from_page(page, od_no, order_option)
     finally:
         page.close()

@@ -32,7 +32,7 @@ from dotenv import load_dotenv
 from playwright.sync_api import BrowserContext
 
 from ..models import TrackingResult
-from .base import BlockedError, ParseError, TrackingNotAvailableYet
+from .base import BlockedError, ParseError, TrackingNotAvailableYet, normalize_option
 
 load_dotenv()
 
@@ -116,19 +116,58 @@ def _auto_login(page) -> bool:
     return False
 
 
-def _scrape_tracking_from_page(page, order_no: str) -> TrackingResult:
+def _select_by_order_option(body_text: str, anchor_matches: list[tuple[int, re.Match]], order_option: str | None):
+    """샵마인 엑셀의 "주문옵션" 값이 어느 앵커("배송상세현황 보기") 바로
+    앞(보통 상품명/옵션은 앵커보다 앞에 나온다) 텍스트에만 유일하게
+    나타나면 그 매치를 쓴다. 0개(표기가 안 맞음) 또는 2개 이상(애매함)
+    매칭되면 None - 호출자가 기존 방식(사람 확인 요청)으로 넘어간다."""
+    if len(anchor_matches) <= 1 or not order_option:
+        return None
+    target = normalize_option(order_option)
+    if not target:
+        return None
+    candidates = []
+    prev_end = 0
+    for anchor_pos, m in anchor_matches:
+        # window 시작을 이전 상품 구간 끝 이후로 묶어서, 앞 상품의 옵션
+        # 텍스트가 다음 상품 판단에 섞여 들어가지(bleed) 않게 한다.
+        window = body_text[max(prev_end, anchor_pos - 400) : anchor_pos]
+        if target in normalize_option(window):
+            candidates.append(m)
+        prev_end = anchor_pos + m.end()  # 이 구간 안에서의 매치 끝을 절대 위치로 환산
+    return candidates[0] if len(candidates) == 1 else None
+
+
+def _scrape_tracking_from_page(page, order_no: str, order_option: str | None = None) -> TrackingResult:
     body_text = page.inner_text("body")
 
     # "택배사 / 숫자" 패턴이 본문 다른 곳(사업자번호 등)에서도 우연히 매칭될
-    # 가능성을 줄이기 위해 "배송상세현황 보기" 바로 뒤 구간만 본다.
-    anchor_idx = body_text.find(TRACKING_ANCHOR)
-    window = body_text[anchor_idx : anchor_idx + 120] if anchor_idx >= 0 else body_text
+    # 가능성을 줄이기 위해 "배송상세현황 보기" 바로 뒤 구간만 본다. 이 앵커가
+    # 상품별로 여러 번 나오면(상품별로 나눠 배송된 주문) 각각의 구간을 모두 본다.
+    anchor_positions = [m.start() for m in re.finditer(re.escape(TRACKING_ANCHOR), body_text)]
+    windows = [body_text[pos : pos + 120] for pos in anchor_positions] if anchor_positions else [body_text]
 
-    tracking_match = TRACKING_LINE_PATTERN.search(window)
-    if not tracking_match:
-        if any(p in window for p in NOT_YET_PATTERNS):
+    anchor_matches: list[tuple[int, re.Match]] = []
+    for pos, window in zip(anchor_positions or [0], windows):
+        m = TRACKING_LINE_PATTERN.search(window)
+        if m:
+            anchor_matches.append((pos, m))
+
+    if not anchor_matches:
+        combined = "\n".join(windows)
+        if any(p in combined for p in NOT_YET_PATTERNS):
             raise TrackingNotAvailableYet(f"아직 송장번호가 발급되지 않았습니다 (orordNo={order_no}).")
         raise ParseError(f"화면에서 송장번호 텍스트를 찾지 못했습니다 (orordNo={order_no}).")
+
+    distinct_tracking_nos = {re.sub(r"[^0-9]", "", m.group(2)) for _, m in anchor_matches}
+    tracking_match = _select_by_order_option(body_text, anchor_matches, order_option)
+    if tracking_match is None:
+        if len(distinct_tracking_nos) > 1:
+            # 한 주문이 상품별로 나눠 배송되어 서로 다른 송장번호가 여러 개
+            # 보이는 경우다 - 어느 걸 써야 하는지 확신할 수 없어 사람이
+            # 확인하게 한다 (무신사 어댑터와 동일한 안전 규칙).
+            raise ParseError(f"한 주문에 서로 다른 송장번호가 여러 개 있습니다 (orordNo={order_no}) - 상품별로 나눠 배송된 것으로 보입니다.")
+        tracking_match = anchor_matches[0][1]
 
     courier = _normalize_courier(tracking_match.group(1).strip())
     tracking_no = re.sub(r"[^0-9]", "", tracking_match.group(2))
@@ -136,7 +175,9 @@ def _scrape_tracking_from_page(page, order_no: str) -> TrackingResult:
     return TrackingResult(tracking_no=tracking_no, courier=courier)
 
 
-def get_tracking(context: BrowserContext, product_url: str, headless: bool = True) -> TrackingResult:
+def get_tracking(
+    context: BrowserContext, product_url: str, headless: bool = True, order_option: str | None = None
+) -> TrackingResult:
     order_no = extract_order_no(product_url)
     page = context.new_page()
     try:
@@ -152,6 +193,6 @@ def get_tracking(context: BrowserContext, product_url: str, headless: bool = Tru
             if _looks_like_login_page(page):
                 raise BlockedError("SSG 로그인 후에도 여전히 로그인 페이지입니다.")
 
-        return _scrape_tracking_from_page(page, order_no)
+        return _scrape_tracking_from_page(page, order_no, order_option)
     finally:
         page.close()

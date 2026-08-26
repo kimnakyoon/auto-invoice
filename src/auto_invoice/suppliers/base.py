@@ -6,11 +6,24 @@ _template.py를 복사해서 시작하면 된다.
 
 from __future__ import annotations
 
+import re
 from typing import Protocol
 
 from playwright.sync_api import BrowserContext
 
 from ..models import TrackingResult
+
+_OPTION_NOISE_PATTERN = re.compile(r"[\s/|·,\-_()]+")
+
+
+def normalize_option(text: str | None) -> str:
+    """주문옵션 문자열을 느슨하게 비교하기 위한 정규화.
+
+    "(59)Navy · 95(095)" 같은 화면 표기와 샵마인 엑셀의 "주문옵션" 값이 공백/
+    구분자 표기만 다르고 내용은 같은 경우가 많아, 그런 잡음을 다 지우고
+    소문자로 맞춰서 비교한다.
+    """
+    return _OPTION_NOISE_PATTERN.sub("", text or "").lower()
 
 
 class AdapterError(Exception):
@@ -40,5 +53,9 @@ class SupplierAdapter(Protocol):
     SITE_KEY: str
 
     def get_tracking(
-        self, context: BrowserContext, product_url: str, headless: bool = True
+        self,
+        context: BrowserContext,
+        product_url: str,
+        headless: bool = True,
+        order_option: str | None = None,
     ) -> TrackingResult: ...

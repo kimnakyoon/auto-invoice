@@ -33,6 +33,13 @@ from ..models import PendingOrder
 # 샵마인 "발송대상 > 엑셀파일생성" 내보내기 파일의 컬럼명
 EXPORT_ORDER_ID_HEADER = "마켓 주문번호"
 EXPORT_PRODUCT_URL_HEADER = "상품URL"
+# 필수는 아니고, 실패한 주문을 사람이 샵마인에서 찾기 쉽게 리포트에 남기는
+# 용도로만 쓴다 - 없어도 동작에는 지장 없다.
+EXPORT_RECIPIENT_NAME_HEADER = "수령인"
+# 필수는 아니고(샵마인 기본 내보내기 항목이 아니라 사용자가 직접 추가한
+# 컬럼), 한 공급사 주문에 상품별로 송장번호가 여러 개 있을 때 이 주문이
+# 어느 상품(색상/사이즈 등)인지 구분해서 맞는 송장을 고르는 데 쓴다.
+EXPORT_ORDER_OPTION_HEADER = "주문옵션"
 
 # 샵마인 "발송정보일괄등록(수정용)" 업로드 파일이 요구하는 컬럼명
 UPLOAD_ORDER_ID_HEADER = "고객주문번호"
@@ -80,6 +87,14 @@ def read_pending_orders(path: str) -> list[PendingOrder]:
             f"엑셀에서 필요한 컬럼('{EXPORT_ORDER_ID_HEADER}', '{EXPORT_PRODUCT_URL_HEADER}')을 "
             f"찾을 수 없습니다. 실제 헤더: {headers}"
         ) from e
+    # 없어도 동작에는 지장 없는 선택 컬럼들이라 못 찾아도 에러 내지 않는다.
+    recipient_idx = headers.index(EXPORT_RECIPIENT_NAME_HEADER) if EXPORT_RECIPIENT_NAME_HEADER in headers else None
+    option_idx = headers.index(EXPORT_ORDER_OPTION_HEADER) if EXPORT_ORDER_OPTION_HEADER in headers else None
+
+    def _optional_cell(row: list, idx: int | None) -> str:
+        if idx is None or len(row) <= idx or not row[idx]:
+            return ""
+        return str(row[idx]).strip()
 
     orders: list[PendingOrder] = []
     for row in data_rows:
@@ -89,7 +104,14 @@ def read_pending_orders(path: str) -> list[PendingOrder]:
         raw_url = row[url_idx]
         if not raw_id or not raw_url:
             continue
-        orders.append(PendingOrder(order_id=_clean_id(raw_id), product_url=str(raw_url).strip()))
+        orders.append(
+            PendingOrder(
+                order_id=_clean_id(raw_id),
+                product_url=str(raw_url).strip(),
+                recipient_name=_optional_cell(row, recipient_idx),
+                order_option=_optional_cell(row, option_idx),
+            )
+        )
 
     return orders
 
