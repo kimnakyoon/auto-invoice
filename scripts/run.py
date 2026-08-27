@@ -39,6 +39,11 @@ def main() -> None:
 
     counts = report.summary()
     print(f"완료: 성공 {counts['success']} / 실패 {counts['fail']} / 스킵 {counts['skip']}")
+    failure_lines = report.failure_lines()
+    if failure_lines:
+        print("\n실패한 주문 (샵마인에서 직접 확인해주세요):")
+        for line in failure_lines:
+            print(line)
     report_path = report.save()
     print(f"상세 리포트: {report_path}")
     if counts["success"] > 0:

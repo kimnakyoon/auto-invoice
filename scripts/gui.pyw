@@ -146,8 +146,9 @@ class App:
             )
             self._process_cjonstyle_orders(report, output_path)
             counts = report.summary()
+            failure_lines = report.failure_lines()
             report.save()
-            self._queue.put(("done", (counts, output_path)))
+            self._queue.put(("done", (counts, failure_lines, output_path)))
         except Exception as e:  # noqa: BLE001
             self._queue.put(("error", str(e)))
 
@@ -204,8 +205,12 @@ class App:
                 if kind == "log":
                     self._log(payload)
                 elif kind == "done":
-                    counts, output_path = payload
+                    counts, failure_lines, output_path = payload
                     self._log(f"\n완료: 성공 {counts['success']} / 실패 {counts['fail']} / 스킵 {counts['skip']}")
+                    if failure_lines:
+                        self._log("\n실패한 주문 (샵마인에서 직접 확인해주세요):")
+                        for line in failure_lines:
+                            self._log(line)
                     if counts["success"] > 0:
                         self._output_path = output_path
                         self._log(f"업로드용 파일: {output_path}")

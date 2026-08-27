@@ -34,6 +34,21 @@ class RunReport:
     def skip(self, order_id: str, reason: str) -> None:
         self.entries.append(ReportEntry(order_id=order_id, status="skip", reason=reason))
 
+    def failures(self) -> list[ReportEntry]:
+        return [entry for entry in self.entries if entry.status == "fail"]
+
+    def failure_lines(self) -> list[str]:
+        """실패 건을 '주문번호 (수령인: 이름) - 사유' 한 줄씩으로 정리한다.
+
+        실행이 끝난 뒤 사람이 샵마인에서 해당 주문을 직접 찾아 처리해야 하므로
+        주문번호만이 아니라 수령인 이름도 같이 보여준다.
+        """
+        lines = []
+        for entry in self.failures():
+            who = f" (수령인: {entry.recipient_name})" if entry.recipient_name else ""
+            lines.append(f"  - {entry.order_id}{who}: {entry.reason}")
+        return lines
+
     def summary(self) -> dict[str, int]:
         counts = {"success": 0, "fail": 0, "skip": 0}
         for entry in self.entries:

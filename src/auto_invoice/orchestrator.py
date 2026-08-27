@@ -99,10 +99,13 @@ def run(
                     message += f" (수령인: {order.recipient_name})"
                 report.fail(order.order_id, str(e), recipient_name=order.recipient_name)
             except Exception as e:  # noqa: BLE001 - 배치 전체가 죽지 않도록 광범위하게 잡는다
-                message = f"예상치 못한 오류: {e}"
+                reason = f"예상치 못한 오류: {e}"
+                message = reason
                 if order.recipient_name:
                     message += f" (수령인: {order.recipient_name})"
-                report.fail(order.order_id, message, recipient_name=order.recipient_name)
+                # reason에는 수령인을 넣지 않는다 - recipient_name 필드가 따로
+                # 있어서 마지막 실패 목록에서 이름이 두 번 찍히게 된다.
+                report.fail(order.order_id, reason, recipient_name=order.recipient_name)
             finally:
                 if on_progress is not None:
                     on_progress(i, total, order.order_id, message)
