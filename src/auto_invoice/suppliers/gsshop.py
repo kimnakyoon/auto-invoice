@@ -1,8 +1,11 @@
 """GS SHOP(GSSHOP) 공급사 어댑터.
 
 리버스엔지니어링 결과:
-- 주문상세(배송현황) 팝업 URL: https://with.gsshop.com/ord/dlvcursta/popup/ordDtl.gs?ordNo=<주문번호>&ecOrdTypCd=<S 등>
+- 주문상세(배송현황) 팝업 URL: https://<호스트>/ord/dlvcursta/popup/ordDtl.gs?ordNo=<주문번호>&ecOrdTypCd=<S 등>
   (샵마인 엑셀의 "상품URL" 컬럼에 이 팝업 URL이 그대로 들어있는 것으로 확인했다.)
+  호스트는 with.gsshop.com과 www.gsshop.com 두 가지로 들어오는데, 경로/응답
+  구조가 완전히 같고 로그인 쿠키도 .gsshop.com 스코프라 서로 공유된다 -
+  들어온 URL의 호스트를 그대로 따라가면 된다.
 - 로그인이 안 되어 있으면 /cust/login/login.gs?returnurl=... 로 리다이렉트되는데,
   이 returnurl은 원래 요청한 팝업 URL이 아니라 항상 홈(index.gs)으로 고정되어
   있었다(롯데온/지마켓과 다른 점) - 그래서 로그인 완료 후에도 자동으로 원래
@@ -42,10 +45,13 @@ load_dotenv()
 
 LOGIN_ID_SELECTOR = "#id"
 
-DOMAINS = {"with.gsshop.com"}
+# 같은 주문상세 팝업이 with.gsshop.com / www.gsshop.com 두 호스트로 모두
+# 들어온다(경로와 응답 구조는 동일). registry는 "www." 접두사를 떼고 찾지만,
+# 다른 어댑터와 표기를 맞추려고 www 형태도 같이 적어둔다.
+DOMAINS = {"with.gsshop.com", "gsshop.com", "www.gsshop.com"}
 SITE_KEY = "gsshop"
 
-TRACE_URL = "https://with.gsshop.com/ord/dlvcursta/popup/dlvTrace.gs?ordNo={ord_no}&ordItemId={ord_item_id}"
+TRACE_PATH = "/ord/dlvcursta/popup/dlvTrace.gs?ordNo={ord_no}&ordItemId={ord_item_id}"
 
 DEFAULT_COURIER = "택배"  # 배송현황조회 팝업에서 택배사명을 못 읽었을 때만 쓰는 기본값
 
@@ -81,6 +87,18 @@ def extract_order_no(product_url: str) -> str:
     if not values:
         raise ParseError(f"URL에서 ordNo 파라미터를 찾을 수 없습니다: {product_url}")
     return values[0]
+
+
+def extract_origin(product_url: str) -> str:
+    """배송현황조회 팝업을 주문상세와 같은 호스트에서 연다.
+
+    with.gsshop.com 주문을 www.gsshop.com으로(또는 그 반대로) 열면 불필요한
+    호스트 이동이 생기므로, 들어온 상품URL의 호스트를 그대로 따라간다.
+    """
+    parsed = urlparse(product_url)
+    if not parsed.scheme or not parsed.netloc:
+        raise ParseError(f"상품URL 형식을 해석할 수 없습니다: {product_url}")
+    return f"{parsed.scheme}://{parsed.netloc}"
 
 
 def _looks_like_login_page(page) -> bool:
@@ -175,8 +193,8 @@ def _select_item(entry: dict, ord_no: str, order_option: str | None) -> dict:
     return shipped[0]
 
 
-def _fetch_courier_name(page, ord_no: str, ord_item_id: str) -> str:
-    trace_url = TRACE_URL.format(ord_no=ord_no, ord_item_id=ord_item_id)
+def _fetch_courier_name(page, origin: str, ord_no: str, ord_item_id: str) -> str:
+    trace_url = origin + TRACE_PATH.format(ord_no=ord_no, ord_item_id=ord_item_id)
     page.goto(trace_url, wait_until="domcontentloaded")
     page.wait_for_timeout(1000)
     body_text = page.inner_text("body")
@@ -190,6 +208,7 @@ def get_tracking(
     context: BrowserContext, product_url: str, headless: bool = True, order_option: str | None = None
 ) -> TrackingResult:
     ord_no = extract_order_no(product_url)
+    origin = extract_origin(product_url)
     page = context.new_page()
     try:
         page.goto(product_url, wait_until="domcontentloaded")
@@ -213,7 +232,7 @@ def get_tracking(
         entry = _read_entry_data(page, ord_no)
         item = _select_item(entry, ord_no, order_option)
         tracking_no = re.sub(r"[^0-9]", "", str(item["invNo"]))
-        courier = _fetch_courier_name(page, ord_no, str(item["ordItemId"]))
+        courier = _fetch_courier_name(page, origin, ord_no, str(item["ordItemId"]))
 
         return TrackingResult(tracking_no=tracking_no, courier=courier)
     finally:
