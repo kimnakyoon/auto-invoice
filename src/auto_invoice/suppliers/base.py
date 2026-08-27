@@ -47,7 +47,15 @@ class BlockedError(AdapterError):
 
 
 class SupplierAdapter(Protocol):
-    """각 공급사 모듈이 구현해야 하는 형태."""
+    """각 공급사 모듈이 구현해야 하는 형태.
+
+    보통은 상품URL에 공급사 주문번호가 들어있어서 그것만으로 주문을 특정할 수
+    있다. 옥션처럼 상품URL이 주문별 주소가 아니라 목록 페이지 주소인 공급사는
+    수령인 이름까지 봐야 어느 주문인지 확정할 수 있는데, 그런 어댑터는
+    모듈에 `WANTS_RECIPIENT_NAME = True`를 선언하고 get_tracking에
+    `recipient_name` 인자를 추가로 받으면 된다 (orchestrator가 그 표시를 보고
+    넘겨준다). 선언하지 않은 어댑터는 아무것도 바꿀 필요가 없다.
+    """
 
     DOMAINS: set[str]
     SITE_KEY: str

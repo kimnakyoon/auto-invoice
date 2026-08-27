@@ -65,9 +65,21 @@ def run(
                     supplier_contexts[site_key] = browser_mod.get_context(p, site_key, headless=headless)
                 _, supplier_context = supplier_contexts[site_key]
 
+                # 옥션처럼 상품URL만으로 주문을 특정할 수 없는 공급사는 수령인
+                # 이름까지 봐야 어느 주문인지 확정할 수 있다. 그런 어댑터만
+                # WANTS_RECIPIENT_NAME으로 표시해두고, 나머지 어댑터의
+                # 시그니처는 그대로 둔다.
+                extra_kwargs = {}
+                if getattr(adapter, "WANTS_RECIPIENT_NAME", False):
+                    extra_kwargs["recipient_name"] = order.recipient_name
+
                 try:
                     result = adapter.get_tracking(
-                        supplier_context, order.product_url, headless=headless, order_option=order.order_option
+                        supplier_context,
+                        order.product_url,
+                        headless=headless,
+                        order_option=order.order_option,
+                        **extra_kwargs,
                     )
                 except TrackingNotAvailableYet:
                     message = "아직 송장번호 미발급 - 건너뜀"
