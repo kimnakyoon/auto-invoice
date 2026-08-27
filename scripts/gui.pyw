@@ -20,7 +20,9 @@ if sys.platform == "win32" and sys.stdout is not None:
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
 
+from auto_invoice import cjonstyle_bridge  # noqa: E402
 from auto_invoice.orchestrator import run as run_orchestrator  # noqa: E402
+from auto_invoice.shopmine import excel_io  # noqa: E402
 
 DESKTOP = Path.home() / "Desktop"
 
@@ -142,11 +144,58 @@ class App:
             report = run_orchestrator(
                 str(self.selected_file), str(output_path), headless=False, on_progress=on_progress
             )
+            self._process_cjonstyle_orders(report, output_path)
             counts = report.summary()
             report.save()
             self._queue.put(("done", (counts, output_path)))
         except Exception as e:  # noqa: BLE001
             self._queue.put(("error", str(e)))
+
+    def _process_cjonstyle_orders(self, report, output_path: Path) -> None:
+        """CJ온스타일(base.cjonstyle.com)은 registry.py에 어댑터가 등록되어
+        있지 않아(Cloudflare가 Playwright 자동화를 차단 - suppliers/cjonstyle.py
+        참고) 위 run_orchestrator가 전부 "등록된 어댑터 없음"으로 스킵한다.
+        여기서 그 스킵 건들을 claude -p --chrome(사용자의 실제 크롬 브라우저)로
+        다시 조회해서 report와 업로드 파일에 반영한다."""
+        all_orders = excel_io.read_pending_orders(str(self.selected_file))
+        cj_orders = cjonstyle_bridge.filter_cjonstyle_orders(all_orders)
+        if not cj_orders:
+            return
+
+        self._queue.put(("log", f"\nCJ온스타일 {len(cj_orders)}건을 실제 크롬 브라우저로 확인 중입니다 (시간이 다소 걸릴 수 있습니다)..."))
+
+        cj_order_ids = {o.order_id for o in cj_orders}
+        recipient_by_id = {o.order_id: o.recipient_name for o in cj_orders}
+        # run_orchestrator가 이미 이 주문들에 대해 남긴 "등록된 어댑터 없음"
+        # 스킵 기록을 지우고, 아래에서 실제 조회 결과로 다시 채운다.
+        report.entries = [
+            e for e in report.entries if not (e.order_id in cj_order_ids and e.status == "skip")
+        ]
+
+        try:
+            results = cjonstyle_bridge.lookup_via_chrome(cj_orders)
+        except Exception as e:  # noqa: BLE001
+            self._queue.put(("log", f"CJ온스타일 확인 중 오류가 발생해 전부 건너뜁니다: {e}"))
+            for order in cj_orders:
+                report.fail(order.order_id, f"CJ온스타일 크롬 조회 실패: {e}", recipient_name=order.recipient_name)
+            return
+
+        upload_rows: list[tuple[str, str, str | None]] = []
+        for r in results:
+            if r.status == "success" and r.tracking_no:
+                report.success(r.order_id, r.courier, r.tracking_no)
+                upload_rows.append((r.order_id, r.tracking_no, r.courier))
+                self._queue.put(("log", f"  {r.order_id}: 성공 ({r.courier} / {r.tracking_no})"))
+            elif r.status == "not_yet":
+                report.skip(r.order_id, r.reason or "아직 송장번호 미발급")
+                self._queue.put(("log", f"  {r.order_id}: 아직 송장번호 미발급 - 건너뜀"))
+            else:
+                reason = r.reason or "알 수 없는 오류"
+                report.fail(r.order_id, reason, recipient_name=recipient_by_id.get(r.order_id))
+                self._queue.put(("log", f"  {r.order_id}: 실패 ({reason})"))
+
+        if upload_rows:
+            excel_io.append_upload_rows(upload_rows, str(output_path))
 
     def _poll_queue(self) -> None:
         try:

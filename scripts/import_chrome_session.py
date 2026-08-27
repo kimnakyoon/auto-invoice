@@ -63,6 +63,10 @@ SITES = {
         "domains": ["gsshop.com"],
         "check_url": "https://with.gsshop.com/",
     },
+    "cjonstyle": {
+        "domains": ["cjonstyle.com"],
+        "check_url": "https://base.cjonstyle.com/p/myzone/orderList?listType=ORDER&orderStatus=ALL",
+    },
 }
 NAVER_DOMAINS = ["naver.com"]
 NAVER_CHECK_URL = "https://new.pay.naver.com/home/my"

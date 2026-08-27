@@ -127,3 +127,21 @@ def write_upload_file(rows: list[tuple[str, str, str | None]], path: str) -> Non
         writer.writerow([UPLOAD_ORDER_ID_HEADER, UPLOAD_TRACKING_HEADER, UPLOAD_COURIER_HEADER])
         for order_id, tracking_no, courier in rows:
             writer.writerow([order_id, tracking_no, courier or ""])
+
+
+def append_upload_rows(rows: list[tuple[str, str, str | None]], path: str) -> None:
+    """이미 write_upload_file로 만들어진 업로드 파일에 rows를 추가한다.
+
+    파일이 아직 없으면(예: 다른 공급사 성공 건이 0건이라 write_upload_file이
+    호출되지 않은 경우) 헤더부터 새로 만든다 - CJ온스타일처럼 별도 경로로
+    조회한 결과를 같은 업로드 파일에 합칠 때 쓴다.
+    """
+    if not rows:
+        return
+    file_exists = Path(path).exists()
+    with open(path, "a" if file_exists else "w", newline="", encoding="utf-8-sig") as f:
+        writer = csv.writer(f)
+        if not file_exists:
+            writer.writerow([UPLOAD_ORDER_ID_HEADER, UPLOAD_TRACKING_HEADER, UPLOAD_COURIER_HEADER])
+        for order_id, tracking_no, courier in rows:
+            writer.writerow([order_id, tracking_no, courier or ""])
