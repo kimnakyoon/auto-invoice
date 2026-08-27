@@ -64,6 +64,7 @@ COURIER_NORMALIZATION = [
     ("대한통운", "CJ대한통운"),
     ("CJ", "CJ대한통운"),
     ("롯데", "롯데택배"),
+    ("DELIBOX", "딜리박스"),
 ]
 
 

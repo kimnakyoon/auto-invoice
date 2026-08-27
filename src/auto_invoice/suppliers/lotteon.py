@@ -42,6 +42,23 @@ COURIER_PATTERN = re.compile(r"택배사\n([^\n]{1,20})")
 TRACKING_NO_PATTERN = re.compile(r"(?:송장번호|운송장번호)\n([0-9][0-9\-]{5,})")
 NOT_YET_PATTERNS = ["상품준비중", "배송준비중", "결제완료"]
 
+# 택배사 표기가 축약형/코드로 나올 수 있어 업로드 파일에는 정식 명칭으로
+# 맞춰 넣는다 (다른 어댑터와 동일한 규칙, 사용자 요청 그대로). 위에서부터
+# 순서대로 검사하므로 더 구체적인 키워드를 먼저 둔다.
+COURIER_NORMALIZATION = [
+    ("대한통운", "CJ대한통운"),
+    ("CJ", "CJ대한통운"),
+    ("롯데", "롯데택배"),
+    ("DELIBOX", "딜리박스"),
+]
+
+
+def _normalize_courier(raw: str) -> str:
+    for keyword, canonical in COURIER_NORMALIZATION:
+        if keyword in raw:
+            return canonical
+    return raw
+
 
 def extract_od_no(product_url: str) -> str:
     parsed = urlparse(product_url)
@@ -168,7 +185,7 @@ def _scrape_tracking_from_page(page, od_no: str, order_option: str | None = None
     window_start = max(0, tracking_match.start() - 60)
     window = body_text[window_start : tracking_match.start()]
     courier_match = COURIER_PATTERN.search(window)
-    courier = courier_match.group(1).strip() if courier_match else DEFAULT_COURIER
+    courier = _normalize_courier(courier_match.group(1).strip()) if courier_match else DEFAULT_COURIER
 
     return TrackingResult(tracking_no=tracking_no, courier=courier)
 
