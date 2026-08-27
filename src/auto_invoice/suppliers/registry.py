@@ -11,7 +11,7 @@ from __future__ import annotations
 
 from urllib.parse import urlparse
 
-from . import fashionplus, gmarket, gsshop, hmall, lotteimall, lotteon, musinsa, naver, ssg, thehyundai
+from . import fashionplus, gmarket, gsshop, hmall, lotteimall, lotteon, musinsa, naver, nsmall, ssg, thehyundai
 
 _ADAPTERS: dict[str, object] = {}
 
@@ -31,6 +31,7 @@ register(gsshop)
 register(lotteimall)
 register(hmall)
 register(thehyundai)
+register(nsmall)
 # 새 공급사 추가 예시:
 # from . import newsupplier
 # register(newsupplier)
