@@ -6,3 +6,4 @@ auth/
 logs/
 *.zip
 .pytest_cache/
+work/
