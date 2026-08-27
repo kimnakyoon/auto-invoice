@@ -73,6 +73,40 @@ def find_windows(title_startswith=None, title_equals=None, min_w=80, min_h=40):
     return out
 
 
+# --- 자식 컨트롤 다루기 --------------------------------------------
+def children(parent):
+    """자식 컨트롤 핸들 전부 (깊이 제한 없음).
+
+    샵마인 메인 창은 자식이 700개가 넘고 필요한 컨트롤이 깊이 들어 있다.
+    한 단계만 훑으면 안 보인다.
+    """
+    out = []
+    u.EnumChildWindows(parent, ENUM(lambda h, l: (out.append(h), True)[1]), 0)
+    return out
+
+
+def class_of(hwnd):
+    """WinForms 창클래스에서 실제 종류만 뽑는다 (WindowsForms10.EDIT.app... -> EDIT)."""
+    c = _cls(hwnd)
+    if c.startswith("WindowsForms10.") and "." in c:
+        return c.split(".")[1]
+    return c
+
+
+def rect(hwnd):
+    r = wt.RECT()
+    u.GetWindowRect(hwnd, ctypes.byref(r))
+    return r
+
+
+def find_child(parent, cls_name, predicate):
+    """조건에 맞는 첫 자식 컨트롤. 없으면 None."""
+    for k in children(parent):
+        if class_of(k) == cls_name and predicate(k):
+            return k
+    return None
+
+
 def pixel(x, y):
     """화면 절대좌표의 색을 (R, G, B)로 읽는다."""
     hdc = u.GetDC(0)
@@ -125,10 +159,14 @@ def move_to(x, y):
     _send(mv)
 
 
-def move_click(x, y, verify=True, tol=3):
+def move_click(x, y, verify=True, tol=3, dwell=0.45):
     """좌표로 이동한 뒤, 커서가 정말 그 자리에 갔는지 확인하고 클릭한다.
 
     다중 모니터/DPI 문제로 커서가 엉뚱한 곳에 놓이면 클릭하지 않는다.
+
+    dwell: 누르기 직전에 그 자리에 머무는 시간. WinForms ToolStrip 버튼은
+    마우스가 들어온 것을 인식한 뒤에야 클릭을 받는다. 0.25초로는 [송장수정모드
+    켜기] 클릭이 조용히 무시됐다 (창은 활성화되는데 버튼은 안 눌림).
     """
     move_to(x, y)
     time.sleep(0.15)
@@ -141,7 +179,7 @@ def move_click(x, y, verify=True, tol=3):
             if abs(cx - x) > tol or abs(cy - y) > tol:
                 raise RuntimeError(
                     f"커서가 목표에 도달하지 못함: 목표=({x},{y}) 실제=({cx},{cy}) - 클릭 취소")
-    time.sleep(0.1)
+    time.sleep(dwell)
     dn = INPUT(type=INPUT_MOUSE); dn.u.mi = MOUSEINPUT(0, 0, 0, MOUSEEVENTF_LEFTDOWN, 0, None)
     up = INPUT(type=INPUT_MOUSE); up.u.mi = MOUSEINPUT(0, 0, 0, MOUSEEVENTF_LEFTUP, 0, None)
     _send(dn); time.sleep(0.06); _send(up)
@@ -149,6 +187,47 @@ def move_click(x, y, verify=True, tol=3):
 
 def cursor_pos():
     p = wt.POINT(); u.GetCursorPos(ctypes.byref(p)); return p.x, p.y
+
+
+MOUSEEVENTF_WHEEL = 0x0800
+WHEEL_DELTA = 120
+
+
+def wheel(x, y, notches):
+    """(x, y)로 커서를 옮긴 뒤 마우스 휠을 굴린다. 양수=아래로, 음수=위로.
+
+    휠은 '커서 아래 컨트롤'로 가므로 좌표를 반드시 그리드 안으로 줘야 한다.
+    """
+    move_to(x, y)
+    time.sleep(0.2)
+    inp = INPUT(type=INPUT_MOUSE)
+    inp.u.mi = MOUSEINPUT(0, 0, (-WHEEL_DELTA * notches) & 0xFFFFFFFF,
+                          MOUSEEVENTF_WHEEL, 0, None)
+    _send(inp)
+
+
+# --- 스크롤바 읽기 -------------------------------------------------
+# GetScrollInfo 는 다른 프로세스의 표준 SCROLLBAR 컨트롤에도 동작한다
+# (WM_GETTEXT 와 달리 이건 윈도우가 대신 마샬링해준다). 단위는 픽셀이라
+# 행 높이로 나누면 전체 행 수를 알 수 있다.
+class SCROLLINFO(ctypes.Structure):
+    _fields_ = [("cbSize", wt.UINT), ("fMask", wt.UINT), ("nMin", ctypes.c_int),
+                ("nMax", ctypes.c_int), ("nPage", wt.UINT), ("nPos", ctypes.c_int),
+                ("nTrackPos", ctypes.c_int)]
+
+
+SIF_ALL = 0x17
+SB_CTL = 2
+
+
+def scroll_info(hwnd):
+    """스크롤바 컨트롤의 (현재위치, 최대위치, 한 페이지) - 실패하면 None."""
+    si = SCROLLINFO()
+    si.cbSize = ctypes.sizeof(SCROLLINFO)
+    si.fMask = SIF_ALL
+    if not u.GetScrollInfo(hwnd, SB_CTL, ctypes.byref(si)):
+        return None
+    return si.nPos, max(0, si.nMax - si.nPage + 1), si.nPage
 
 
 def key(vk, alt=False):
@@ -294,6 +373,27 @@ def click_dlg_button(hwnd, ctrl_id, label=""):
     except RuntimeError as e:
         return False, f"[{label}] {e}"
     return True, f"[{label}] '{caption}' 클릭"
+
+
+BM_CLICK = 0x00F5
+
+
+def press_button(hwnd):
+    """HWND를 가진 버튼/체크박스를 '커서를 쓰지 않고' 누른다.
+
+    좌표 클릭은 실행 중에 사람이 마우스를 건드리면 커서가 목표에 도달하지 못해
+    중단된다. 실제로 70건짜리 실행이 [전체선택] 직전에 그렇게 멈췄다. 컨트롤이
+    HWND를 갖고 있다면 BM_CLICK 한 방이 더 정확하고 마우스와 무관하다
+    (WinForms 버튼도 OWNERDRAW지만 BM_CLICK은 정상 처리한다 - 실측 확인).
+
+    좌표 클릭이 여전히 필요한 곳: HWND가 없는 툴바 버튼([송장수정모드],
+    [송장번호수정]), WebView2 창의 버튼, 그리고 그리드 행 체크박스.
+
+    SendMessage 가 아니라 PostMessage 를 쓴다. SendMessage 는 대상이 메시지를
+    다 처리할 때까지 돌아오지 않는데, 버튼이 모달 대화상자를 띄우면 그 창이
+    닫힐 때까지 영영 멈춘다 ([찾아보기]에서 실제로 그렇게 걸렸다).
+    """
+    u.PostMessageW(hwnd, BM_CLICK, 0, 0)
 
 
 def ctrl_key(vk):

@@ -83,7 +83,7 @@ class App:
         tk.Label(limit_frame, text="최대 반영 건수", fg="#5f6368").pack(side="left")
         self.max_apply = tk.Spinbox(limit_frame, from_=1, to=200, width=5)
         self.max_apply.delete(0, "end")
-        self.max_apply.insert(0, "30")
+        self.max_apply.insert(0, "100")
         self.max_apply.pack(side="left", padx=(6, 0))
         tk.Label(limit_frame, text="건을 넘으면 멈춤", fg="#5f6368").pack(side="left", padx=(6, 0))
 
@@ -141,7 +141,7 @@ class App:
         self.log.config(state="disabled")
 
     def start_full_auto(self) -> None:
-        """1~5단계 전부 자동. 실제 주문 데이터가 바뀌므로 한 번 확인받는다."""
+        """1~6단계 전부 자동. 실제 주문 데이터가 바뀌므로 한 번 확인받는다."""
         try:
             max_apply = int(self.max_apply.get())
         except ValueError:

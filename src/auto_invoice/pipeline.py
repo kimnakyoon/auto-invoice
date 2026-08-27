@@ -3,12 +3,21 @@
 scripts/run_all.py(터미널)와 scripts/gui.pyw(바탕화면 아이콘)가 이 모듈을
 공유한다. 화면에 어떻게 보여줄지는 각자 log 콜백으로 정한다.
 
-    1. 샵마인 [배송중] 탭에서 주문 목록 엑셀 내보내기   (shopmine/export.py)
-    2. 공급사에서 송장번호 조회 -> 업로드용 CSV 생성    (orchestrator.py)
+    1. [배송중] 탭에서 송장수정모드를 켜고, 택배사가 '경동택배' / '직접'인
+       주문만 필터로 골라 전부 체크한다                 (shopmine/upload.py)
+    2. 체크한 주문만 엑셀로 내보낸다                    (shopmine/export.py)
+    3. 공급사에서 송장번호 조회 -> 업로드용 CSV 생성    (orchestrator.py)
        + CJ온스타일은 실제 크롬으로 별도 조회          (cjonstyle_bridge.py)
-    3. CSV를 [발송정보일괄등록(수정용)]으로 업로드      (shopmine/upload.py)
-    4. [일괄등록] - 송장번호(수정용) 컬럼에 반영
-    5. [송장번호수정] - 쇼핑몰까지 실제 반영
+    4. CSV를 [발송정보일괄등록(수정용)]으로 [일괄등록]  (shopmine/upload.py)
+       -> 그리드의 '송장번호(수정용)' 컬럼이 채워진다
+    5. 그 컬럼이 채워진 행만 체크하고 [송장번호수정]    (shopmine/grid.py)
+       -> 쇼핑몰까지 실제 반영
+    6. 결과에 오류가 없으면 송장수정모드를 끈다
+
+왜 1단계에서 택배사로 거르나: '경동택배'와 '직접(전달)'은 실제 택배사가 아니라
+'아직 진짜 송장이 없다'는 표시다. 샵마인도 이 두 값일 때만 송장번호(수정용)를
+비워두기 때문에, 이것이 대상 주문을 고르는 기준이자 5단계에서 '일괄등록이
+실제로 반영됐는지' 판별하는 근거가 된다.
 
 실제 주문 데이터를 바꾸므로, 확신이 없으면 진행하지 않고 멈춘다. 자세한
 안전장치는 shopmine/upload.py 와 README.md 참고.
@@ -22,9 +31,11 @@ from pathlib import Path
 
 from . import cjonstyle_bridge
 from .orchestrator import run as run_orchestrator
-from .shopmine import export, upload
+from .shopmine import export, grid, upload
 
 WORK_DIR = Path(__file__).resolve().parent.parent.parent / "work"
+
+STEPS = 6
 
 
 class PipelineResult:
@@ -33,17 +44,23 @@ class PipelineResult:
     def __init__(self):
         self.export_path: Path | None = None
         self.csv_path: Path | None = None
+        self.picked: int = 0            # 1단계에서 고른 주문 수 (보이는 화면 기준)
         self.lookup_counts: dict = {}
-        self.applied: list[tuple[str, str]] = []
+        self.applied_count: int = 0     # [송장번호수정]으로 반영한 건수
+        self.apply_status: str = ""     # '오류없음.' 등 결과 창 문구
         self.stopped_reason: str | None = None
 
     @property
-    def applied_ok(self) -> list[str]:
-        return [o for o, s in self.applied if s.startswith("오류없음")]
+    def applied(self) -> bool:
+        return self.applied_count > 0
 
     @property
-    def applied_bad(self) -> list[tuple[str, str]]:
-        return [(o, s) for o, s in self.applied if not s.startswith("오류없음")]
+    def apply_ok(self) -> bool:
+        return self.applied and upload.result_is_clean(self.apply_status)
+
+    @property
+    def applied_bad(self) -> bool:
+        return self.applied and not self.apply_ok
 
 
 def read_csv_order_ids(path) -> list[str]:
@@ -60,24 +77,41 @@ def read_csv_order_ids(path) -> list[str]:
     return [r[idx].strip() for r in data if len(r) > idx and r[idx].strip()]
 
 
-def export_and_lookup(result: PipelineResult, *, limit=None, tab="배송중",
-                      headless=False, skip_cjonstyle=False, log=print) -> bool:
-    """1~2단계. 성공하면 True."""
+def select_and_export(result: PipelineResult, *, tab="배송중", log=print) -> bool:
+    """1~2단계: 고칠 주문만 체크하고 그 주문만 엑셀로 내보낸다."""
     WORK_DIR.mkdir(exist_ok=True)
     stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     result.export_path = WORK_DIR / f"주문목록_{stamp}.xls"
     result.csv_path = WORK_DIR / f"송장업로드_{stamp}.csv"
 
-    log(f"[1/5] 샵마인 [{tab}] 탭에서 주문 목록 내보내기")
+    log(f"[1/{STEPS}] 배송중 탭에서 송장을 고칠 주문 고르기 "
+        f"({' / '.join(upload.TARGET_COURIERS)})")
+    try:
+        upload.ensure_edit_mode(log=log)
+        main = upload.main_window()
+        grid.clear_all_checks(main, log=log)
+        result.picked = upload.select_target_orders(upload.TARGET_COURIERS, log=log)
+    except (upload.UploadError, grid.GridError) as e:
+        result.stopped_reason = str(e)
+        log(f"중단: {e}")
+        return False
+
+    log("")
+    log(f"[2/{STEPS}] 체크한 주문만 엑셀로 내보내기")
     try:
         export.export_to(result.export_path, tab_title=tab, log=log)
     except export.ExportError as e:
         result.stopped_reason = str(e)
         log(f"중단: {e}")
         return False
+    return True
 
+
+def lookup_tracking(result: PipelineResult, *, limit=None, headless=False,
+                    skip_cjonstyle=False, log=print) -> None:
+    """3단계: 공급사에서 송장번호를 조회해 업로드용 CSV를 만든다."""
     log("")
-    log("[2/5] 공급사에서 송장번호 조회")
+    log(f"[3/{STEPS}] 공급사에서 송장번호 조회")
     report = run_orchestrator(str(result.export_path), str(result.csv_path),
                               limit=limit, headless=headless)
 
@@ -99,12 +133,11 @@ def export_and_lookup(result: PipelineResult, *, limit=None, tab="배송중",
     for line in report.failure_lines():
         log(f"  {line}")
     log(f"  상세 리포트: {report.save()}")
-    return True
 
 
-def apply_csv(csv_path, order_ids, *, max_apply=30, stop_before_apply=False,
+def apply_csv(csv_path, order_ids, *, max_apply=100, stop_before_apply=False,
               log=print, result: PipelineResult | None = None) -> PipelineResult:
-    """3~5단계. 엑셀 내보내기/조회가 이미 끝난 상태에서 실행한다."""
+    """4~6단계. 엑셀 내보내기/조회가 이미 끝난 상태에서 실행한다."""
     result = result or PipelineResult()
     result.csv_path = Path(csv_path)
     rows = len(order_ids)
@@ -117,13 +150,11 @@ def apply_csv(csv_path, order_ids, *, max_apply=30, stop_before_apply=False,
         return result
 
     log("")
-    log("[3/5] 샵마인 송장수정모드 켜고 업로드 창 열기")
+    log(f"[4/{STEPS}] CSV 일괄등록 ({rows}건)")
     try:
         upload.ensure_edit_mode(log=log)
-        log("")
-        log(f"[4/5] CSV 일괄등록 ({rows}건)")
         upload.bulk_register(csv_path, log=log)
-    except upload.UploadError as e:
+    except (upload.UploadError, grid.GridError) as e:
         result.stopped_reason = str(e)
         log(f"중단: {e}")
         return result
@@ -131,27 +162,52 @@ def apply_csv(csv_path, order_ids, *, max_apply=30, stop_before_apply=False,
     if stop_before_apply:
         log("")
         log("4단계까지 완료했습니다. 화면에서 '송장번호(수정용)' 컬럼을 확인한 뒤")
-        log("[송장번호수정] 버튼을 직접 눌러주세요.")
+        log("채워진 행을 체크하고 [송장번호수정] 버튼을 직접 눌러주세요.")
         return result
 
     log("")
-    log(f"[5/5] [송장번호수정]으로 쇼핑몰까지 반영 ({rows}건, 한 건씩)")
-    result.applied = upload.apply_one_by_one(order_ids, log=log)
+    log(f"[5/{STEPS}] 송장이 채워진 행만 체크하고 [송장번호수정]")
     try:
-        upload.filter_grid("", log=log)      # 목록 원상복구
-    except upload.UploadError as e:
-        log(f"  경고: 목록 필터를 되돌리지 못했습니다 - {e}")
+        picked = upload.select_registered_rows(log=log)
+        if picked > rows:
+            raise upload.UploadError(
+                f"송장이 채워진 행이 {picked}건으로 CSV({rows}건)보다 많습니다. "
+                "필터가 제대로 걸리지 않았을 수 있어 아무것도 반영하지 않았습니다.")
+        if picked < rows:
+            log(f"  경고: CSV는 {rows}건인데 화면에서 채워진 건 {picked}건입니다 "
+                "- 채워진 건만 반영합니다.")
+        result.apply_status = upload.apply_tracking(picked, log=log)
+        result.applied_count = picked
+    except (upload.UploadError, grid.GridError) as e:
+        result.stopped_reason = str(e)
+        log(f"중단: {e}")
+        upload.cleanup_stray_dialogs()
+        return result
+
+    log("")
+    log(f"[6/{STEPS}] 마무리")
+    if not result.apply_ok:
+        log(f"  결과에 오류가 있어 송장수정모드를 켜둔 채로 둡니다: {result.apply_status!r}")
+        log("  샵마인 화면에서 직접 확인해주세요.")
+        return result
+    try:
+        upload.wait_until_idle(log=log)
+        grid.clear_all_checks(upload.main_window(), log=log)
+        upload.disable_edit_mode(log=log)
+    except (upload.UploadError, grid.GridError) as e:
+        log(f"  경고: 마무리 정리를 끝내지 못했습니다 - {e}")
     return result
 
 
-def run_full(*, limit=None, max_apply=30, tab="배송중", stop_before_apply=False,
+def run_full(*, limit=None, max_apply=100, tab="배송중", stop_before_apply=False,
              headless=False, skip_cjonstyle=False, log=print) -> PipelineResult:
-    """1~5단계 전체."""
+    """1~6단계 전체."""
     result = PipelineResult()
-    if not export_and_lookup(result, limit=limit, tab=tab, headless=headless,
-                             skip_cjonstyle=skip_cjonstyle, log=log):
+    if not select_and_export(result, tab=tab, log=log):
         return result
 
+    lookup_tracking(result, limit=limit, headless=headless,
+                    skip_cjonstyle=skip_cjonstyle, log=log)
     if result.lookup_counts.get("success", 0) == 0:
         result.stopped_reason = "조회 성공 건이 없어 종료했습니다 (샵마인은 건드리지 않음)."
         log("")
@@ -164,9 +220,9 @@ def run_full(*, limit=None, max_apply=30, tab="배송중", stop_before_apply=Fal
                      stop_before_apply=stop_before_apply, log=log, result=result)
 
 
-def run_from_csv(csv_path, *, max_apply=30, stop_before_apply=False,
+def run_from_csv(csv_path, *, max_apply=100, stop_before_apply=False,
                  log=print) -> PipelineResult:
-    """이미 만들어둔 CSV로 3~5단계만."""
+    """이미 만들어둔 CSV로 4~6단계만."""
     result = PipelineResult()
     csv_path = Path(csv_path)
     if not csv_path.exists():
@@ -187,10 +243,10 @@ def summarize(result: PipelineResult) -> str:
     """실행 결과를 사람이 읽을 한 덩어리 요약으로."""
     if result.stopped_reason and not result.applied:
         return f"중단됨: {result.stopped_reason}"
-    ok, bad = result.applied_ok, result.applied_bad
-    lines = [f"반영 성공 {len(ok)}건 / 실패 {len(bad)}건"]
-    for o, s in bad:
-        lines.append(f"  실패 {o}: {s}")
-    if bad:
-        lines.append("실패 건은 샵마인에서 직접 확인해주세요.")
-    return "\n".join(lines)
+    if not result.applied:
+        return "반영한 건이 없습니다."
+    if result.apply_ok:
+        return f"반영 완료 {result.applied_count}건 (결과: {result.apply_status})"
+    return (f"반영 시도 {result.applied_count}건 - 결과 창에 오류가 있습니다: "
+            f"{result.apply_status or '(문구 없음)'}\n"
+            "샵마인 화면에서 직접 확인해주세요.")

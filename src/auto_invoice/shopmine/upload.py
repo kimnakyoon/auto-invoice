@@ -1,15 +1,21 @@
-"""3~5단계 - 생성된 CSV를 샵마인에 올리고, 쇼핑몰까지 반영한다.
+"""배송중 탭에서 대상 주문을 고르고, CSV를 올려, 쇼핑몰까지 반영한다.
 
 실제 화면 흐름 (2026-08-27 실측 검증):
 
     [배송중 탭]
-      --[송장수정모드 켜기] 클릭--> [송장번호수정(S)] / [발송정보일괄등록(수정용)(U)] 등장
+      --수집 결과 필터에 '경동택배' + [수집결과내 검색]--> 그 택배사 주문만 남음
+      --[송장수정모드 켜기]--> [송장번호수정(S)] / [발송정보일괄등록(수정용)(U)]
+          등장 + 그리드 앞에 '택배사(수정용)/송장번호(수정용)' 컬럼 추가
+      --헤더 [전체선택] 체크--> 필터에 걸린 행 전부 체크 (필터를 바꿔도 유지됨)
+      --필터 '직접' + 전체선택--> 직접전달 건도 함께 체크
+      --필터초기화(F8) --> [엑셀파일생성](Alt+X): 체크된 행만 내보내진다
       --Alt+U--> '발송정보일괄등록' 창 (순수 WinForms, 컨트롤 전부 HWND 있음)
       --경로 EDIT 에 CSV 경로 설정 + [일괄등록(&S)]-->
           '발송정보일괄등록 결과' 창 ... 그리드의 '송장번호(수정용)' 컬럼이 채워짐
-      --결과/등록창 닫기--> 대상 행 체크 --> [송장번호수정] 클릭
+      --송장번호(수정용)가 채워진 행만 체크 --> [송장번호수정] 클릭
       --'선택한 N개의 주문을 [송장번호수정] 하시겠습니까?' --[예]-->
           '송장번호수정 결과' 창 ('오류없음.' 이면 성공)
+      --오류가 없으면 [송장수정모드 끄기]
 
 안전장치의 핵심은 마지막 확인 대화상자다. 이 창이 '선택한 N개'라고 건수를
 알려주므로, N이 기대와 다르면 [예] 대신 [아니요]를 눌러 아무것도 반영하지
@@ -17,24 +23,24 @@
 
 '발송정보일괄등록 결과' 창은 처리가 끝나도 라벨이 "처리중입니다."에서 안
 바뀐다. 이 문구로 완료를 판단하면 안 된다 - 실제 반영 여부는 그리드의
-'송장번호(수정용)' 컬럼으로 확인해야 한다.
+'송장번호(수정용)' 컬럼으로 확인해야 한다(grid.py).
 """
 
 from __future__ import annotations
 
-import ctypes
-import ctypes.wintypes as wt
 import re
 import time
 from pathlib import Path
 
-from . import winui
+from . import grid, winui
 
+VK_A = 0x41
 VK_U = 0x55
 VK_RETURN = 0x0D
 VK_F8 = 0x77
 
 UPLOAD_WINDOW = "발송정보일괄등록"
+OPEN_DIALOG_TITLE = "열기"
 UPLOAD_RESULT_WINDOW = "발송정보일괄등록 결과"
 APPLY_RESULT_WINDOW = "송장번호수정 결과"
 CONFIRM_WINDOW = "질문"
@@ -43,41 +49,25 @@ CONFIRM_WINDOW = "질문"
 # 클릭 전에 winui.safe_click 이 가림/커서도달을 검증한다.
 REL_EDIT_MODE_TOGGLE = (77, 285)     # [송장수정모드 켜기/끄기]
 REL_APPLY_BUTTON = (202, 285)        # [송장번호수정(S)]
-REL_FIRST_ROW_CHECKBOX = (44, 415)   # 그리드 첫 데이터 행의 체크박스
 SEARCH_EDIT_HINT = (98, 210)         # 수집 결과 필터 입력란
 FILTER_STATUS_HINT = (495, 222)      # '필터안됨.' / '"xxx"(으)로 필터됨.' 라벨
-
-# 행 체크박스 상태 판정. 실측된 색은 세 가지다:
-#   (25,110,191) / (0,95,184)  체크됨      - 파랑
-#   (243,243,243)              미체크      - 흰색
-#   (130,135,144)              그리드 잠김 - 무채색 회색
-# 밝기로 가르면 '잠김'을 체크로 오판한다. 파랑인지(B가 R보다 충분히 큰지)로
-# 판정해야 세 상태가 정확히 갈린다.
-CHECKBOX_BLUE_MARGIN = 40
+BULK_INPUT_EDIT_HINT = (599, 309)    # 송장수정모드에서만 나타나는 '송장번호 일괄입력' 칸
 
 # [송장번호수정]은 실제로 쇼핑몰에 접속해 송장을 등록한다. 그동안 '쇼핑몰 연결'
-# 창이 뜨고 그리드가 잠기는데, 이를 기다리지 않고 다음 건을 클릭하면 클릭이
+# 창이 뜨고 그리드가 잠기는데, 이를 기다리지 않고 다음 조작을 하면 클릭이
 # 먹지 않는다. 8건 중 5건이 처음에 이 이유로 반영되지 않았다.
 BUSY_WINDOW = "쇼핑몰 연결"
 
-
-def _is_checked(color) -> bool:
-    """체크박스가 체크됐는지 (파란색인지) 판정한다."""
-    if color is None:
-        return False
-    r, g, b = color
-    return b - r > CHECKBOX_BLUE_MARGIN
+# 송장을 고쳐야 하는 주문의 '수정 전 택배사'. 샵마인이 이 두 값일 때만
+# 송장번호(수정용)를 비워두므로, 목록을 고르는 기준이자 반영 여부의 근거다.
+TARGET_COURIERS = ("경동택배", "직접")
 
 
-def _is_grid_locked(color) -> bool:
-    """그리드가 잠긴(로딩 중) 상태의 무채색 회색인지."""
-    if color is None:
-        return True
-    r, g, b = color
-    return abs(b - r) <= CHECKBOX_BLUE_MARGIN and sum(color) / 3.0 < 200
+class UploadError(RuntimeError):
+    """업로드/반영 도중 안전하게 중단해야 하는 상황."""
 
 
-def wait_until_idle(timeout: float = 180.0, log=print) -> bool:
+def wait_until_idle(timeout: float = 300.0, log=print) -> bool:
     """샵마인이 쇼핑몰 연결/처리를 끝낼 때까지 기다린다."""
     end = time.time() + timeout
     waited = False
@@ -94,168 +84,117 @@ def wait_until_idle(timeout: float = 180.0, log=print) -> bool:
     return False
 
 
-class UploadError(RuntimeError):
-    """업로드/반영 도중 안전하게 중단해야 하는 상황."""
-
-
-def _main_window():
+def main_window():
     wins = winui.find_windows(title_startswith="ShopMine::")
     if not wins:
         raise UploadError("샵마인이 실행 중이지 않습니다.")
     return wins[0][0]
 
 
-def _children(parent):
-    u = winui.u
-    kids = []
-    u.EnumChildWindows(parent, winui.ENUM(lambda h, l: (kids.append(h), True)[1]), 0)
-    return kids
-
-
-def _class_of(hwnd):
-    b = ctypes.create_unicode_buffer(256)
-    winui.u.GetClassNameW(hwnd, b, 256)
-    c = b.value
-    if c.startswith("WindowsForms10.") and "." in c:
-        return c.split(".")[1]
-    return c
-
-
-def _find_control(parent, cls_name, predicate):
-    for k in _children(parent):
-        if _class_of(k) == cls_name and predicate(k):
-            return k
-    return None
-
-
 def _rect(hwnd):
-    r = wt.RECT()
-    winui.u.GetWindowRect(hwnd, ctypes.byref(r))
-    return r
+    return winui.rect(hwnd)
+
+
+def _near(hwnd, base, hint, tol_x=25, tol_y=20) -> bool:
+    r = _rect(hwnd)
+    return (abs((r.left - base.left) - hint[0]) < tol_x
+            and abs((r.top - base.top) - hint[1]) < tol_y
+            and winui.u.IsWindowVisible(hwnd))
 
 
 def _click_control(hwnd, owner, label):
-    """자식 컨트롤을 그 중심좌표로 클릭한다 (가림/커서도달 검증 포함).
+    """HWND를 가진 버튼을 BM_CLICK으로 누른다 (커서를 쓰지 않는다).
 
-    사용자가 실행 중에 마우스를 움직이면 커서가 목표에 도달하지 못하는데,
-    winui.move_click 이 그때 RuntimeError 를 낸다. 파이프라인이 다루는
-    UploadError 로 바꿔서 '안전하게 중단'으로 처리되게 한다.
+    좌표 클릭이면 실행 중 사람이 마우스를 건드릴 때마다 중단된다. 컨트롤이
+    HWND를 갖는 곳에서는 그럴 이유가 없다. 각 호출부가 결과(창이 뜨는지,
+    필터 라벨이 바뀌는지)로 눌렸는지 확인하므로 클릭 자체를 검증하진 않는다.
     """
-    r = _rect(hwnd)
-    cx, cy = (r.left + r.right) // 2, (r.top + r.bottom) // 2
     winui.bring_to_front(owner)
     time.sleep(0.35)
-    if not winui.is_descendant(winui.window_at(cx, cy), owner):
-        raise UploadError(f"[{label}] 버튼이 다른 창에 가려져 있습니다.")
-    try:
-        winui.move_click(cx, cy)
-    except RuntimeError as e:
-        raise UploadError(
-            f"[{label}] {e} (실행 중 마우스를 움직이면 이렇게 됩니다)") from e
-
-
-def find_search_edit(main_hwnd):
-    """'수집 결과 필터' 입력란을 창 상대 위치로 찾는다."""
-    base = _rect(main_hwnd)
-
-    def is_search(k):
-        rr = _rect(k)
-        rel = (rr.left - base.left, rr.top - base.top)
-        return (abs(rel[0] - SEARCH_EDIT_HINT[0]) < 40
-                and abs(rel[1] - SEARCH_EDIT_HINT[1]) < 40
-                and winui.u.IsWindowVisible(k))
-
-    return _find_control(main_hwnd, "EDIT", is_search)
+    winui.press_button(hwnd)
 
 
 def _close_window(title, log=print):
-    for h, _t, _rect_ in winui.find_windows(title_equals=title):
-        btn = _find_control(h, "BUTTON", lambda k: winui.ctrl_text(k).startswith("닫기"))
+    for h, _t, _r in winui.find_windows(title_equals=title):
+        btn = winui.find_child(h, "BUTTON",
+                               lambda k: winui.ctrl_text(k).startswith("닫기"))
         if btn is None:
             continue
-        try:
-            _click_control(btn, h, f"{title} 닫기")
+        _click_control(btn, h, f"{title} 닫기")
+        if winui.wait_for_window_gone(title_equals=title, timeout=8.0):
             log(f"  '{title}' 닫음")
-        except UploadError as e:
-            log(f"  경고: {e}")
-        time.sleep(1.2)
+        else:
+            log(f"  경고: '{title}' 창이 닫히지 않았습니다.")
+
+
+# --- 송장수정모드 ---------------------------------------------------
+# 툴바 버튼은 HWND를 갖지 않아 글자를 읽을 수 없다. 대신 송장수정모드에서만
+# 나타나는 '송장번호 일괄입력(수정용)' 입력란(EDIT)이 있는지로 판정한다.
+# 예전에는 Alt+U 로 업로드 창이 열리는지 봤는데, 확인만 하려고 창을 여닫는
+# 부작용이 있었다.
+
+def edit_mode_on(main_hwnd=None) -> bool:
+    """송장수정모드가 켜져 있는가."""
+    main_hwnd = main_hwnd or main_window()
+    base = _rect(main_hwnd)
+    return winui.find_child(
+        main_hwnd, "EDIT", lambda k: _near(k, base, BULK_INPUT_EDIT_HINT)) is not None
+
+
+def _toggle_edit_mode(main_hwnd, label):
+    if not winui.bring_to_front(main_hwnd):
+        raise UploadError("샵마인 창을 앞으로 가져오지 못했습니다.")
+    time.sleep(0.5)
+    ok, msg = winui.safe_click(main_hwnd, REL_EDIT_MODE_TOGGLE, label=label)
+    if not ok:
+        raise UploadError(msg)
+    time.sleep(2.0)
+    return msg
 
 
 def ensure_edit_mode(log=print) -> None:
-    """송장수정모드를 켠다 (이미 켜져 있으면 그대로 둔다).
-
-    Alt+U 로 업로드 창이 열리는지로 현재 모드를 판정한다 - 툴바 글자를
-    읽을 수 없기 때문(버튼이 HWND를 갖지 않음)이다.
-    """
-    main = _main_window()
-    if not winui.bring_to_front(main):
-        raise UploadError("샵마인 창을 앞으로 가져오지 못했습니다.")
-    time.sleep(0.5)
-
-    winui.key(VK_U, alt=True)
-    if winui.wait_for_window(title_equals=UPLOAD_WINDOW, timeout=3.0) is not None:
-        log("  송장수정모드: 이미 켜져 있음 (업로드 창 열림)")
+    """송장수정모드를 켠다 (이미 켜져 있으면 그대로 둔다)."""
+    main = main_window()
+    if edit_mode_on(main):
+        log("  송장수정모드: 이미 켜져 있음")
         return
+    log(f"  {_toggle_edit_mode(main, '송장수정모드 켜기')}")
+    if not edit_mode_on(main):
+        raise UploadError(
+            "[송장수정모드 켜기]를 눌렀는데 모드가 켜지지 않았습니다. "
+            "배송중 탭이 아니거나 화면 상태가 다를 수 있습니다.")
+    log("  송장수정모드 켜짐 확인")
 
-    ok, msg = winui.safe_click(main, REL_EDIT_MODE_TOGGLE, label="송장수정모드 켜기")
-    log(f"  {msg}")
-    if not ok:
-        raise UploadError(msg)
-    time.sleep(1.5)
+
+def disable_edit_mode(log=print) -> None:
+    """송장수정모드를 끈다 (모두 정상 반영된 뒤 마무리)."""
+    main = main_window()
+    if not edit_mode_on(main):
+        log("  송장수정모드: 이미 꺼져 있음")
+        return
+    log(f"  {_toggle_edit_mode(main, '송장수정모드 끄기')}")
+    if edit_mode_on(main):
+        raise UploadError("[송장수정모드 끄기]를 눌렀는데 모드가 꺼지지 않았습니다.")
+    log("  송장수정모드 꺼짐 확인")
 
 
-def bulk_register(csv_path, log=print) -> None:
-    """3~4단계: CSV를 발송정보일괄등록(수정용)으로 올린다."""
-    csv_file = Path(csv_path).resolve()
-    if not csv_file.exists():
-        raise UploadError(f"CSV 파일이 없습니다: {csv_file}")
-    csv_str = str(csv_file).replace("/", "\\")
+# --- 수집 결과 필터 -------------------------------------------------
 
-    main = _main_window()
-    existing = winui.find_windows(title_equals=UPLOAD_WINDOW)
-    if existing:
-        upload_hwnd = existing[0][0]
-    else:
-        winui.bring_to_front(main)
-        time.sleep(0.4)
-        winui.key(VK_U, alt=True)
-        found = winui.wait_for_window(title_equals=UPLOAD_WINDOW, timeout=15.0)
-        if found is None:
-            raise UploadError(
-                "Alt+U 후 '발송정보일괄등록' 창이 열리지 않았습니다. "
-                "송장수정모드가 꺼져 있거나 배송중 탭이 아닐 수 있습니다.")
-        upload_hwnd = found[0]
-    log(f"  발송정보일괄등록 창 확인 (hwnd={upload_hwnd})")
+def _search_edit(main_hwnd):
+    base = _rect(main_hwnd)
+    return winui.find_child(main_hwnd, "EDIT",
+                            lambda k: _near(k, base, SEARCH_EDIT_HINT, 40, 40))
 
-    def is_path_edit(k):
-        if winui.ctrl_text(winui.u.GetParent(k)) != "엑셀 파일 열기":
-            return False
-        rr = _rect(k)
-        return rr.right - rr.left > 200
 
-    path_edit = _find_control(upload_hwnd, "EDIT", is_path_edit)
-    if path_edit is None:
-        raise UploadError("엑셀 경로 입력란을 찾지 못했습니다.")
+def _search_button(main_hwnd):
+    base = _rect(main_hwnd)
 
-    if not winui.set_ctrl_text(path_edit, csv_str):
-        raise UploadError(f"경로가 입력란에 반영되지 않았습니다: {csv_str}")
-    log(f"  경로 입력: {csv_str}")
+    def hit(k):
+        return (winui.ctrl_text(k).startswith("수집결과내 검색")
+                and winui.u.IsWindowVisible(k)
+                and _rect(k).left - base.left > 0)
 
-    submit = _find_control(upload_hwnd, "BUTTON",
-                           lambda k: winui.ctrl_text(k).startswith("일괄등록"))
-    if submit is None:
-        raise UploadError("[일괄등록] 버튼을 찾지 못했습니다.")
-
-    _click_control(submit, upload_hwnd, "일괄등록")
-    log("  [일괄등록] 클릭")
-
-    if winui.wait_for_window(title_equals=UPLOAD_RESULT_WINDOW, timeout=30.0) is None:
-        raise UploadError("'발송정보일괄등록 결과' 창이 뜨지 않았습니다.")
-    time.sleep(2.0)
-    log("  일괄등록 결과 창 확인")
-
-    _close_window(UPLOAD_RESULT_WINDOW, log)
-    _close_window(UPLOAD_WINDOW, log)
+    return winui.find_child(main_hwnd, "BUTTON", hit)
 
 
 def filter_status(main_hwnd) -> str:
@@ -264,13 +203,16 @@ def filter_status(main_hwnd) -> str:
     '필터안됨.' 또는 '" 12345"(으)로 필터됨.' 형태다. 이 문구가 필터가
     실제로 걸렸는지를 확인할 수 있는 유일하게 확실한 근거다 - 그리드 셀은
     HWND가 없어 읽을 수 없기 때문이다.
+
+    주의: 필터초기화(F8) 뒤에는 이 라벨이 갱신되지 않고 직전 문구가 그대로
+    남는다. 초기화 확인용으로는 쓸 수 없다.
     """
     base = _rect(main_hwnd)
-    for k in _children(main_hwnd):
-        if not winui.u.IsWindowVisible(k) or _class_of(k) != "STATIC":
+    for k in winui.children(main_hwnd):
+        if not winui.u.IsWindowVisible(k) or winui.class_of(k) != "STATIC":
             continue
-        rr = _rect(k)
-        rel = (rr.left - base.left, rr.top - base.top)
+        r = _rect(k)
+        rel = (r.left - base.left, r.top - base.top)
         if abs(rel[0] - FILTER_STATUS_HINT[0]) < 220 and abs(rel[1] - FILTER_STATUS_HINT[1]) < 30:
             tx = winui.ctrl_text(k)
             if "필터" in tx:
@@ -278,85 +220,228 @@ def filter_status(main_hwnd) -> str:
     return ""
 
 
-def filter_grid(keyword, log=print, verify: bool = True) -> None:
-    """수집 결과 필터로 목록을 좁힌다. 빈 값이면 F8로 초기화한다.
+def set_filter(keyword, log=print) -> None:
+    """수집 결과 필터로 목록을 좁힌다.
 
-    필터가 실제로 걸렸는지 반드시 확인한다. 필터가 안 걸린 채로 다음 단계에
-    가면 목록 첫 행은 '엉뚱한 주문'이고, 그 상태로 체크 후 [송장번호수정]을
-    누르면 확인 대화상자는 여전히 '선택한 1개'라고 말한다. 즉 건수 검증만으로는
-    막을 수 없다.
+    입력란에 값만 넣고 Enter를 치면 포커스가 없어 필터가 걸리지 않는다
+    (실제로 '경동택배'가 조용히 무시됐다). [수집결과내 검색] 버튼을 직접
+    누른다 - 이 버튼은 HWND가 있어 좌표에 의존하지 않는다.
+
+    필터가 실제로 걸렸는지 반드시 확인한다. 필터가 안 걸린 채로 전체선택을
+    하면 목록 전체가 체크되는데, 건수 검증만으로는 막을 수 없다.
     """
-    main = _main_window()
+    main = main_window()
     winui.bring_to_front(main)
     time.sleep(0.4)
-    edit = find_search_edit(main)
+    edit = _search_edit(main)
     if edit is None:
-        raise UploadError("검색 필터 입력란을 찾지 못했습니다.")
-    winui.set_ctrl_text(edit, keyword or "")
+        raise UploadError("수집 결과 필터 입력란을 찾지 못했습니다.")
+    button = _search_button(main)
+    if button is None:
+        raise UploadError("[수집결과내 검색] 버튼을 찾지 못했습니다.")
+
+    if not winui.set_ctrl_text(edit, keyword):
+        raise UploadError(f"필터 입력란에 '{keyword}'가 들어가지 않았습니다.")
     time.sleep(0.3)
-    winui.key(VK_RETURN if keyword else VK_F8)
+    _click_control(button, main, "수집결과내 검색")
     time.sleep(2.5)
 
-    if not keyword:
-        log("  목록 필터 초기화 (F8)")
-        return
-
     status = filter_status(main)
-    if verify and keyword not in status:
+    if keyword not in status:
         raise UploadError(
             f"필터가 '{keyword}'로 걸리지 않았습니다 (화면 표시: {status or '(읽을 수 없음)'}). "
-            "목록에 없는 주문이거나 화면이 갱신되지 않았습니다. "
-            "이대로 진행하면 엉뚱한 주문이 반영될 수 있어 중단합니다.")
+            "이대로 진행하면 엉뚱한 주문이 선택될 수 있어 중단합니다.")
     log(f"  목록 필터: {status}")
 
 
-def ensure_row_checked(main_hwnd, log=print, attempts: int = 4) -> None:
-    """그리드 첫 행의 체크박스가 '실제로 체크될 때까지' 확인하며 클릭한다.
+def reset_filter(log=print) -> None:
+    """필터초기화(F8). 체크해둔 행은 그대로 남는다."""
+    main = main_window()
+    winui.bring_to_front(main)
+    time.sleep(0.4)
+    edit = _search_edit(main)
+    if edit is not None:
+        winui.set_ctrl_text(edit, "")
+        time.sleep(0.2)
+    winui.bring_to_front(main)
+    time.sleep(0.3)
+    winui.key(VK_F8)
+    time.sleep(2.5)
+    log("  목록 필터 초기화 (F8)")
 
-    클릭이 들어갔다고 체크되는 게 아니다. 목록 필터를 바꾼 직후에는 그리드가
-    아직 갱신 중이라 클릭이 먹지 않는데, 그 상태로 [송장번호수정]을 누르면
-    샵마인이 '선택 0건'으로 보고 확인 대화상자를 아예 띄우지 않는다.
-    실제로 8건 중 5건이 이 이유로 반영되지 않았다.
+
+# --- 1단계: 반영할 주문 고르기 --------------------------------------
+
+def select_target_orders(keywords, log=print) -> int:
+    """송장을 고쳐야 할 주문(택배사가 경동택배/직접전달인 건)을 체크한다.
+
+    키워드마다 필터를 걸고 헤더 [전체선택]을 누른다. 체크 상태는 필터를 바꿔도,
+    필터를 초기화해도 유지되므로 마지막에 초기화하면 두 그룹이 모두 체크된
+    상태로 남는다.
     """
-    base = _rect(main_hwnd)
-    ax = base.left + REL_FIRST_ROW_CHECKBOX[0]
-    ay = base.top + REL_FIRST_ROW_CHECKBOX[1]
+    main = main_window()
+    total = 0
+    for keyword in keywords:
+        log(f"  '{keyword}' 검색")
+        set_filter(keyword, log=log)
+        total += grid.check_all_filtered(main, log=log)
+    reset_filter(log=log)
+    if total == 0:
+        raise UploadError(
+            f"{'/'.join(keywords)} 에 해당하는 주문이 하나도 없습니다. "
+            "고칠 송장이 없으니 아무것도 하지 않고 멈춥니다.")
+    return total
 
-    for i in range(attempts):
-        color = winui.pixel(ax, ay)
-        if _is_checked(color):
-            log(f"  행 선택 확인됨 (체크 색 {color})")
-            time.sleep(0.6)     # 그리드가 선택을 반영할 틈을 준다
-            return
-        if _is_grid_locked(color):
-            # 아직 로딩/연결 중이다. 클릭해봐야 먹지 않으므로 기다린다.
-            wait_until_idle(log=log)
+
+# --- 3~4단계: CSV 업로드 --------------------------------------------
+
+def _open_upload_window(main_hwnd):
+    """Alt+U 로 '발송정보일괄등록' 창을 연다.
+
+    Alt+U 는 '지금 포커스를 가진 창'으로 간다. 공급사 조회 단계에서 브라우저가
+    떠 있으면 샵마인이 앞으로 나오지 못한 채 단축키가 브라우저로 새고, 창이
+    안 열려서 멈춘다 (실제로 그렇게 실패했다). 그래서 앞으로 가져오는 데
+    성공했는지를 반드시 확인하고, 한 번 더 시도한다.
+    """
+    last = ""
+    for attempt in (1, 2, 3):
+        if not winui.bring_to_front(main_hwnd):
+            last = ("샵마인 창을 앞으로 가져오지 못했습니다 - 다른 창(브라우저 등)이 "
+                    "앞을 막고 있습니다.")
             time.sleep(1.5)
             continue
-        if not winui.is_descendant(winui.window_at(ax, ay), main_hwnd):
-            raise UploadError("행 체크박스가 다른 창에 가려져 있습니다.")
-        winui.move_click(ax, ay)
-        time.sleep(0.8 + 0.4 * i)      # 갱신이 늦을 수 있으니 점점 더 기다린다
+        time.sleep(0.8)
+        winui.key(VK_U, alt=True)
+        found = winui.wait_for_window(title_equals=UPLOAD_WINDOW, timeout=15.0)
+        if found is not None:
+            return found[0]
+        last = ("Alt+U 후 '발송정보일괄등록' 창이 열리지 않았습니다. "
+                "송장수정모드가 꺼져 있거나 배송중 탭이 아닐 수 있습니다.")
+    raise UploadError(last)
 
-    raise UploadError(
-        f"행 체크박스가 체크되지 않았습니다 (마지막 색 {winui.pixel(ax, ay)}). "
-        "목록이 비었거나 화면이 아직 갱신 중일 수 있습니다.")
+
+def _path_edit(upload_hwnd):
+    def hit(k):
+        if winui.ctrl_text(winui.u.GetParent(k)) != "엑셀 파일 열기":
+            return False
+        r = winui.rect(k)
+        return r.right - r.left > 200
+    return winui.find_child(upload_hwnd, "EDIT", hit)
 
 
-def apply_tracking(expected_count: int, log=print, select_rows: bool = True,
-                   close_result: bool = True) -> str:
-    """5단계: 체크한 행을 [송장번호수정]으로 쇼핑몰까지 반영한다.
+def _pick_csv_file(upload_hwnd, csv_str, log=print) -> None:
+    """[찾아보기]로 CSV 파일을 고른다.
+
+    경로 입력란에 WM_SETTEXT 로 값만 넣으면 **화면에는 제대로 보이는데
+    [일괄등록]은 0건을 처리한다.** 샵마인이 그 텍스트가 아니라 '대화상자로
+    고른 파일'을 쓰기 때문이다. 결과 창도 빈 채로 "준비."만 뜨고 오류조차
+    알려주지 않아서, 3건이 조용히 반영되지 않은 걸 그리드를 보고서야 알았다.
+    그래서 반드시 대화상자를 거친다.
+    """
+    browse = winui.find_child(upload_hwnd, "BUTTON",
+                              lambda k: winui.ctrl_text(k).startswith("찾아보기"))
+    if browse is None:
+        raise UploadError("[찾아보기] 버튼을 찾지 못했습니다.")
+    winui.bring_to_front(upload_hwnd)
+    time.sleep(0.4)
+    winui.press_button(browse)
+
+    dlg = winui.wait_for_window(title_equals=OPEN_DIALOG_TITLE, timeout=15.0)
+    if dlg is None:
+        raise UploadError(f"[찾아보기] 후 '{OPEN_DIALOG_TITLE}' 대화상자가 뜨지 않았습니다.")
+    if not winui.bring_to_front(dlg[0]):
+        raise UploadError("파일 선택 대화상자를 앞으로 가져오지 못했습니다.")
+    time.sleep(0.5)
+    winui.ctrl_key(VK_A)
+    time.sleep(0.2)
+    winui.type_text(csv_str)
+    time.sleep(0.4)
+    winui.key(VK_RETURN)
+
+    if not winui.wait_for_window_gone(title_equals=OPEN_DIALOG_TITLE, timeout=15.0):
+        raise UploadError(
+            f"파일 선택 대화상자가 닫히지 않았습니다 - 경로가 거부됐을 수 있습니다: {csv_str}")
+
+    edit = _path_edit(upload_hwnd)
+    shown = winui.ctrl_text(edit) if edit is not None else ""
+    if csv_str not in shown:
+        raise UploadError(f"고른 파일이 경로칸에 반영되지 않았습니다 (화면: {shown!r}).")
+    log(f"  파일 선택: {csv_str}")
+
+
+def bulk_register(csv_path, log=print) -> None:
+    """CSV를 발송정보일괄등록(수정용)으로 올리고 [일괄등록]까지 누른다."""
+    csv_file = Path(csv_path).resolve()
+    if not csv_file.exists():
+        raise UploadError(f"CSV 파일이 없습니다: {csv_file}")
+    csv_str = str(csv_file).replace("/", "\\")
+
+    main = main_window()
+    existing = winui.find_windows(title_equals=UPLOAD_WINDOW)
+    if existing:
+        upload_hwnd = existing[0][0]
+    else:
+        upload_hwnd = _open_upload_window(main)
+    log(f"  발송정보일괄등록 창 확인 (hwnd={upload_hwnd})")
+
+    _pick_csv_file(upload_hwnd, csv_str, log=log)
+
+    submit = winui.find_child(upload_hwnd, "BUTTON",
+                              lambda k: winui.ctrl_text(k).startswith("일괄등록"))
+    if submit is None:
+        raise UploadError("[일괄등록] 버튼을 찾지 못했습니다.")
+
+    _click_control(submit, upload_hwnd, "일괄등록")
+    log("  [일괄등록] 클릭")
+
+    if winui.wait_for_window(title_equals=UPLOAD_RESULT_WINDOW, timeout=60.0) is None:
+        raise UploadError("'발송정보일괄등록 결과' 창이 뜨지 않았습니다.")
+    time.sleep(2.0)
+    log("  일괄등록 결과 창 확인")
+
+    _close_window(UPLOAD_RESULT_WINDOW, log)
+    _close_window(UPLOAD_WINDOW, log)
+
+
+# --- 5단계: 쇼핑몰까지 반영 -----------------------------------------
+
+def select_registered_rows(log=print) -> int:
+    """일괄등록으로 송장번호(수정용)가 채워진 행만 체크한다.
+
+    송장수정모드에서 이 컬럼은 원래 값으로 미리 채워져 있고 경동택배·직접전달
+    행만 비어 있다. 그 두 필터 안에서 '채워짐'은 곧 '이번 일괄등록이 반영됨'을
+    뜻한다 - 조회에 실패해 CSV에 없던 건은 여전히 비어 있다.
+    """
+    main = main_window()
+    if not edit_mode_on(main):
+        raise UploadError(
+            "송장수정모드가 꺼져 있습니다. 그 상태에서는 '송장번호(수정용)' 컬럼이 "
+            "화면에 없어 어떤 행이 반영됐는지 알 수 없습니다.")
+    grid.clear_all_checks(main, log=log)
+    total = 0
+    for keyword in TARGET_COURIERS:
+        set_filter(keyword, log=log)
+        n = grid.check_filled_rows(main, log=log)
+        log(f"  '{keyword}' 에서 송장이 채워진 {n}건 체크")
+        total += n
+    reset_filter(log=log)
+    if total == 0:
+        raise UploadError(
+            "송장번호(수정용)가 채워진 행을 하나도 찾지 못했습니다. "
+            "일괄등록이 실제로 반영되지 않았을 수 있어 중단합니다.")
+    return total
+
+
+def apply_tracking(expected_count: int, log=print, close_result: bool = True) -> str:
+    """체크해둔 행을 [송장번호수정]으로 쇼핑몰까지 반영한다.
 
     확인 대화상자가 알려주는 건수가 expected_count 와 다르면 [아니요]를 눌러
     아무것도 반영하지 않고 UploadError 를 낸다. 이것이 이 파이프라인 전체의
     마지막이자 가장 중요한 안전장치다.
     """
-    main = _main_window()
+    main = main_window()
     winui.bring_to_front(main)
     time.sleep(0.5)
-
-    if select_rows:
-        ensure_row_checked(main, log=log)
 
     ok, msg = winui.safe_click(main, REL_APPLY_BUTTON, label="송장번호수정")
     log(f"  {msg}")
@@ -365,11 +450,13 @@ def apply_tracking(expected_count: int, log=print, select_rows: bool = True,
 
     dlg = winui.wait_for_window(title_equals=CONFIRM_WINDOW, timeout=15.0)
     if dlg is None:
-        raise UploadError("[송장번호수정] 확인 대화상자가 뜨지 않았습니다.")
+        raise UploadError(
+            "[송장번호수정] 확인 대화상자가 뜨지 않았습니다. "
+            "선택된 행이 없거나 화면이 갱신 중일 수 있습니다.")
     confirm_hwnd = dlg[0]
 
     message = ""
-    for k in _children(confirm_hwnd):
+    for k in winui.children(confirm_hwnd):
         tx = winui.ctrl_text(k)
         if "주문을" in tx or "송장번호수정" in tx:
             message = tx
@@ -393,14 +480,15 @@ def apply_tracking(expected_count: int, log=print, select_rows: bool = True,
     if not ok:
         raise UploadError(msg)
 
-    # 쇼핑몰 접속이 끼어 있어 결과 창까지 시간이 걸릴 수 있다.
-    res = winui.wait_for_window(title_equals=APPLY_RESULT_WINDOW, timeout=180.0)
+    # 쇼핑몰 접속이 끼어 있어 결과 창까지 시간이 오래 걸린다 (건당 수 초).
+    res = winui.wait_for_window(title_equals=APPLY_RESULT_WINDOW,
+                                timeout=max(300.0, 20.0 * count))
     if res is None:
         raise UploadError("'송장번호수정 결과' 창이 뜨지 않았습니다.")
     time.sleep(2.0)
 
     status = ""
-    for k in _children(res[0]):
+    for k in winui.children(res[0]):
         tx = winui.ctrl_text(k).strip()
         if tx.startswith("오류") and "발생건은" not in tx:
             status = tx
@@ -412,42 +500,15 @@ def apply_tracking(expected_count: int, log=print, select_rows: bool = True,
     return status
 
 
-def apply_one_by_one(order_ids, log=print) -> list:
-    """주문번호별로 목록을 1건씩 좁혀가며 [송장번호수정]을 반영한다.
-
-    한 번에 여러 건을 체크하지 않는 이유: 확인 대화상자의 건수 검증이
-    '항상 1개'라는 가장 단순하고 확실한 형태로 작동하기 때문이다. 필터가
-    잘못 걸려 다른 주문이 딸려오면 즉시 건수가 어긋나 중단된다.
-
-    반환: [(주문번호, 상태문자열 또는 예외메시지), ...]
-    """
-    results = []
-    for i, order_id in enumerate(order_ids, 1):
-        log(f"  ({i}/{len(order_ids)}) 주문 {order_id}")
-        last_error = None
-        # 확인 대화상자가 안 뜬 실패는 '아무것도 반영되지 않은' 상태이므로
-        # 재시도해도 중복 반영 위험이 없다.
-        for attempt in (1, 2):
-            try:
-                # 앞 건의 쇼핑몰 연결이 끝나기 전에 다음 건을 건드리면 안 된다.
-                wait_until_idle(log=lambda m: log(f"    {m.strip()}"))
-                filter_grid(order_id, log=lambda m: log(f"    {m.strip()}"))
-                status = apply_tracking(1, log=lambda m: log(f"    {m.strip()}"))
-                results.append((order_id, status))
-                last_error = None
-                break
-            except UploadError as e:
-                last_error = e
-                log(f"    {'실패' if attempt == 2 else '1차 실패, 재시도'}: {e}")
-                _cleanup_stray_dialogs()
-        if last_error is not None:
-            results.append((order_id, f"ERROR: {last_error}"))
-    return results
+def result_is_clean(status: str) -> bool:
+    """'송장번호수정 결과' 문구가 '오류 없음'인가."""
+    return status.startswith("오류없음")
 
 
-def _cleanup_stray_dialogs():
+def cleanup_stray_dialogs():
     """중단 후 남아 있을 수 있는 확인창/결과창을 정리한다."""
     for h, _t, _r in winui.find_windows(title_equals=CONFIRM_WINDOW):
         winui.click_dlg_button(h, winui.DLG_NO, label="확인 취소")
         time.sleep(0.6)
     _close_window(APPLY_RESULT_WINDOW, log=lambda m: None)
+
