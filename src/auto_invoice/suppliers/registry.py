@@ -11,7 +11,20 @@ from __future__ import annotations
 
 from urllib.parse import urlparse
 
-from . import fashionplus, gmarket, gsshop, hmall, lotteimall, lotteon, musinsa, naver, nsmall, ssg, thehyundai
+from . import (
+    elevenst,
+    fashionplus,
+    gmarket,
+    gsshop,
+    hmall,
+    lotteimall,
+    lotteon,
+    musinsa,
+    naver,
+    nsmall,
+    ssg,
+    thehyundai,
+)
 
 # cjonstyle(CJ온스타일)은 어댑터가 작성되어 있으나 여기에 등록하지 않는다:
 # 로그인 페이지의 Cloudflare Turnstile("사람인지 확인")이 Playwright로 띄운
@@ -43,6 +56,7 @@ register(lotteimall)
 register(hmall)
 register(thehyundai)
 register(nsmall)
+register(elevenst)
 # register(cjonstyle)  # 위 설명 참고 - Playwright로는 로그인이 막혀 미등록
 # 새 공급사 추가 예시:
 # from . import newsupplier
