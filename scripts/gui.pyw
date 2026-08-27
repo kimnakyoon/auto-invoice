@@ -24,6 +24,19 @@ from auto_invoice.orchestrator import run as run_orchestrator  # noqa: E402
 
 DESKTOP = Path.home() / "Desktop"
 
+WINDOW_WIDTH = 600
+WINDOW_HEIGHT = 460
+RIGHT_MARGIN = 40  # 화면 오른쪽 가장자리와의 여백(px)
+
+
+def _place_right_center(root: tk.Tk) -> None:
+    """창을 화면의 오른쪽 중앙에 위치시킨다."""
+    screen_width = root.winfo_screenwidth()
+    screen_height = root.winfo_screenheight()
+    x = screen_width - WINDOW_WIDTH - RIGHT_MARGIN
+    y = (screen_height - WINDOW_HEIGHT) // 2
+    root.geometry(f"{WINDOW_WIDTH}x{WINDOW_HEIGHT}+{x}+{y}")
+
 
 def find_latest_export() -> Path | None:
     candidates = sorted(DESKTOP.glob("*.xls"), key=lambda p: p.stat().st_mtime, reverse=True)
@@ -38,7 +51,7 @@ class App:
     def __init__(self, root: tk.Tk) -> None:
         self.root = root
         root.title("송장 자동화")
-        root.geometry("600x460")
+        _place_right_center(root)
         root.minsize(520, 400)
 
         self.selected_file: Path | None = find_latest_export()
