@@ -199,3 +199,58 @@ def lookup_via_chrome(orders: list[PendingOrder]) -> list[CjonstyleLookupResult]
             results[i] = _lookup_one(orders[i])
 
     return results
+
+
+def process_orders(report, input_path: str, output_path: str, log=print) -> int:
+    """orchestrator가 스킵한 CJ온스타일 주문을 크롬으로 조회해 report와
+    업로드 파일에 반영한다.
+
+    CJ온스타일은 registry.py에 어댑터가 등록되어 있지 않아(Cloudflare가
+    Playwright 자동화를 차단 - suppliers/cjonstyle.py 참고) orchestrator가
+    전부 "등록된 어댑터 없음"으로 스킵한다. 그 스킵 기록을 지우고 실제
+    조회 결과로 다시 채운다.
+
+    반환: 업로드 파일에 새로 추가된 성공 건수.
+    """
+    from .shopmine import excel_io
+
+    all_orders = excel_io.read_pending_orders(input_path)
+    cj_orders = filter_cjonstyle_orders(all_orders)
+    if not cj_orders:
+        return 0
+
+    log(f"CJ온스타일 {len(cj_orders)}건을 실제 크롬 브라우저로 확인 중입니다 "
+        "(시간이 다소 걸릴 수 있습니다)...")
+
+    cj_order_ids = {o.order_id for o in cj_orders}
+    recipient_by_id = {o.order_id: o.recipient_name for o in cj_orders}
+    report.entries = [
+        e for e in report.entries if not (e.order_id in cj_order_ids and e.status == "skip")
+    ]
+
+    try:
+        results = lookup_via_chrome(cj_orders)
+    except Exception as e:  # noqa: BLE001
+        log(f"CJ온스타일 확인 중 오류가 발생해 전부 건너뜁니다: {e}")
+        for order in cj_orders:
+            report.fail(order.order_id, f"CJ온스타일 크롬 조회 실패: {e}",
+                        recipient_name=order.recipient_name)
+        return 0
+
+    upload_rows: list[tuple[str, str, str | None]] = []
+    for r in results:
+        if r.status == "success" and r.tracking_no:
+            report.success(r.order_id, r.courier, r.tracking_no)
+            upload_rows.append((r.order_id, r.tracking_no, r.courier))
+            log(f"  {r.order_id}: 성공 ({r.courier} / {r.tracking_no})")
+        elif r.status == "not_yet":
+            report.skip(r.order_id, r.reason or "아직 송장번호 미발급")
+            log(f"  {r.order_id}: 아직 송장번호 미발급 - 건너뜀")
+        else:
+            reason = r.reason or "알 수 없는 오류"
+            report.fail(r.order_id, reason, recipient_name=recipient_by_id.get(r.order_id))
+            log(f"  {r.order_id}: 실패 ({reason})")
+
+    if upload_rows:
+        excel_io.append_upload_rows(upload_rows, output_path)
+    return len(upload_rows)

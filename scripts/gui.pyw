@@ -20,9 +20,8 @@ if sys.platform == "win32" and sys.stdout is not None:
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
 
-from auto_invoice import cjonstyle_bridge  # noqa: E402
+from auto_invoice import cjonstyle_bridge, pipeline  # noqa: E402
 from auto_invoice.orchestrator import run as run_orchestrator  # noqa: E402
-from auto_invoice.shopmine import excel_io  # noqa: E402
 
 DESKTOP = Path.home() / "Desktop"
 
@@ -60,32 +59,54 @@ class App:
         self._output_path: Path | None = None
         self._queue: "queue.Queue" = queue.Queue()
 
+        # --- 전자동: 샵마인에서 받아서 반영까지 ---
         tk.Label(
             root,
-            text="1. 샵마인 [주문관리 > 발송대상 > 엑셀파일생성]으로 받은 파일",
+            text="샵마인을 켜고 [배송중] 탭을 열어둔 뒤 아래 버튼을 누르세요.",
             anchor="w",
-        ).pack(fill="x", padx=14, pady=(14, 2))
+        ).pack(fill="x", padx=14, pady=(14, 4))
+
+        self.auto_button = tk.Button(
+            root,
+            text="⚡  전부 자동으로 처리",
+            font=("맑은 고딕", 14, "bold"),
+            bg="#188038",
+            fg="white",
+            activebackground="#0d652d",
+            activeforeground="white",
+            command=self.start_full_auto,
+        )
+        self.auto_button.pack(pady=(0, 2))
+
+        limit_frame = tk.Frame(root)
+        limit_frame.pack(pady=(0, 6))
+        tk.Label(limit_frame, text="최대 반영 건수", fg="#5f6368").pack(side="left")
+        self.max_apply = tk.Spinbox(limit_frame, from_=1, to=200, width=5)
+        self.max_apply.delete(0, "end")
+        self.max_apply.insert(0, "30")
+        self.max_apply.pack(side="left", padx=(6, 0))
+        tk.Label(limit_frame, text="건을 넘으면 멈춤", fg="#5f6368").pack(side="left", padx=(6, 0))
+
+        tk.Frame(root, height=1, bg="#dadce0").pack(fill="x", padx=14, pady=6)
+
+        # --- 파일만 만들기 (예전 방식) ---
+        tk.Label(
+            root,
+            text="또는, 이미 받아둔 엑셀로 업로드 파일만 만들기",
+            anchor="w",
+            fg="#5f6368",
+        ).pack(fill="x", padx=14)
 
         file_frame = tk.Frame(root)
-        file_frame.pack(fill="x", padx=14)
+        file_frame.pack(fill="x", padx=14, pady=(4, 0))
         self.file_label = tk.Label(file_frame, text=self._file_display(), anchor="w", fg="#1a73e8")
         self.file_label.pack(side="left", fill="x", expand=True)
         tk.Button(file_frame, text="다른 파일 선택...", command=self.choose_file).pack(side="right")
 
-        tk.Label(
-            root,
-            text="2. 아래 버튼을 누르면 송장번호를 자동으로 조회합니다",
-            anchor="w",
-        ).pack(fill="x", padx=14, pady=(14, 4))
-
         self.run_button = tk.Button(
             root,
-            text="▶  실행",
-            font=("맑은 고딕", 14, "bold"),
-            bg="#1a73e8",
-            fg="white",
-            activebackground="#1558b0",
-            activeforeground="white",
+            text="▶  파일만 만들기",
+            font=("맑은 고딕", 11),
             command=self.start_run,
         )
         self.run_button.pack(pady=6)
@@ -119,16 +140,57 @@ class App:
         self.log.see("end")
         self.log.config(state="disabled")
 
+    def start_full_auto(self) -> None:
+        """1~5단계 전부 자동. 실제 주문 데이터가 바뀌므로 한 번 확인받는다."""
+        try:
+            max_apply = int(self.max_apply.get())
+        except ValueError:
+            messagebox.showerror("입력 오류", "최대 반영 건수는 숫자로 입력해주세요.")
+            return
+
+        if not messagebox.askokcancel(
+            "전부 자동으로 처리",
+            "샵마인에서 주문 목록을 받아 송장을 조회하고, 쇼핑몰까지 반영합니다.\n\n"
+            "· 샵마인 [배송중] 탭이 열려 있어야 합니다\n"
+            "· 실행 중에는 마우스와 키보드를 건드리지 마세요\n"
+            f"· 조회 성공이 {max_apply}건을 넘으면 반영하지 않고 멈춥니다\n\n"
+            "진행할까요?",
+        ):
+            return
+
+        self._set_busy(True, "처리 중...")
+        self._log("전부 자동 처리를 시작합니다. 마우스를 건드리지 말아주세요.\n")
+        threading.Thread(target=self._full_auto_worker, args=(max_apply,), daemon=True).start()
+
+    def _full_auto_worker(self, max_apply: int) -> None:
+        try:
+            result = pipeline.run_full(
+                max_apply=max_apply,
+                log=lambda msg: self._queue.put(("log", msg)),
+            )
+            self._output_path = result.csv_path
+            self._queue.put(("auto_done", result))
+        except Exception as e:  # noqa: BLE001
+            self._queue.put(("error", str(e)))
+
+    def _set_busy(self, busy: bool, text: str = "") -> None:
+        state = "disabled" if busy else "normal"
+        self.auto_button.config(state=state,
+                                text=text if busy else "⚡  전부 자동으로 처리")
+        self.run_button.config(state=state,
+                               text=text if busy else "▶  파일만 만들기")
+        if busy:
+            self.open_button.config(state="disabled")
+            self.log.config(state="normal")
+            self.log.delete("1.0", "end")
+            self.log.config(state="disabled")
+
     def start_run(self) -> None:
         if self.selected_file is None or not self.selected_file.exists():
             messagebox.showerror("파일 없음", "먼저 발송대상 엑셀 파일을 선택해주세요.")
             return
 
-        self.run_button.config(state="disabled", text="처리 중...")
-        self.open_button.config(state="disabled")
-        self.log.config(state="normal")
-        self.log.delete("1.0", "end")
-        self.log.config(state="disabled")
+        self._set_busy(True, "처리 중...")
         self._log(f"입력 파일: {self.selected_file.name}")
         self._log("처리를 시작합니다. 롯데온 로그인이 필요하면 별도 브라우저 창이 뜹니다...\n")
 
@@ -153,50 +215,16 @@ class App:
             self._queue.put(("error", str(e)))
 
     def _process_cjonstyle_orders(self, report, output_path: Path) -> None:
-        """CJ온스타일(base.cjonstyle.com)은 registry.py에 어댑터가 등록되어
-        있지 않아(Cloudflare가 Playwright 자동화를 차단 - suppliers/cjonstyle.py
-        참고) 위 run_orchestrator가 전부 "등록된 어댑터 없음"으로 스킵한다.
-        여기서 그 스킵 건들을 claude -p --chrome(사용자의 실제 크롬 브라우저)로
-        다시 조회해서 report와 업로드 파일에 반영한다."""
-        all_orders = excel_io.read_pending_orders(str(self.selected_file))
-        cj_orders = cjonstyle_bridge.filter_cjonstyle_orders(all_orders)
-        if not cj_orders:
-            return
+        """CJ온스타일 주문을 실제 크롬 브라우저로 조회해 결과에 반영한다.
 
-        self._queue.put(("log", f"\nCJ온스타일 {len(cj_orders)}건을 실제 크롬 브라우저로 확인 중입니다 (시간이 다소 걸릴 수 있습니다)..."))
-
-        cj_order_ids = {o.order_id for o in cj_orders}
-        recipient_by_id = {o.order_id: o.recipient_name for o in cj_orders}
-        # run_orchestrator가 이미 이 주문들에 대해 남긴 "등록된 어댑터 없음"
-        # 스킵 기록을 지우고, 아래에서 실제 조회 결과로 다시 채운다.
-        report.entries = [
-            e for e in report.entries if not (e.order_id in cj_order_ids and e.status == "skip")
-        ]
-
-        try:
-            results = cjonstyle_bridge.lookup_via_chrome(cj_orders)
-        except Exception as e:  # noqa: BLE001
-            self._queue.put(("log", f"CJ온스타일 확인 중 오류가 발생해 전부 건너뜁니다: {e}"))
-            for order in cj_orders:
-                report.fail(order.order_id, f"CJ온스타일 크롬 조회 실패: {e}", recipient_name=order.recipient_name)
-            return
-
-        upload_rows: list[tuple[str, str, str | None]] = []
-        for r in results:
-            if r.status == "success" and r.tracking_no:
-                report.success(r.order_id, r.courier, r.tracking_no)
-                upload_rows.append((r.order_id, r.tracking_no, r.courier))
-                self._queue.put(("log", f"  {r.order_id}: 성공 ({r.courier} / {r.tracking_no})"))
-            elif r.status == "not_yet":
-                report.skip(r.order_id, r.reason or "아직 송장번호 미발급")
-                self._queue.put(("log", f"  {r.order_id}: 아직 송장번호 미발급 - 건너뜀"))
-            else:
-                reason = r.reason or "알 수 없는 오류"
-                report.fail(r.order_id, reason, recipient_name=recipient_by_id.get(r.order_id))
-                self._queue.put(("log", f"  {r.order_id}: 실패 ({reason})"))
-
-        if upload_rows:
-            excel_io.append_upload_rows(upload_rows, str(output_path))
+        실제 처리는 cjonstyle_bridge.process_orders 가 하고(run_all.py 도 같은
+        함수를 쓴다), 여기서는 로그를 창에 흘려보내기만 한다."""
+        cjonstyle_bridge.process_orders(
+            report,
+            str(self.selected_file),
+            str(output_path),
+            log=lambda msg: self._queue.put(("log", msg)),
+        )
 
     def _poll_queue(self) -> None:
         try:
@@ -216,10 +244,21 @@ class App:
                         self._log(f"업로드용 파일: {output_path}")
                         self._log("이 파일을 샵마인 [발송정보일괄등록(수정용)]으로 업로드해주세요.")
                         self.open_button.config(state="normal")
-                    self.run_button.config(state="normal", text="▶  실행")
+                    self._set_busy(False)
+                elif kind == "auto_done":
+                    result = payload
+                    self._log("")
+                    self._log("=" * 40)
+                    self._log(pipeline.summarize(result))
+                    self._log("=" * 40)
+                    if result.csv_path and Path(result.csv_path).exists():
+                        self.open_button.config(state="normal")
+                    self._set_busy(False)
+                    if result.stopped_reason and not result.applied:
+                        messagebox.showwarning("멈춤", result.stopped_reason)
                 elif kind == "error":
                     self._log(f"\n오류가 발생했습니다: {payload}")
-                    self.run_button.config(state="normal", text="▶  실행")
+                    self._set_busy(False)
                     messagebox.showerror("오류", str(payload))
         except queue.Empty:
             pass
