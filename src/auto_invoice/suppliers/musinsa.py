@@ -84,6 +84,7 @@ COURIER_CODE_MAP = {
     "LOGEN": "로젠택배",
     "HDEXP": "합동택배",
     "CVSNET": "GS Postbox 편의점택배",
+    "DELIBOX": "딜리박스",
 }
 
 # 혹시 코드가 아니라 이미 한글 명칭(축약형)으로 오는 경우를 대비한 안전망.
