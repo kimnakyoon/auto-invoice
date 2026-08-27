@@ -10,6 +10,18 @@
   그래서 API를 직접 호출하지 않고, Playwright로 실제 버튼 클릭을 흉내내서
   화면에 렌더링된 텍스트(택배사/송장번호)를 읽는 방식으로 바꿨다. 이게 진짜
   사용자 행동과 동일해서 차단 가능성이 훨씬 낮다.
+- 로그인은 SSG/더현대/NS홈쇼핑/11번가/옥션과 동일하게 완전 자동 로그인이
+  가능하다(사용자 요청으로 확인 후 도입). 실제로 확인한 것:
+  로그인 페이지는 /p/member/login/common?rtnUrl=<원래주소> 이고, reCAPTCHA도
+  키보드보안 플러그인도 없다. 존재하지 않는 아이디로 제출해보니 로그인 API
+  (POST pbf.lotteon.com/member/v1/auth/loginDivision)가 HTTP 200으로 정상
+  응답했다 - 위의 주문상세 API와 달리 로그인 경로는 Imperva가 막지 않는다.
+  단, 로그인 실패가 화면 문구가 아니라 자바스크립트 alert()로 뜬다
+  ("일치하는 회원정보가 없습니다."). Playwright는 핸들러가 없으면 alert을
+  조용히 닫아버려서, 핸들러를 걸지 않으면 실패를 감지하지 못하고 타임아웃까지
+  기다리게 된다. 그래서 이 어댑터만 dialog 핸들러를 쓴다.
+  (비밀번호는 페이지 JS가 세션별 키로 암호화해 members.lpoint.com으로 보내므로,
+  브라우저 없이 requests로 직접 로그인하는 방식은 쓸 수 없다.)
 """
 
 from __future__ import annotations
@@ -27,13 +39,16 @@ from .base import BlockedError, ParseError, TrackingNotAvailableYet, normalize_o
 load_dotenv()
 
 LOGIN_ID_SELECTOR = "#inId"
+LOGIN_PW_SELECTOR = "#Password"
+LOGIN_BUTTON_TEXT = "로그인하기"
 
 DOMAINS = {"lotteon.com", "www.lotteon.com"}
 SITE_KEY = "lotteon"
 
 DEFAULT_COURIER = "롯데택배"  # 화면에서 택배사명을 못 읽었을 때만 쓰는 기본값
 
-LOGIN_WAIT_TIMEOUT_MS = 5 * 60 * 1000  # 로그인 대기 최대 5분
+LOGIN_WAIT_TIMEOUT_MS = 5 * 60 * 1000  # 수동 로그인 대기 최대 5분
+AUTO_LOGIN_WAIT_TIMEOUT_MS = 30 * 1000  # 자동 로그인 후 리다이렉트 대기 최대 30초
 
 # 배송정보 상세를 여는 버튼 텍스트들 (실제 확인된 텍스트: "배송상세조회")
 TRACKING_BUTTON_TEXTS = ["배송상세조회", "배송조회", "배송 조회", "송장조회", "배송추적"]
@@ -103,6 +118,54 @@ def _safe_print(message: str) -> None:
         print(message)
     except Exception:
         pass
+
+
+def _auto_login(page) -> bool:
+    """LOTTEON_ID/LOTTEON_PW로 완전 자동 로그인한다 (사용자 명시 요청).
+
+    SSG/더현대/NS홈쇼핑/11번가/옥션 어댑터와 같은 패턴이지만, 롯데온은 로그인
+    실패를 화면 문구가 아니라 alert()으로 알려주기 때문에 dialog 핸들러로 그
+    문구를 받아 실패 사유째로 올린다. 핸들러가 없으면 Playwright가 alert을
+    조용히 닫아버려서, 원인도 모른 채 대기 시간만 다 쓰고 실패한다.
+
+    비밀번호가 설정되어 있지 않으면 False를 돌려주고, 호출자가 기존의 수동
+    로그인 방식으로 넘어간다 (비밀번호를 저장하고 싶지 않은 경우를 위해
+    수동 로그인 경로를 그대로 남겨뒀다).
+    """
+    login_id = os.environ.get("LOTTEON_ID")
+    login_pw = os.environ.get("LOTTEON_PW")
+    if not login_id or not login_pw:
+        return False
+
+    alerts: list[str] = []
+
+    def _on_dialog(dialog) -> None:
+        alerts.append(dialog.message)
+        dialog.dismiss()
+
+    page.on("dialog", _on_dialog)
+    try:
+        page.fill(LOGIN_ID_SELECTOR, login_id)
+        page.fill(LOGIN_PW_SELECTOR, login_pw)
+        page.get_by_text(LOGIN_BUTTON_TEXT, exact=True).first.click()
+
+        elapsed_ms = 0
+        while elapsed_ms < AUTO_LOGIN_WAIT_TIMEOUT_MS:
+            # 로그인 페이지를 벗어났으면 성공이다. alert이 떴더라도 로그인
+            # 자체가 된 경우(비밀번호 변경 안내 등)가 있어, 페이지 상태를
+            # alert보다 먼저 본다.
+            if not _looks_like_login_page(page):
+                return True
+            if alerts:
+                raise BlockedError(f"롯데온 자동 로그인이 거부됐습니다: {alerts[0].strip()}")
+            elapsed_ms += 1500  # _looks_like_login_page 내부에서 1500ms 대기함
+
+        raise BlockedError(
+            "롯데온 자동 로그인 후에도 로그인 페이지에서 벗어나지 못했습니다 "
+            "(추가 본인인증을 요구받았을 수 있습니다 - 브라우저 창을 확인해주세요)."
+        )
+    finally:
+        page.remove_listener("dialog", _on_dialog)
 
 
 def _wait_for_manual_login(page) -> bool:
@@ -199,15 +262,19 @@ def get_tracking(
         page.goto(product_url, wait_until="domcontentloaded")
 
         if _looks_like_login_page(page):
-            if headless:
+            if _auto_login(page):
+                _safe_print("[lotteon] 로그인 세션이 없어 자동 로그인했습니다.")
+            elif headless:
                 raise BlockedError(
-                    "롯데온 로그인이 필요합니다. 먼저 --headless 없이 실행해 수동으로 로그인해주세요."
+                    "롯데온 로그인이 필요합니다. .env에 LOTTEON_PW를 넣으면 자동 로그인하고, "
+                    "비밀번호를 저장하지 않으려면 --headless 없이 실행해 직접 로그인해주세요."
                 )
-            _prefill_login_id(page)
-            _safe_print("[lotteon] 아이디는 자동으로 입력했습니다. 뜬 브라우저 창에서 비밀번호를 입력하고 로그인해주세요.")
-            _safe_print("[lotteon] 로그인이 완료되면 자동으로 이어서 진행합니다 (최대 5분 대기).")
-            if not _wait_for_manual_login(page):
-                raise BlockedError("로그인 대기 시간(5분)이 지났습니다. 로그인 후 다시 실행해주세요.")
+            else:
+                _prefill_login_id(page)
+                _safe_print("[lotteon] 아이디는 자동으로 입력했습니다. 뜬 브라우저 창에서 비밀번호를 입력하고 로그인해주세요.")
+                _safe_print("[lotteon] 로그인이 완료되면 자동으로 이어서 진행합니다 (최대 5분 대기).")
+                if not _wait_for_manual_login(page):
+                    raise BlockedError("로그인 대기 시간(5분)이 지났습니다. 로그인 후 다시 실행해주세요.")
             page.goto(product_url, wait_until="domcontentloaded")
             if _looks_like_login_page(page):
                 raise BlockedError("로그인 후에도 여전히 로그인 페이지입니다.")
