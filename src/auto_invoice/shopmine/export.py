@@ -11,9 +11,16 @@
 않는다. 그래서 그 버튼 하나만 색으로 찾아 클릭하고, 나머지 표준 대화상자는
 전부 컨트롤 ID로 다룬다.
 
-양식은 샵마인 쪽에 저장된 '송장 자동화' 프리셋을 그대로 쓴다. 그 양식이
-수령인 / 마켓 주문번호 / 상품URL / 주문옵션 4개 컬럼을 내보내며, 이는
+양식은 샵마인 쪽에 저장된 '송장 자동화' 프리셋을 쓴다. 그 양식이 수령인 /
+마켓 주문번호 / 상품URL / 주문옵션 4개 컬럼을 내보내며, 이는
 excel_io.read_pending_orders()가 요구하는 것과 정확히 일치한다.
+
+다만 이 창은 **샵마인에 저장된 양식을 골라둔 채로 뜬다.** 사람이 다른 양식으로
+한 번 쓰면 그 뒤로는 계속 그게 골라져 있고 (2026-08-28에 열어보니
+'주문관리_마스터'였다), 그러면 컬럼이 달라 뒷단계가 통째로 어긋난다. 파일은
+멀쩡히 만들어지기 때문에 바로 알아채기도 어렵다. 그래서 버튼을 누르기 전에
+양식을 확인하고, 다르면 '송장 자동화'로 바꾼 뒤 바뀐 것까지 확인하고 넘어간다
+(ensure_template). 글자를 읽어야 하는 이 한 곳만 msaa 로 읽는다.
 """
 
 from __future__ import annotations
@@ -22,14 +29,19 @@ import os
 import time
 from pathlib import Path
 
-from . import winui
+from . import msaa, winui
 
 # [엑셀 파일 생성] 버튼의 보라파랑 (#5b63d3 계열)
 EXPORT_BUTTON_COLOR = (91, 99, 211)
 
+# 반드시 이 양식으로 내보내야 excel_io 가 읽을 수 있다.
+TEMPLATE_NAME = "송장 자동화"
+WEBVIEW_CLASS = "Chrome_WidgetWin_1"
+
 VK_X = 0x58
 VK_RETURN = 0x0D
 VK_A = 0x41
+VK_ESCAPE = 0x1B
 
 SAVE_DIALOG_TITLE = "다른 이름으로 저장"
 OPEN_ASK_TITLE = "질문"
@@ -37,6 +49,126 @@ OPEN_ASK_TITLE = "질문"
 
 class ExportError(RuntimeError):
     """내보내기 도중 안전하게 중단해야 하는 상황."""
+
+
+def _webview(export_hwnd):
+    """엑셀 생성 창 안에서 실제 화면을 그리는 WebView2 자식 창."""
+    for k in winui.children(export_hwnd):
+        if winui.class_of(k) == WEBVIEW_CLASS:
+            return k
+    return None
+
+
+def _template_combo(webview_hwnd):
+    """'엑셀 양식' 선택칸 요소. 값(accValue)이 지금 골라진 양식 이름이다."""
+    root = msaa.from_window(webview_hwnd)
+    if root is None:
+        return None
+    return msaa.find(root, lambda e: (msaa.role(e) == msaa.ROLE_COMBOBOX
+                                      and (msaa.name(e) or "").startswith("엑셀 양식")))
+
+
+def _template_value(webview_hwnd):
+    combo = _template_combo(webview_hwnd)
+    return None if combo is None else msaa.value(combo)
+
+
+def _template_names(webview_hwnd):
+    """펼쳐진 목록에 있는 양식 이름들. 안 읽힐 때가 많으니 오류 메시지 용도로만 쓴다."""
+    combo = _template_combo(webview_hwnd)
+    if combo is None:
+        return []
+    return [n for n in (msaa.name(e) for e in
+                        msaa.find_all(combo, lambda e: msaa.role(e) == msaa.ROLE_LISTITEM))
+            if n]
+
+
+def _list_is_open(export_hwnd, probe):
+    """양식 목록이 펼쳐져 있는지. 목록은 WebView2 프로세스의 '별도 팝업 창'이라,
+    선택칸 바로 아래 지점이 엑셀 생성 창이 아닌 다른 창이면 펼쳐진 것이다."""
+    at = winui.window_at(*probe)
+    return bool(at) and not winui.is_descendant(at, export_hwnd)
+
+
+def ensure_template(export_hwnd, template: str = TEMPLATE_NAME, timeout: float = 12.0,
+                    log=print) -> bool:
+    """'엑셀 양식'이 template 인지 확인하고, 아니면 그것으로 바꾼다.
+
+    바꿨으면 True, 이미 맞아서 아무것도 안 했으면 False. 조금이라도 확실하지
+    않으면 ExportError 로 멈춘다 - 엉뚱한 양식으로 내보내면 컬럼이 달라 뒷단계가
+    통째로 어긋나는데, 파일 자체는 멀쩡히 만들어져서 알아채기 어렵다.
+
+    고르는 방법은 '목록에서 해당 줄을 클릭'이 아니라 **이름을 타이핑**이다.
+    목록이 펼쳐졌을 때 이름을 치면 앞글자가 맞는 줄로 옮겨가고, 그 순간
+    선택칸의 값이 바로 바뀐다. 목록 줄의 좌표는 읽히지 않을 때가 많지만
+    (msaa 주석 참고) 값은 항상 읽히므로, 이 방법은 확인까지 확실하다.
+    """
+    wv = _webview(export_hwnd)
+    if wv is None:
+        raise ExportError("엑셀 생성 창에서 화면 영역(WebView2)을 찾지 못했습니다.")
+
+    combo = _template_combo(wv)
+    if combo is None:
+        raise ExportError("'엑셀 양식' 선택칸을 찾지 못했습니다 - 화면 구성이 바뀐 것 같습니다.")
+
+    current = msaa.value(combo)
+    if current == template:
+        log(f"  엑셀 양식 확인: '{template}' - 그대로 사용")
+        return False
+    log(f"  엑셀 양식이 '{current}' 입니다 - '{template}'(으)로 바꿉니다.")
+
+    box = msaa.location(combo)
+    if box is None or box[2] <= 0 or box[3] <= 0:
+        raise ExportError("'엑셀 양식' 선택칸의 위치를 읽지 못했습니다.")
+    r = winui.rect(export_hwnd)
+    spot = (box[0] + box[2] // 2, box[1] + box[3] // 2)
+    probe = (spot[0], box[1] + box[3] + 20)     # 선택칸 바로 아래 = 목록이 펼쳐지는 자리
+
+    # 1) 선택칸을 눌러 목록을 편다. 펼쳐지지 않았다면 타이핑이 엉뚱한 곳으로
+    #    가므로 여기서 멈춘다.
+    ok, msg = winui.safe_click(export_hwnd, (spot[0] - r.left, spot[1] - r.top),
+                               label="엑셀 양식 목록 열기")
+    if not ok:
+        raise ExportError(msg)
+    end = time.time() + 5.0
+    while time.time() < end and not _list_is_open(export_hwnd, probe):
+        time.sleep(0.2)
+    if not _list_is_open(export_hwnd, probe):
+        raise ExportError("엑셀 양식 목록이 펼쳐지지 않았습니다.")
+
+    # 2) 이름을 쳐서 그 줄로 옮긴다. 아직 확정(Enter)하기 전에 값부터 확인한다 -
+    #    이름이 조금 다른 양식으로 옮겨갔을 수 있기 때문이다.
+    winui.type_text(template)
+    end = time.time() + timeout
+    while time.time() < end:
+        if _template_value(wv) == template:
+            break
+        time.sleep(0.3)
+    now = _template_value(wv)
+    if now != template:
+        winui.key(VK_ESCAPE)
+        names = _template_names(wv)
+        raise ExportError(
+            f"'{template}' 양식을 고르지 못했습니다 (선택칸 값: '{now}'). "
+            + (f"샵마인에 있는 양식: {names}" if names else
+               "그런 이름의 양식이 샵마인에 없는 것 같습니다."))
+
+    # 3) Enter 로 확정하고 목록을 닫는다. 목록이 열린 채로 두면 다음 단계의
+    #    [엑셀 파일 생성] 클릭이 '목록 닫기'로 먹혀버린다.
+    for _ in range(2):
+        if not _list_is_open(export_hwnd, probe):
+            break
+        winui.key(VK_RETURN)
+        time.sleep(0.6)
+    if _list_is_open(export_hwnd, probe):
+        winui.key(VK_ESCAPE)
+        raise ExportError("엑셀 양식 목록이 닫히지 않았습니다.")
+
+    final = _template_value(wv)
+    if final != template:
+        raise ExportError(f"엑셀 양식을 '{template}'(으)로 바꾸지 못했습니다 (지금 값: '{final}').")
+    log(f"  엑셀 양식 변경 완료: '{template}'")
+    return True
 
 
 def export_to(target_path, tab_title: str = "배송중", timeout: float = 40.0,
@@ -72,9 +204,12 @@ def export_to(target_path, tab_title: str = "배송중", timeout: float = 40.0,
     export_hwnd = win[0]
     log(f"  엑셀 파일 생성 창 확인 (hwnd={export_hwnd})")
 
-    # 3) [엑셀 파일 생성] 버튼을 색으로 찾아 클릭
+    # 3) 엑셀 양식이 '송장 자동화'인지 확인 (아니면 바꾼다)
     winui.bring_to_front(export_hwnd)
     time.sleep(0.6)
+    ensure_template(export_hwnd, log=log)
+
+    # 4) [엑셀 파일 생성] 버튼을 색으로 찾아 클릭
     found = winui.locate_button_by_color(export_hwnd, EXPORT_BUTTON_COLOR, tmp_shot)
     if found is None:
         raise ExportError("'엑셀 파일 생성' 버튼(보라파랑)을 화면에서 찾지 못했습니다.")
@@ -88,7 +223,7 @@ def export_to(target_path, tab_title: str = "배송중", timeout: float = 40.0,
     if not ok:
         raise ExportError(msg)
 
-    # 4) 저장 대화상자 -> 경로 입력
+    # 5) 저장 대화상자 -> 경로 입력
     dlg = winui.wait_for_window(title_equals=SAVE_DIALOG_TITLE, timeout=timeout)
     if dlg is None:
         raise ExportError("'다른 이름으로 저장' 창이 뜨지 않았습니다.")
@@ -104,13 +239,13 @@ def export_to(target_path, tab_title: str = "배송중", timeout: float = 40.0,
     winui.key(VK_RETURN)
     log(f"  저장 경로 입력: {target}")
 
-    # 5) '엑셀파일을 여시겠습니까?' -> 아니요
+    # 6) '엑셀파일을 여시겠습니까?' -> 아니요
     ask = winui.wait_for_window(title_equals=OPEN_ASK_TITLE, timeout=15.0)
     if ask is not None:
         ok, msg = winui.click_dlg_button(ask[0], winui.DLG_NO, label="엑셀 열기 묻기")
         log(f"  {msg}")
 
-    # 6) 결과 확인
+    # 7) 결과 확인
     end = time.time() + timeout
     while time.time() < end:
         if target.exists() and target.stat().st_size > 0:
