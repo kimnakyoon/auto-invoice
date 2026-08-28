@@ -241,11 +241,18 @@ class App:
 
         실제 처리는 cjonstyle_bridge.process_orders 가 하고(run_all.py 도 같은
         함수를 쓴다), 여기서는 로그를 창에 흘려보내기만 한다."""
+
+        # 병렬로 돌아서 주문 순서가 아니라 끝난 순서로 센다.
+        def on_progress(done: int, total: int, order_id: str, retry: bool) -> None:
+            head = "재시도" if retry else "CJ온스타일"
+            self._queue.put(("log", f"[{head}] ({done}/{total}) {order_id} 조회 완료"))
+
         cjonstyle_bridge.process_orders(
             report,
             str(self.selected_file),
             str(output_path),
             log=lambda msg: self._queue.put(("log", msg)),
+            on_progress=on_progress,
         )
 
     def _poll_queue(self) -> None:

@@ -177,16 +177,30 @@ def lookup_tracking(result: PipelineResult, *, limit=None, headless=False,
     """5단계: 공급사에서 송장번호를 조회해 업로드용 CSV를 만든다."""
     log("")
     log(f"[5/{STEPS}] 공급사에서 송장번호 조회")
+
+    # 한 건에 수십 초씩 걸려서, 몇 건째를 하고 있는지 안 보이면 멈춘 것처럼
+    # 보인다. 주문마다 (3/100) 처럼 진행 상황을 남긴다.
+    def on_progress(index, total, order_id, message):
+        log(f"  ({index}/{total}) {order_id}: {message}" if message
+            else f"  ({index}/{total}) {order_id}")
+
     report = run_orchestrator(str(result.export_path), str(result.csv_path),
-                              limit=limit, headless=headless)
+                              limit=limit, headless=headless,
+                              on_progress=on_progress)
 
     # CJ온스타일은 Playwright 로그인이 막혀 있어 orchestrator가 전부 스킵한다.
     # 실제 크롬 브라우저로 따로 조회해서 합친다. (--limit 로 소량만 볼 때는
     # 이 느린 경로를 타지 않는다.)
     if not skip_cjonstyle and limit is None:
+        # CJ온스타일은 병렬로 돌아서 주문 순서가 아니라 끝난 순서로 센다.
+        def cj_progress(done, total, order_id, retry):
+            head = "재시도" if retry else "CJ온스타일"
+            log(f"  [{head}] ({done}/{total}) {order_id} 조회 완료")
+
         try:
             added = cjonstyle_bridge.process_orders(
-                report, str(result.export_path), str(result.csv_path), log=log)
+                report, str(result.export_path), str(result.csv_path), log=log,
+                on_progress=cj_progress)
             if added:
                 log(f"  CJ온스타일 {added}건 추가됨")
         except Exception as e:  # noqa: BLE001

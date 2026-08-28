@@ -38,6 +38,7 @@ from __future__ import annotations
 
 import json
 import subprocess
+import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
@@ -176,33 +177,54 @@ def _lookup_one(order: PendingOrder, stagger_sec: float = 0.0) -> CjonstyleLooku
     )
 
 
-def lookup_via_chrome(orders: list[PendingOrder]) -> list[CjonstyleLookupResult]:
+def lookup_via_chrome(orders: list[PendingOrder], on_progress=None) -> list[CjonstyleLookupResult]:
     """주문마다 별도의 claude -p --chrome 프로세스를 동시에 띄워 조회한다.
 
     호출자가 이미 CJ온스타일 주문만 걸러서 넘겨야 한다(filter_cjonstyle_orders).
     한 건이 실패해도 나머지 건 처리에는 영향을 주지 않는다. 병렬 실행 중
     크롬 확장 충돌로 실패한 건이 있을 수 있어(위 docstring 참고), 실패한
     건만 마지막에 순차로 한 번 더 시도한다.
+
+    on_progress(끝난건수, 전체건수, 주문번호, 재시도여부): 한 건이 끝날 때마다
+    부른다. 병렬로 도니까 주문 순서가 아니라 '끝난 순서'로 세어서 넘긴다.
+    마지막 순차 재시도는 재시도여부=True로, 재시도 대상 안에서 다시 센다.
     """
     if not orders:
         return []
 
-    workers = min(len(orders), _MAX_WORKERS)
+    total = len(orders)
+    workers = min(total, _MAX_WORKERS)
     # 처음 동시에 뜨는 workers개만 시작 시점을 어긋나게 하면 된다(그 뒤 주문들은
     # 앞 프로세스가 끝난 뒤에 시작하므로 자연히 겹치지 않는다).
-    staggers = [(i % workers) * _STAGGER_SEC for i in range(len(orders))]
+    staggers = [(i % workers) * _STAGGER_SEC for i in range(total)]
+
+    done = 0
+    lock = threading.Lock()
+
+    def lookup_and_count(order, stagger):
+        nonlocal done
+        result = _lookup_one(order, stagger)
+        if on_progress is not None:
+            with lock:
+                done += 1
+                finished = done
+            on_progress(finished, total, order.order_id, False)
+        return result
 
     with ThreadPoolExecutor(max_workers=workers) as executor:
-        results = list(executor.map(_lookup_one, orders, staggers))
+        results = list(executor.map(lookup_and_count, orders, staggers))
 
-    for i, result in enumerate(results):
-        if result.status == "fail":
-            results[i] = _lookup_one(orders[i])
+    retry_targets = [i for i, r in enumerate(results) if r.status == "fail"]
+    for n, i in enumerate(retry_targets, start=1):
+        results[i] = _lookup_one(orders[i])
+        if on_progress is not None:
+            on_progress(n, len(retry_targets), orders[i].order_id, True)
 
     return results
 
 
-def process_orders(report, input_path: str, output_path: str, log=print) -> int:
+def process_orders(report, input_path: str, output_path: str, log=print,
+                   on_progress=None) -> int:
     """orchestrator가 스킵한 CJ온스타일 주문을 크롬으로 조회해 report와
     업로드 파일에 반영한다.
 
@@ -230,7 +252,7 @@ def process_orders(report, input_path: str, output_path: str, log=print) -> int:
     ]
 
     try:
-        results = lookup_via_chrome(cj_orders)
+        results = lookup_via_chrome(cj_orders, on_progress=on_progress)
     except Exception as e:  # noqa: BLE001
         log(f"CJ온스타일 확인 중 오류가 발생해 전부 건너뜁니다: {e}")
         for order in cj_orders:

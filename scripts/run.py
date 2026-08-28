@@ -36,7 +36,13 @@ def main() -> None:
     args = parser.parse_args()
     output_path = args.output or default_output_path()
 
-    report = run(args.input, output_path, limit=args.limit, headless=args.headless)
+    # 한 건에 수십 초씩 걸려서, 진행 상황이 안 보이면 멈춘 것처럼 보인다.
+    def on_progress(index: int, total: int, order_id: str, message: str) -> None:
+        print(f"[{index}/{total}] {order_id}: {message}" if message
+              else f"[{index}/{total}] {order_id}", flush=True)
+
+    report = run(args.input, output_path, limit=args.limit, headless=args.headless,
+                 on_progress=on_progress)
 
     counts = report.summary()
     print(f"완료: 성공 {counts['success']} / 실패 {counts['fail']} / 스킵 {counts['skip']}")
