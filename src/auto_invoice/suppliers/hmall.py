@@ -6,15 +6,27 @@
   있으면 되도록 만들었다.)
 - 로그인이 안 되어 있으면 https://www.hmall.com/mo/cob/loginForm 으로 리다이렉트된다.
   로그인 폼 셀렉터: 아이디 "#userid", 비밀번호 "#password".
-- 아이디/비밀번호로 완전 자동 로그인(SSG 어댑터와 같은 방식)을 시도해봤으나,
-  로그인 버튼 클릭 시 내부적으로 reCAPTCHA v3를 호출하고(api/hf/od/v1/order/
-  recaptcha-siteverify) 자동화된 클릭은 낮은 점수(확인된 값: 0.4)를 받아
-  "로그인에 실패하였습니다. 다른 로그인 수단을 이용바랍니다."로 항상 막혔다.
-  그래서 롯데온/지마켓 등과 동일하게 아이디만 자동 입력하고, 비밀번호 입력과
-  로그인 버튼 클릭은 사람이 직접 하도록 만들었다 - 사람이 실제로 클릭하면
-  이 문제가 없다. 로그인 세션은 storage_state(쿠키)로 저장되어 다음 실행부터는
-  다시 로그인할 필요가 없다(사용자가 원한 "쿠키로 자동 로그인"은 이 방식으로
-  충족된다).
+- 로그인 폼은 제출할 때 reCAPTCHA v3를 호출한다(api/hf/od/v1/order/
+  recaptcha-siteverify). 처음에는 자동화된 클릭이 낮은 점수(0.4)를 받아
+  "로그인에 실패하였습니다. 다른 로그인 수단을 이용바랍니다."로 막혔는데,
+  원인은 자동화 자체가 아니라 **브라우저를 띄우는 방식**이었다(2026-08-28 실측).
+  점수는 이렇게 갈렸다:
+    * 번들 Chromium + 매번 새 빈 컨텍스트(기존 방식) -> 0.4, 거부
+    * 설치된 진짜 크롬 + 재사용되는 프로필(창 띄움) -> **0.8, 통과**
+    * 설치된 진짜 크롬 + headless -> 0.1, 거부
+  그래서 로그인만 browser.real_chrome_context()로 띄운 진짜 크롬 창에서
+  하고(GSSHOP과 같은 "로그인만 별도 컨텍스트, 쿠키만 이식" 구조), 성공하면
+  쿠키를 원래 컨텍스트로 옮겨 조회는 지금까지처럼 headless로 이어간다
+  (실크롬에서 만든 세션이 번들 Chromium headless에서 그대로 통하는 것을
+  실제 주문상세까지 열어서 확인했다). 로그인 창이 반드시 보여야 하는 것만
+  롯데아이몰과 같은 제약이고, 사람이 타이핑할 일은 없다.
+  HMALL_PW가 비어 있으면 예전처럼 아이디만 자동 입력하고 사람이 직접
+  로그인하는 경로로 넘어간다. 로그인 세션은 storage_state(쿠키)로 저장되어
+  다음 실행부터는 다시 로그인할 필요가 없다.
+- HMALL_ID는 더현대(hi.thehyundai.com) 계정과 같은 통합회원이라 비밀번호도
+  같다(THEHYUNDAI_PW와 동일한 값으로 로그인되는 것을 확인했다). 다만 쿠키는
+  공유되지 않아서(더현대 세션으로 현대몰에 가면 그대로 로그인 페이지가 뜬다)
+  사이트별로 각각 로그인해야 한다.
 - 주문상세 페이지의 "배송조회" 링크(<span>, 클릭 핸들러가 상위 엘리먼트에
   있어 href가 없음)를 클릭하면 새 탭이 아니라 같은 탭에서
   https://www.hmall.com/mo/mpa/selectDlvTrcUrl?wbno=<송장번호>&codename=<택배사명>&...
@@ -42,6 +54,7 @@ from urllib.parse import parse_qs, urlparse
 from dotenv import load_dotenv
 from playwright.sync_api import BrowserContext, Page
 
+from .. import browser as browser_mod
 from ..models import TrackingResult
 from .base import (
     BlockedError,
@@ -55,13 +68,26 @@ from .base import (
 load_dotenv()
 
 LOGIN_ID_SELECTOR = "#userid"
+LOGIN_PW_SELECTOR = "#password"
+# 제출 버튼은 접근성 이름이 '로그인' 뒤에 '최근 로그인' 배지 텍스트까지 붙어
+# 나올 때가 있어(기기에 최근 로그인 기록이 있으면 배지가 생긴다) 이름
+# 완전일치로는 못 찾는다 - 폼 안의 버튼을 텍스트 포함으로 찾는다.
+LOGIN_BUTTON_SELECTOR = "form[name='login'] button"
+LOGIN_PAGE_URL = "https://www.hmall.com/mo/cob/loginForm"
+HOME_URL = "https://www.hmall.com/"
+
+# 로그인 제출 시 사이트가 부르는 reCAPTCHA 점수 평가 API.
+RECAPTCHA_VERIFY_MARKER = "recaptcha-siteverify"
+# 이 점수 밑이면 사이트가 로그인을 거부한다(0.4는 거부, 0.8은 통과 확인).
+RECAPTCHA_MIN_SCORE = 0.5
 
 DOMAINS = {"hmall.com", "www.hmall.com"}
 SITE_KEY = "hmall"
 
 DEFAULT_COURIER = "택배"  # 이동한 URL에서 택배사명을 못 읽었을 때만 쓰는 기본값
 
-LOGIN_WAIT_TIMEOUT_MS = 5 * 60 * 1000  # 로그인 대기 최대 5분
+LOGIN_WAIT_TIMEOUT_MS = 5 * 60 * 1000  # 사람이 직접 로그인할 때 대기 최대 5분
+AUTO_LOGIN_WAIT_TIMEOUT_MS = 30 * 1000  # 자동 로그인 제출 후 결과 대기 최대 30초
 TRACKING_NAV_WAIT_TIMEOUT_MS = 5 * 1000  # 배송조회 클릭 후 페이지 이동 대기 최대 5초
 
 TRACKING_LINK_TEXT = "배송조회"
@@ -102,10 +128,10 @@ def _looks_like_login_page(page: Page) -> bool:
 
 
 def _prefill_login_id(page: Page) -> None:
-    """비밀번호는 절대 자동 입력하지 않는다 - 아이디만 채워서 타이핑을 줄인다.
+    """자동 로그인이 안 될 때(HMALL_PW 없음/점수 미달) 쓰는 폴백 - 아이디만 채운다.
 
-    로그인 버튼 자동 클릭도 하지 않는다 - reCAPTCHA v3가 자동화된 클릭에
-    낮은 점수를 매겨 로그인이 거부되는 것을 확인했다(위 docstring 참고).
+    이 경로에서는 로그인 버튼을 자동으로 누르지 않는다 - 사람이 직접 누르는
+    편이 reCAPTCHA 점수에 유리하고, 어차피 사람이 비밀번호를 치는 중이다.
     """
     hmall_id = os.environ.get("HMALL_ID")
     if not hmall_id:
@@ -125,6 +151,109 @@ def _safe_print(message: str) -> None:
         print(message)
     except Exception:
         pass
+
+
+def _warm_up(page: Page) -> None:
+    """로그인 전에 홈에서 잠깐 돌아다녀 프로필에 이력을 만든다.
+
+    reCAPTCHA v3는 페이지에 머문 시간과 상호작용도 점수에 반영한다 - 로그인
+    페이지로 바로 직행했을 때보다 이 워밍업을 거쳤을 때 통과했다.
+    """
+    page.goto(HOME_URL, wait_until="domcontentloaded")
+    page.wait_for_timeout(3000)
+    page.mouse.wheel(0, 600)
+    page.wait_for_timeout(1500)
+    page.mouse.wheel(0, 600)
+    page.wait_for_timeout(2000)
+
+
+def _auto_login(context: BrowserContext) -> bool:
+    """HMALL_ID/HMALL_PW로 자동 로그인하고, 받은 쿠키를 원래 컨텍스트에 옮긴다.
+
+    로그인은 진짜 크롬 창(browser.real_chrome_context)에서만 통과한다 - 이유와
+    실측 점수는 이 파일 맨 위 docstring 참고. 조회까지 그 창에서 하지는 않고,
+    GSSHOP과 마찬가지로 쿠키만 원래 컨텍스트로 옮긴다.
+
+    비밀번호가 없거나 점수가 낮으면 False를 돌려주고 호출자가 기존 수동
+    로그인 경로로 넘어간다.
+    """
+    login_id = os.environ.get("HMALL_ID")
+    login_pw = os.environ.get("HMALL_PW")
+    if not login_id or not login_pw:
+        return False
+
+    try:
+        login_context = browser_mod.real_chrome_context(SITE_KEY)
+    except Exception as exc:  # 크롬 미설치 등 - 수동 경로로 넘긴다
+        _safe_print(f"[hmall] 자동 로그인용 크롬을 띄우지 못했습니다({exc}) - 직접 로그인으로 넘어갑니다.")
+        return False
+
+    scores: list[float] = []
+
+    def _on_response(response) -> None:
+        if RECAPTCHA_VERIFY_MARKER not in response.url:
+            return
+        try:
+            data = (response.json() or {}).get("respData") or {}
+            scores.append(float(data.get("score")))
+        except Exception:
+            return
+
+    try:
+        page = login_context.pages[0] if login_context.pages else login_context.new_page()
+        page.on("response", _on_response)
+
+        _warm_up(page)
+        page.goto(LOGIN_PAGE_URL, wait_until="domcontentloaded")
+        page.wait_for_timeout(2500)
+
+        if not _looks_like_login_page(page):
+            # 이 프로필에 로그인이 남아 있으면 쿠키만 옮기고 끝낸다.
+            context.add_cookies(login_context.cookies())
+            return True
+
+        if page.locator(LOGIN_ID_SELECTOR).count() == 0:
+            _safe_print("[hmall] 로그인 페이지에서 아이디 입력창을 찾지 못했습니다 - 직접 로그인으로 넘어갑니다.")
+            return False
+
+        page.locator(LOGIN_ID_SELECTOR).click()
+        page.locator(LOGIN_ID_SELECTOR).press_sequentially(login_id, delay=80)
+        page.wait_for_timeout(300)
+        page.locator(LOGIN_PW_SELECTOR).click()
+        page.locator(LOGIN_PW_SELECTOR).press_sequentially(login_pw, delay=80)
+        page.wait_for_timeout(600)
+
+        button = page.locator(LOGIN_BUTTON_SELECTOR, has_text="로그인")
+        if button.count() == 0:
+            _safe_print("[hmall] 로그인 버튼을 찾지 못했습니다 - 직접 로그인으로 넘어갑니다.")
+            return False
+        button.first.click()
+
+        elapsed_ms = 0
+        while elapsed_ms < AUTO_LOGIN_WAIT_TIMEOUT_MS:
+            if not _looks_like_login_page(page):
+                context.add_cookies(login_context.cookies())
+                _safe_print("[hmall] 자동 로그인에 성공했습니다.")
+                return True
+            if scores and scores[-1] < RECAPTCHA_MIN_SCORE:
+                # 점수가 낮으면 사이트가 자격증명과 무관하게 거부한다 - 더 기다릴 이유가 없다.
+                _safe_print(
+                    f"[hmall] reCAPTCHA 점수가 낮아(={scores[-1]}) 사이트가 로그인을 거부했습니다 "
+                    "- 직접 로그인으로 넘어갑니다."
+                )
+                return False
+            elapsed_ms += 1500  # _looks_like_login_page 내부에서 1500ms 대기함
+
+        _safe_print("[hmall] 자동 로그인 결과를 30초 안에 확인하지 못했습니다 - 직접 로그인으로 넘어갑니다.")
+        return False
+    except Exception as exc:
+        _safe_print(f"[hmall] 자동 로그인 중 오류({exc}) - 직접 로그인으로 넘어갑니다.")
+        return False
+    finally:
+        try:
+            login_context.close()
+        except Exception:
+            pass
 
 
 def _wait_for_manual_login(page: Page) -> bool:
@@ -238,18 +367,24 @@ def get_tracking(
         page.goto(product_url, wait_until="domcontentloaded")
 
         if _looks_like_login_page(page):
-            if headless:
+            # 자동 로그인은 자체 크롬 창을 띄우므로 headless 실행 중에도 쓸 수 있다.
+            if _auto_login(context):
+                page.goto(product_url, wait_until="domcontentloaded")
+                if _looks_like_login_page(page):
+                    raise BlockedError("자동 로그인 후에도 여전히 로그인 페이지입니다.")
+            elif headless:
                 raise BlockedError(
-                    "현대몰 로그인이 필요합니다. 먼저 --headless 없이 실행해 수동으로 로그인해주세요."
+                    "현대몰 로그인이 필요합니다. HMALL_PW를 넣거나, --headless 없이 실행해 수동으로 로그인해주세요."
                 )
-            _prefill_login_id(page)
-            _safe_print("[hmall] 아이디는 자동으로 입력했습니다. 뜬 브라우저 창에서 비밀번호를 입력하고 로그인해주세요.")
-            _safe_print("[hmall] 로그인이 완료되면 자동으로 이어서 진행합니다 (최대 5분 대기).")
-            if not _wait_for_manual_login(page):
-                raise BlockedError("로그인 대기 시간(5분)이 지났습니다. 로그인 후 다시 실행해주세요.")
-            page.goto(product_url, wait_until="domcontentloaded")
-            if _looks_like_login_page(page):
-                raise BlockedError("로그인 후에도 여전히 로그인 페이지입니다.")
+            else:
+                _prefill_login_id(page)
+                _safe_print("[hmall] 아이디는 자동으로 입력했습니다. 뜬 브라우저 창에서 비밀번호를 입력하고 로그인해주세요.")
+                _safe_print("[hmall] 로그인이 완료되면 자동으로 이어서 진행합니다 (최대 5분 대기).")
+                if not _wait_for_manual_login(page):
+                    raise BlockedError("로그인 대기 시간(5분)이 지났습니다. 로그인 후 다시 실행해주세요.")
+                page.goto(product_url, wait_until="domcontentloaded")
+                if _looks_like_login_page(page):
+                    raise BlockedError("로그인 후에도 여전히 로그인 페이지입니다.")
 
         # 주문상세 화면을 떠나기 전에 주문일부터 읽어둔다 (오래된 주문을 결과에 따로 모으는 데 쓴다).
         return with_order_date(page, lambda: _scrape_tracking_from_page(page, product_url, order_no, order_option))
