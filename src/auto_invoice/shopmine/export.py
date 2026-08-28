@@ -171,6 +171,41 @@ def ensure_template(export_hwnd, template: str = TEMPLATE_NAME, timeout: float =
     return True
 
 
+# 표준 '다른 이름으로 저장' 대화상자의 '파일 이름' 입력칸 컨트롤 ID.
+# ComboBoxEx32 안에 들어있어서 GetDlgItem으로는 못 잡고, 하위 전체를 뒤져야 한다.
+FILENAME_EDIT_ID = 1001
+
+
+def _fill_save_filename(save_hwnd, wanted: str, log=print) -> str:
+    """저장 대화상자의 '파일 이름' 칸을 채우고, 실제로 들어간 값을 돌려준다.
+
+    예전에는 Ctrl+A 후 type_text로 한 글자씩 타이핑했는데, 키 입력이 한 글자
+    유실되는 사고가 실제로 났다(2026-08-28: "Desktop"이 "Deskto"로 들어가
+    존재하지 않는 폴더가 되는 바람에 저장이 되지 않고 대화상자가 그대로 남았다).
+    화면에는 멀쩡해 보이는 경로가 로그에 찍혀서 원인을 찾기도 어려웠다.
+
+    그래서 WM_SETTEXT로 값을 통째로 넣고(키 유실이 원리적으로 불가능하다),
+    되읽어서 검증한다. WM_SETTEXT가 먹지 않는 경우에만 예전처럼 타이핑으로
+    한 번 더 시도하고, 그것도 실패하면 실제로 들어간 값을 호출자에게 알려준다.
+    """
+    edits = winui.find_descendants(save_hwnd, class_name="Edit", ctrl_id=FILENAME_EDIT_ID)
+    if edits:
+        if winui.set_ctrl_text(edits[0], wanted):
+            return wanted
+        log("  파일 이름 칸에 값을 직접 넣지 못해 타이핑으로 다시 시도합니다.")
+    else:
+        log("  파일 이름 입력칸을 찾지 못해 타이핑으로 입력합니다.")
+
+    if not winui.bring_to_front(save_hwnd):
+        raise ExportError("저장 대화상자를 앞으로 가져오지 못했습니다.")
+    time.sleep(0.4)
+    winui.ctrl_key(VK_A)            # 기본 파일명 전체 선택
+    time.sleep(0.2)
+    winui.type_text(wanted)
+    time.sleep(0.4)
+    return winui.ctrl_text(edits[0]) if edits else wanted
+
+
 def export_to(target_path, tab_title: str = "배송중", timeout: float = 40.0,
               log=print) -> Path:
     """샵마인 현재 탭의 주문 목록을 target_path 로 내보낸다.
@@ -232,10 +267,13 @@ def export_to(target_path, tab_title: str = "배송중", timeout: float = 40.0,
         raise ExportError("저장 대화상자를 앞으로 가져오지 못했습니다.")
     time.sleep(0.4)
 
-    winui.ctrl_key(VK_A)            # 기본 파일명 전체 선택
-    time.sleep(0.2)
-    winui.type_text(str(target).replace("/", "\\"))
-    time.sleep(0.4)
+    wanted = str(target).replace("/", "\\")
+    entered = _fill_save_filename(save_hwnd, wanted, log=log)
+    if entered != wanted:
+        raise ExportError(
+            f"저장 경로가 정확히 입력되지 않았습니다. 입력하려던 값: {wanted!r} / "
+            f"실제로 들어간 값: {entered!r}"
+        )
     winui.key(VK_RETURN)
     log(f"  저장 경로 입력: {target}")
 

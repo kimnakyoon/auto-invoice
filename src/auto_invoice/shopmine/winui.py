@@ -522,3 +522,28 @@ def set_ctrl_text(hwnd, value):
     u.SendMessageW(hwnd, WM_SETTEXT, 0, ctypes.cast(buf, ctypes.c_void_p))
     time.sleep(0.2)
     return ctrl_text(hwnd) == value
+
+
+def find_descendants(hwnd, class_name=None, ctrl_id=None, visible_only=True):
+    """창의 모든 하위 컨트롤 중 조건에 맞는 것을 찾는다 (직계 자식만이 아니라).
+
+    표준 저장 대화상자의 '파일 이름' 입력칸처럼 ComboBoxEx32 안에 들어있어
+    GetDlgItem으로는 못 잡는 컨트롤을 찾기 위한 것이다.
+    """
+    out = []
+
+    def cb(child, _):
+        if visible_only and not u.IsWindowVisible(child):
+            return True
+        if ctrl_id is not None and u.GetDlgCtrlID(child) != ctrl_id:
+            return True
+        if class_name is not None:
+            buf = ctypes.create_unicode_buffer(128)
+            u.GetClassNameW(child, buf, 128)
+            if buf.value != class_name:
+                return True
+        out.append(child)
+        return True
+
+    u.EnumChildWindows(hwnd, ENUM(cb), 0)
+    return out
