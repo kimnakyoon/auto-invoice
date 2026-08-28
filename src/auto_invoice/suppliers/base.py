@@ -7,10 +7,12 @@ _template.py를 복사해서 시작하면 된다.
 from __future__ import annotations
 
 import re
-from typing import Protocol
+from datetime import date
+from typing import Callable, Protocol
 
 from playwright.sync_api import BrowserContext
 
+from .. import order_date as order_date_mod
 from ..models import TrackingResult
 
 _OPTION_NOISE_PATTERN = re.compile(r"[\s/|·,\-_()]+")
@@ -27,7 +29,14 @@ def normalize_option(text: str | None) -> str:
 
 
 class AdapterError(Exception):
-    """공급사 어댑터 관련 기본 예외."""
+    """공급사 어댑터 관련 기본 예외.
+
+    order_date: 주문상세에서 읽은 주문일. 송장이 안 나온 주문(미발급/취소)
+    일수록 '주문한 지 며칠 됐는지'가 중요해서, 성공했을 때만이 아니라 예외로
+    끝났을 때도 결과 정리까지 값을 실어 보낸다. 못 읽었으면 None이다.
+    """
+
+    order_date: date | None = None
 
 
 class OrderNotFound(AdapterError):
@@ -87,6 +96,37 @@ def raise_if_cancelled(text: str | None, order_no: str) -> None:
             f"주문 화면에 '{keyword}' 표시가 있습니다 (주문번호={order_no}) - "
             "취소/품절 주문인지 확인해주세요."
         )
+
+
+def with_order_date(page, fetch: Callable[[], TrackingResult], *, data=None) -> TrackingResult:
+    """주문상세 화면에서 주문일을 읽어 조회 결과(또는 예외)에 실어준다.
+
+    각 어댑터의 get_tracking에서 '주문상세 화면에 도착한 직후' 이 함수로
+    실제 조회를 감싸기만 하면 된다 - 화면을 떠나기 전에 날짜부터 읽어두고,
+    조회가 예외로 끝나도(아직 미발급/취소 등) 그 예외에 날짜를 붙여준다.
+
+    data: 주문 정보 JSON(화면에 심어둔 entry-data 등)이 있으면 화면 텍스트
+    보다 먼저 본다 - 라벨을 찾아 헤매지 않아도 되니 더 정확하다.
+    """
+    found = order_date_mod.from_json(data) if data is not None else None
+    return attach_order_date(found or order_date_mod.from_page(page), fetch)
+
+
+def attach_order_date(found: date | None, fetch: Callable[[], TrackingResult]) -> TrackingResult:
+    """이미 읽어둔 주문일을 조회 결과(또는 예외)에 붙인다.
+
+    화면이 아니라 API 응답에서 주문일을 얻는 어댑터(무신사/GSSHOP 등)용.
+    어댑터가 스스로 채워 넣은 값이 있으면 그쪽을 존중한다.
+    """
+    try:
+        result = fetch()
+    except AdapterError as e:
+        if e.order_date is None:
+            e.order_date = found
+        raise
+    if result.order_date is None:
+        result.order_date = found
+    return result
 
 
 class SupplierAdapter(Protocol):

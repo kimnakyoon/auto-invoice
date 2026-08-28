@@ -77,8 +77,17 @@ from dotenv import load_dotenv
 from playwright.sync_api import BrowserContext
 
 from .. import browser as browser_mod
+from .. import order_date as order_date_mod
 from ..models import TrackingResult
-from .base import BlockedError, OrderNotFound, ParseError, TrackingNotAvailableYet, normalize_option, raise_if_cancelled
+from .base import (
+    BlockedError,
+    OrderNotFound,
+    ParseError,
+    TrackingNotAvailableYet,
+    attach_order_date,
+    normalize_option,
+    raise_if_cancelled,
+)
 
 load_dotenv()
 
@@ -436,7 +445,12 @@ def _get_tracking_from_account(
     if data.get("result") != "SUCCESS":
         raise OrderNotFound(f"이 계정({account_label})에서 주문을 찾을 수 없습니다 (주문번호={order_no}).")
 
-    return _tracking_from_order_view(data, order_no, order_option)
+    # 이 어댑터는 주문상세 화면을 열지 않고 API 응답만 보므로, 주문일도
+    # 그 JSON에서 읽는다 (오래된 주문을 결과에 따로 모으는 데 쓴다).
+    return attach_order_date(
+        order_date_mod.from_json(data),
+        lambda: _tracking_from_order_view(data, order_no, order_option),
+    )
 
 
 def get_tracking(

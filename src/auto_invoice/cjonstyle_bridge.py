@@ -43,6 +43,7 @@ import time
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 
+from . import order_date as order_date_mod
 from .models import PendingOrder
 
 CJONSTYLE_DOMAIN = "cjonstyle.com"
@@ -71,6 +72,7 @@ _SCHEMA = {
                     "tracking_no": {"type": "string"},
                     "courier": {"type": "string"},
                     "reason": {"type": "string"},
+                    "order_date": {"type": "string"},
                 },
                 "required": ["order_id", "status"],
             },
@@ -89,6 +91,7 @@ _PROMPT_TEMPLATE = """너는 CJ온스타일(base.cjonstyle.com) 주문의 배송
 
 각 주문에 대해 순서대로, 매번 browser_batch로 최대한 묶어서 호출해라(왕복 횟수를 줄이는 게 속도에 가장 중요하다):
 1. browser_batch 한 번으로 [navigate(product_url), computer(wait 1.5초), get_page_text]를 순서대로 실행한다.
+1-1. 그 페이지 텍스트에서 주문일자("주문일"/"주문일자"/"결제일" 옆에 적힌 날짜)를 찾아 order_date에 "YYYY-MM-DD" 형식으로 기록해라. 배송예정일이나 다른 날짜를 넣지 말고, 확실하지 않으면 order_date를 아예 넣지 마라. 이 값은 아래 어떤 status로 끝나든 같이 기록한다.
 2. 그 결과에서 URL이 로그인 페이지이거나 "/p/myzone/" 경로를 벗어나 홈으로 리다이렉트됐으면 status="fail", reason="로그인 필요"로 기록하고 다음 주문으로 넘어간다.
 3. "배송조회" 버튼이 없고 "상품준비중"/"배송준비중"/"결제완료"/"주문접수" 같은 문구가 있으면 status="not_yet"으로 기록하고 다음 주문으로 넘어간다.
 3-1. "배송조회" 버튼이 없고 주문상태에 "취소" 또는 "품절"이 있으면 status="cancelled", reason에 그 상태 문구를 그대로 넣고 다음 주문으로 넘어간다. 주의: 화면 어딘가에 있는 "주문취소" 같은 버튼 이름이 아니라, 이 주문의 상태 표시일 때만 그렇게 판단해라.
@@ -109,6 +112,8 @@ class CjonstyleLookupResult:
     tracking_no: str | None = None
     courier: str | None = None
     reason: str | None = None
+    # 주문상세에 적혀 있던 주문일 ("2026-08-26"). 못 읽었으면 None.
+    order_date: str | None = None
 
 
 def filter_cjonstyle_orders(orders: list[PendingOrder]) -> list[PendingOrder]:
@@ -174,6 +179,7 @@ def _lookup_one(order: PendingOrder, stagger_sec: float = 0.0) -> CjonstyleLooku
         tracking_no=r.get("tracking_no"),
         courier=r.get("courier"),
         reason=r.get("reason"),
+        order_date=r.get("order_date"),
     )
 
 
@@ -262,23 +268,30 @@ def process_orders(report, input_path: str, output_path: str, log=print,
 
     upload_rows: list[tuple[str, str, str | None]] = []
     for r in results:
+        # 크롬으로 읽어온 주문일도 다른 공급사와 똑같이 결과에 싣는다
+        # (오래된 주문을 따로 모으는 데 쓴다 - order_date.py 참고).
+        ordered_on = order_date_mod.parse(r.order_date)
+        recipient = recipient_by_id.get(r.order_id)
         if r.status == "success" and r.tracking_no:
-            report.success(r.order_id, r.courier, r.tracking_no)
+            report.success(r.order_id, r.courier, r.tracking_no,
+                           order_date=ordered_on)
             upload_rows.append((r.order_id, r.tracking_no, r.courier))
             log(f"  {r.order_id}: 성공 ({r.courier} / {r.tracking_no})")
         elif r.status == "not_yet":
-            report.skip(r.order_id, r.reason or "아직 송장번호 미발급")
+            report.skip(r.order_id, r.reason or "아직 송장번호 미발급",
+                        recipient_name=recipient, order_date=ordered_on)
             log(f"  {r.order_id}: 아직 송장번호 미발급 - 건너뜀")
         elif r.status == "cancelled":
             # 기다려도 송장이 안 나오는 주문이라 일반 스킵과 분리한다
             # (suppliers/base.py의 OrderCancelled와 같은 취급).
             reason = f"주문 화면에 취소/품절 표시가 있습니다: {r.reason or '(문구 없음)'}"
-            report.cancelled(r.order_id, reason,
-                             recipient_name=recipient_by_id.get(r.order_id))
+            report.cancelled(r.order_id, reason, recipient_name=recipient,
+                             order_date=ordered_on)
             log(f"  {r.order_id}: 취소/품절로 보임 - 건너뜀")
         else:
             reason = r.reason or "알 수 없는 오류"
-            report.fail(r.order_id, reason, recipient_name=recipient_by_id.get(r.order_id))
+            report.fail(r.order_id, reason, recipient_name=recipient,
+                        order_date=ordered_on)
             log(f"  {r.order_id}: 실패 ({reason})")
 
     # orchestrator와 같은 규칙으로 '한 주문번호가 여러 행' 주문을 뺀다.

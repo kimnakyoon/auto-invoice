@@ -78,8 +78,15 @@ from urllib.parse import parse_qs, urlparse
 from dotenv import load_dotenv
 from playwright.sync_api import BrowserContext, Page
 
+from .. import order_date as order_date_mod
 from ..models import TrackingResult
-from .base import BlockedError, ParseError, TrackingNotAvailableYet, raise_if_cancelled
+from .base import (
+    BlockedError,
+    ParseError,
+    TrackingNotAvailableYet,
+    attach_order_date,
+    raise_if_cancelled,
+)
 
 load_dotenv()
 
@@ -644,6 +651,20 @@ def _fetch_tracking(context: BrowserContext, order_no: str) -> TrackingResult:
         page.close()
 
 
+def _tracking_for_listed_order(context: BrowserContext, order: ListedOrder) -> TrackingResult:
+    if not order.has_tracking:
+        # 주문상태를 정확히 읽을 수 있으니 취소/품절 판정을 먼저 한다.
+        raise_if_cancelled(order.status, order.order_no)
+        if any(pattern in order.status for pattern in NOT_YET_STATUSES):
+            raise TrackingNotAvailableYet(
+                f"아직 발송 전입니다 (주문번호={order.order_no}, 주문상태={order.status})."
+            )
+        raise ParseError(
+            f"배송조회를 할 수 없는 주문입니다 (주문번호={order.order_no}, 주문상태={order.status})."
+        )
+    return _fetch_tracking(context, order.order_no)
+
+
 def get_tracking(
     context: BrowserContext,
     product_url: str,
@@ -652,19 +673,14 @@ def get_tracking(
     recipient_name: str | None = None,
 ) -> TrackingResult:
     order_no = extract_order_no(product_url)
+    if order_no is not None:
+        return _fetch_tracking(context, order_no)
 
-    if order_no is None:
-        order = _find_order(context, order_option, recipient_name)
-        if not order.has_tracking:
-            # 주문상태를 정확히 읽을 수 있으니 취소/품절 판정을 먼저 한다.
-            raise_if_cancelled(order.status, order.order_no)
-            if any(pattern in order.status for pattern in NOT_YET_STATUSES):
-                raise TrackingNotAvailableYet(
-                    f"아직 발송 전입니다 (주문번호={order.order_no}, 주문상태={order.status})."
-                )
-            raise ParseError(
-                f"배송조회를 할 수 없는 주문입니다 (주문번호={order.order_no}, 주문상태={order.status})."
-            )
-        order_no = order.order_no
-
-    return _fetch_tracking(context, order_no)
+    # 상품URL에 주문번호가 없으면 주문내역 목록에서 찾는다. 그 목록에 주문일이
+    # 같이 들어있어서, 화면을 따로 읽지 않고 그 값을 그대로 결과에 실어준다
+    # (오래된 주문을 결과에 따로 모으는 데 쓴다).
+    order = _find_order(context, order_option, recipient_name)
+    return attach_order_date(
+        order_date_mod.parse(order.order_date),
+        lambda: _tracking_for_listed_order(context, order),
+    )

@@ -88,29 +88,36 @@ def run(
                         order_option=order.order_option,
                         **extra_kwargs,
                     )
-                except TrackingNotAvailableYet:
+                except TrackingNotAvailableYet as e:
                     message = "아직 송장번호 미발급 - 건너뜀"
-                    report.skip(order.order_id, "아직 송장번호 미발급")
+                    # 어댑터가 주문상세에서 읽어 예외에 실어준 주문일을 같이
+                    # 남긴다 - 미발급인 채로 며칠 지난 주문은 따로 모아야 한다.
+                    report.skip(order.order_id, "아직 송장번호 미발급",
+                                recipient_name=order.recipient_name,
+                                order_date=e.order_date)
                     continue
                 except OrderCancelled as e:
                     # 기다려도 송장이 안 나오는 주문이라 일반 스킵과 분리한다.
                     message = f"취소/품절로 보임 - 건너뜀 ({e})"
                     report.cancelled(order.order_id, str(e),
-                                     recipient_name=order.recipient_name)
+                                     recipient_name=order.recipient_name,
+                                     order_date=e.order_date)
                     continue
                 except BlockedError as e:
                     blocked_sites[site_key] = str(e)
                     raise
 
                 upload_rows.append((order.order_id, result.tracking_no, result.courier))
-                report.success(order.order_id, result.courier, result.tracking_no)
+                report.success(order.order_id, result.courier, result.tracking_no,
+                               order_date=result.order_date)
                 message = f"성공 ({result.courier} / {result.tracking_no})"
 
             except AdapterError as e:
                 message = f"실패: {e}"
                 if order.recipient_name:
                     message += f" (수령인: {order.recipient_name})"
-                report.fail(order.order_id, str(e), recipient_name=order.recipient_name)
+                report.fail(order.order_id, str(e), recipient_name=order.recipient_name,
+                            order_date=e.order_date)
             except Exception as e:  # noqa: BLE001 - 배치 전체가 죽지 않도록 광범위하게 잡는다
                 reason = f"예상치 못한 오류: {e}"
                 message = reason

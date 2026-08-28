@@ -32,7 +32,14 @@ from dotenv import load_dotenv
 from playwright.sync_api import BrowserContext
 
 from ..models import TrackingResult
-from .base import BlockedError, ParseError, TrackingNotAvailableYet, raise_if_cancelled, normalize_option
+from .base import (
+    BlockedError,
+    ParseError,
+    TrackingNotAvailableYet,
+    raise_if_cancelled,
+    normalize_option,
+    with_order_date,
+)
 
 load_dotenv()
 
@@ -197,6 +204,7 @@ def get_tracking(
             if _looks_like_login_page(page):
                 raise BlockedError("SSG 로그인 후에도 여전히 로그인 페이지입니다.")
 
-        return _scrape_tracking_from_page(page, order_no, order_option)
+        # 주문상세 화면을 떠나기 전에 주문일부터 읽어둔다 (오래된 주문을 결과에 따로 모으는 데 쓴다).
+        return with_order_date(page, lambda: _scrape_tracking_from_page(page, order_no, order_option))
     finally:
         page.close()

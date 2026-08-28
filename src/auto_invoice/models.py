@@ -1,3 +1,4 @@
+from datetime import date
 from typing import Literal, Optional
 
 from pydantic import BaseModel
@@ -20,6 +21,10 @@ class TrackingResult(BaseModel):
     tracking_no: str
     courier: Optional[str] = None
     note: Optional[str] = None
+    # 공급사 주문상세에 적혀 있던 주문일. 오늘과 이틀 이상 벌어진 주문은
+    # 결과 정리에서 따로 모아 보여준다 (order_date.py 참고). 화면에서
+    # 읽지 못했으면 None이고, 그러면 아무 표시도 하지 않는다.
+    order_date: Optional[date] = None
 
 
 # 실행이 끝난 뒤 사람이 따로 챙겨야 하는 주문의 종류. 마지막 결과 정리에서
@@ -39,3 +44,6 @@ class ReportEntry(BaseModel):
     recipient_name: Optional[str] = None
     # 사람 손이 필요한 이유를 분류해둔다. None이면 일반 성공/실패/스킵.
     category: Optional[AttentionCategory] = None
+    # 공급사 주문상세에서 읽은 주문일 (못 읽었으면 None). 성공/실패/스킵과
+    # 상관없이 오래된 주문을 따로 뽑는 데 쓴다 - order_date.py 참고.
+    order_date: Optional[date] = None

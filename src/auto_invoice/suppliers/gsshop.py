@@ -66,7 +66,14 @@ from dotenv import load_dotenv
 from playwright.sync_api import BrowserContext
 
 from ..models import TrackingResult
-from .base import BlockedError, ParseError, TrackingNotAvailableYet, normalize_option, raise_if_cancelled
+from .base import (
+    BlockedError,
+    ParseError,
+    TrackingNotAvailableYet,
+    normalize_option,
+    raise_if_cancelled,
+    with_order_date,
+)
 
 load_dotenv()
 
@@ -385,10 +392,15 @@ def get_tracking(
                 raise BlockedError("로그인 후에도 여전히 로그인 페이지입니다.")
 
         entry = _read_entry_data(page, ord_no)
-        item = _select_item(entry, ord_no, order_option)
-        tracking_no = re.sub(r"[^0-9]", "", str(item["invNo"]))
-        courier = _fetch_courier_name(page, origin, ord_no, str(item["ordItemId"]))
 
-        return TrackingResult(tracking_no=tracking_no, courier=courier)
+        def fetch() -> TrackingResult:
+            item = _select_item(entry, ord_no, order_option)
+            tracking_no = re.sub(r"[^0-9]", "", str(item["invNo"]))
+            courier = _fetch_courier_name(page, origin, ord_no, str(item["ordItemId"]))
+            return TrackingResult(tracking_no=tracking_no, courier=courier)
+
+        # 주문일은 화면 텍스트에서 라벨을 찾는 것보다 entry-data(JSON)에서
+        # 읽는 쪽이 정확하다 (오래된 주문을 결과에 따로 모으는 데 쓴다).
+        return with_order_date(page, fetch, data=entry)
     finally:
         page.close()

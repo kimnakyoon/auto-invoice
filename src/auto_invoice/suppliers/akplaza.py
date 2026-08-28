@@ -48,7 +48,14 @@ from playwright.sync_api import BrowserContext
 from playwright.sync_api import TimeoutError as PlaywrightTimeoutError
 
 from ..models import TrackingResult
-from .base import BlockedError, ParseError, TrackingNotAvailableYet, normalize_option, raise_if_cancelled
+from .base import (
+    BlockedError,
+    ParseError,
+    TrackingNotAvailableYet,
+    normalize_option,
+    raise_if_cancelled,
+    with_order_date,
+)
 
 load_dotenv()
 
@@ -358,6 +365,7 @@ def get_tracking(
                 raise BlockedError("로그인 후에도 여전히 로그인 페이지입니다.")
 
         page.wait_for_timeout(1500)  # 주문상세가 렌더링될 시간을 준다
-        return _scrape_tracking_from_page(context, page, order_no, order_option)
+        # 주문상세 화면을 떠나기 전에 주문일부터 읽어둔다 (오래된 주문을 결과에 따로 모으는 데 쓴다).
+        return with_order_date(page, lambda: _scrape_tracking_from_page(context, page, order_no, order_option))
     finally:
         page.close()

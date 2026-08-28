@@ -372,8 +372,9 @@ def summarize(result: PipelineResult) -> str:
     """실행 결과를 사람이 읽을 한 덩어리 요약으로.
 
     자동으로 처리하지 못해 사람이 직접 손봐야 하는 주문(아직 지원하지 않는
-    사이트, 취소/품절)은 5단계 로그에 이미 한 번 나오지만 그 위로 로그가 길게
-    쌓여 묻히기 쉬워서, 맨 마지막 요약에 수령인 이름과 함께 다시 붙인다.
+    사이트, 취소/품절, 주문일이 오래된 건)은 5단계 로그에 이미 한 번 나오지만
+    그 위로 로그가 길게 쌓여 묻히기 쉬워서, 맨 마지막 요약에 수령인 이름과
+    함께 다시 붙인다 (report.attention_blocks).
     """
     return "\n".join([_apply_summary(result), *_lookup_summary(result),
                       *_attention_summary(result)])

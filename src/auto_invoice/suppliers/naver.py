@@ -53,7 +53,15 @@ from playwright.sync_api import BrowserContext
 
 from .. import browser as browser_mod
 from ..models import TrackingResult
-from .base import BlockedError, OrderNotFound, ParseError, TrackingNotAvailableYet, normalize_option, raise_if_cancelled
+from .base import (
+    BlockedError,
+    OrderNotFound,
+    ParseError,
+    TrackingNotAvailableYet,
+    normalize_option,
+    raise_if_cancelled,
+    with_order_date,
+)
 
 load_dotenv()
 
@@ -368,7 +376,8 @@ def _get_tracking_from_account(
         if _redirected_away(page):
             raise OrderNotFound(f"이 계정({account_label})에서 주문을 찾을 수 없습니다 (주문번호={order_no}).")
 
-        return _scrape_tracking_from_page(page, order_no, order_option)
+        # 주문상세 화면을 떠나기 전에 주문일부터 읽어둔다 (오래된 주문을 결과에 따로 모으는 데 쓴다).
+        return with_order_date(page, lambda: _scrape_tracking_from_page(page, order_no, order_option))
     finally:
         # 두 번째 계정 세션은 여기서 직접 저장해야 한다. 오케스트레이터는
         # supplier_contexts에 담긴 context만 실행 끝에 저장하는데, 두 번째
