@@ -34,7 +34,9 @@ from . import cjonstyle_bridge
 from .orchestrator import run as run_orchestrator
 from .shopmine import excel_io, export, grid, upload
 
-WORK_DIR = Path(__file__).resolve().parent.parent.parent / "work"
+# 내보낸 주문목록 엑셀과 업로드용 CSV는 전부 바탕화면에 저장한다
+# (사람이 바로 열어 확인할 수 있어야 해서).
+OUTPUT_DIR = Path.home() / "Desktop"
 
 STEPS = 6
 
@@ -80,10 +82,10 @@ def read_csv_order_ids(path) -> list[str]:
 
 def select_and_export(result: PipelineResult, *, tab="배송중", log=print) -> bool:
     """1~2단계: 고칠 주문만 체크하고 그 주문만 엑셀로 내보낸다."""
-    WORK_DIR.mkdir(exist_ok=True)
+    OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
     stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    result.export_path = WORK_DIR / f"주문목록_{stamp}.xls"
-    result.csv_path = WORK_DIR / f"송장업로드_{stamp}.csv"
+    result.export_path = OUTPUT_DIR / f"주문목록_{stamp}.xls"
+    result.csv_path = OUTPUT_DIR / f"송장업로드_{stamp}.csv"
 
     log(f"[1/{STEPS}] 배송중 탭에서 송장을 고칠 주문 고르기 "
         f"({' / '.join(upload.TARGET_COURIERS)})")

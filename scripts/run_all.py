@@ -7,7 +7,7 @@
     python scripts/run_all.py                             # 기본 상한 100건
     python scripts/run_all.py --limit 5 --max-apply 5      # 소량 테스트
     python scripts/run_all.py --stop-before-apply          # 일괄등록까지만
-    python scripts/run_all.py --csv "work/송장업로드_....csv"   # 4~6단계만
+    python scripts/run_all.py --csv "~/Desktop/송장업로드_....csv"  # 4~6단계만
 """
 
 import argparse
