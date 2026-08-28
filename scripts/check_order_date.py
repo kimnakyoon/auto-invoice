@@ -44,6 +44,7 @@ DEFAULT_URLS = {
     "gmarket": "https://my.gmarket.co.kr/ko/pc/detail/basic/5522257883",
     "naver": "https://orders.pay.naver.com/order/status/2026082523369571?returnUrl=https%3A%2F%2Fpay.naver.com%2Fpc%2Fhistory",
     "musinsa": "https://www.musinsa.com/order/order-detail/202608250706390001",
+    "akplaza": "https://www.digital-akplaza.com/mypage/orderList/202608250102769",
     "gsshop": "https://with.gsshop.com/ord/dlvcursta/popup/ordDtl.gs?ordNo=3468580811&ecOrdTypCd=S",
 }
 
