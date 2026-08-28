@@ -9,6 +9,7 @@ if sys.platform == "win32":
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
 
+from auto_invoice import result_excel  # noqa: E402
 from auto_invoice.orchestrator import run  # noqa: E402
 
 
@@ -52,6 +53,13 @@ def main() -> None:
             print(line)
     report_path = report.save()
     print(f"상세 리포트: {report_path}")
+    # 조회 결과는 JSON 말고 사람이 바로 열어볼 엑셀로도 남긴다 (바탕화면).
+    result_excel.save_run_result(
+        report.entries, counts,
+        applied_label="미반영 (업로드 전)",
+        paths=(("입력 엑셀", args.input),
+               ("업로드용 파일", output_path if counts["success"] else None),
+               ("상세 로그", report_path)))
     if counts["success"] > 0:
         print(f"업로드용 파일: {output_path}")
         print("이 파일을 검토한 뒤 샵마인 [발송정보일괄등록(수정용)]으로 직접 업로드해주세요.")

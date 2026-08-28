@@ -39,10 +39,11 @@ Alt+X / Alt+U 도 엉뚱한 화면으로 가버린다.
 from __future__ import annotations
 
 import csv
+import traceback
 from datetime import datetime
 from pathlib import Path
 
-from . import cjonstyle_bridge
+from . import cjonstyle_bridge, result_excel
 from .orchestrator import run as run_orchestrator
 from .shopmine import connect, excel_io, export, grid, tabs, upload
 
@@ -61,6 +62,13 @@ class PipelineResult:
         self.csv_path: Path | None = None
         self.picked: int = 0            # 3단계에서 고른 주문 수 (보이는 화면 기준)
         self.lookup_counts: dict = {}
+        # 5단계 조회 결과 원본. 6~8단계에서 멈추거나 오류가 나도 이미 끝낸
+        # 조회 결과는 그대로 사람에게 넘겨야 해서 들고 있는다
+        # (마지막 요약 + 바탕화면 결과 엑셀).
+        self.lookup_entries: list = []
+        self.lookup_failure_lines: list[str] = []
+        self.lookup_report_path: Path | None = None
+        self.result_excel_path: Path | None = None
         self.applied_count: int = 0     # [송장번호수정]으로 반영한 건수
         self.apply_status: str = ""     # '오류없음.' 등 결과 창 문구
         self.stopped_reason: str | None = None
@@ -72,6 +80,11 @@ class PipelineResult:
     @property
     def applied(self) -> bool:
         return self.applied_count > 0
+
+    @property
+    def lookup_done(self) -> bool:
+        """5단계 송장조회까지는 끝났는가 (그 뒤에서 멈췄더라도)."""
+        return bool(self.lookup_counts)
 
     @property
     def apply_ok(self) -> bool:
@@ -180,6 +193,8 @@ def lookup_tracking(result: PipelineResult, *, limit=None, headless=False,
             log(f"  CJ온스타일 처리 건너뜀: {e}")
 
     result.lookup_counts = report.summary()
+    result.lookup_entries = list(report.entries)
+    result.lookup_failure_lines = report.failure_lines()
     result.attention_blocks = report.attention_blocks()
     log(f"  성공 {result.lookup_counts['success']} / "
         f"실패 {result.lookup_counts['fail']} / 스킵 {result.lookup_counts['skip']}")
@@ -189,7 +204,8 @@ def lookup_tracking(result: PipelineResult, *, limit=None, headless=False,
         log(f"  [{title}]")
         for line in lines:
             log(f"  {line}")
-    log(f"  상세 리포트: {report.save()}")
+    result.lookup_report_path = report.save()
+    log(f"  상세 리포트: {result.lookup_report_path}")
 
 
 def apply_csv(csv_path, order_ids, *, max_apply=100, expected_filled=None,
@@ -278,11 +294,30 @@ def run_full(*, limit=None, max_apply=100, tab="배송중", stop_before_apply=Fa
 
     lookup_tracking(result, limit=limit, headless=headless,
                     skip_cjonstyle=skip_cjonstyle, log=log)
+    # 조회가 끝난 뒤로는 무슨 일이 생기든 결과를 들고 돌아온다. 반영 단계에서
+    # 멈추든 예상 못 한 오류로 죽든, 이미 끝낸 송장조회 결과는 사람에게 그대로
+    # 넘겨줘야 한다 - 결과 엑셀로 남기고 마지막 요약에도 싣는다.
+    try:
+        _apply_after_lookup(result, max_apply=max_apply,
+                            stop_before_apply=stop_before_apply, log=log)
+    except Exception as e:  # noqa: BLE001 - 조회 결과를 잃지 않는 것이 우선
+        result.stopped_reason = f"예상치 못한 오류: {e}"
+        log("")
+        log(f"중단: {result.stopped_reason}")
+        log(traceback.format_exc())
+    finally:
+        save_result_excel(result, log=log)
+    return result
+
+
+def _apply_after_lookup(result: PipelineResult, *, max_apply, stop_before_apply,
+                        log=print) -> None:
+    """조회가 끝난 뒤의 6~8단계. 결과는 전부 result에 쌓는다."""
     if result.lookup_counts.get("success", 0) == 0:
         result.stopped_reason = "조회 성공 건이 없어 종료했습니다 (샵마인은 건드리지 않음)."
         log("")
         log(result.stopped_reason)
-        return result
+        return
 
     order_ids = read_csv_order_ids(result.csv_path)
     log(f"  업로드용 CSV: {result.csv_path} ({len(order_ids)}건)")
@@ -291,9 +326,9 @@ def run_full(*, limit=None, max_apply=100, tab="배송중", stop_before_apply=Fa
     expected = excel_io.count_export_rows(str(result.export_path), order_ids)
     if expected != len(order_ids):
         log(f"  (그리드 기준 {expected}행 - 한 주문번호가 여러 행인 주문 포함)")
-    return apply_csv(result.csv_path, order_ids, max_apply=max_apply,
-                     expected_filled=expected, stop_before_apply=stop_before_apply,
-                     log=log, result=result)
+    apply_csv(result.csv_path, order_ids, max_apply=max_apply,
+              expected_filled=expected, stop_before_apply=stop_before_apply,
+              log=log, result=result)
 
 
 def run_from_csv(csv_path, *, max_apply=100, tab="배송중",
@@ -326,7 +361,67 @@ def summarize(result: PipelineResult) -> str:
     사이트, 취소/품절)은 5단계 로그에 이미 한 번 나오지만 그 위로 로그가 길게
     쌓여 묻히기 쉬워서, 맨 마지막 요약에 수령인 이름과 함께 다시 붙인다.
     """
-    return "\n".join([_apply_summary(result), *_attention_summary(result)])
+    return "\n".join([_apply_summary(result), *_lookup_summary(result),
+                      *_attention_summary(result)])
+
+
+def _lookup_summary(result: PipelineResult) -> list[str]:
+    """송장조회 결과. 반영까지 못 가고 멈췄어도 조회가 끝났으면 보여준다.
+
+    멈춘 실행에서 '중단됨' 한 줄만 남으면 이미 다 해둔 조회가 없던 일처럼
+    보인다. 실제로는 업로드용 CSV와 결과 엑셀이 만들어져 있어서 사람이 그걸로
+    이어서 처리하면 되므로, 그 경로까지 같이 알려준다.
+    """
+    if not result.lookup_done:
+        return []
+    counts = result.lookup_counts
+    stopped = bool(result.stopped_reason) and not result.applied
+    head = "송장조회는 끝냈습니다" if stopped else "송장조회"
+    lines = ["",
+             f"{head}: 성공 {counts.get('success', 0)} / "
+             f"실패 {counts.get('fail', 0)} / 스킵 {counts.get('skip', 0)}"]
+    if result.csv_path and Path(result.csv_path).exists():
+        lines.append(f"  업로드용 CSV: {result.csv_path}")
+    if result.result_excel_path:
+        lines.append(f"  조회 결과 엑셀: {result.result_excel_path}")
+    if result.lookup_failure_lines:
+        lines.append(f"[조회 실패] {len(result.lookup_failure_lines)}건 (직접 확인해주세요)")
+        lines.extend(result.lookup_failure_lines)
+    return lines
+
+
+def save_result_excel(result: PipelineResult, *, log=print) -> None:
+    """송장조회 결과를 바탕화면 엑셀로 남긴다 (조회를 했으면 항상).
+
+    run_full의 finally에서 부른다 - 반영 단계에서 멈추든 오류로 죽든, 이미
+    끝낸 조회 결과는 파일로 남아야 사람이 이어서 처리할 수 있다.
+    """
+    if not result.lookup_entries:
+        return
+    log("")
+    result.result_excel_path = result_excel.save_run_result(
+        result.lookup_entries, result.lookup_counts,
+        applied_label=_applied_label(result),
+        apply_note=_apply_summary(result),
+        paths=(("내보낸 주문목록", result.export_path),
+               ("업로드용 CSV", result.csv_path),
+               ("상세 로그", result.lookup_report_path)),
+        out_dir=OUTPUT_DIR, log=log)
+
+
+def _applied_label(result: PipelineResult) -> str:
+    """성공 건의 '샵마인 반영' 칸 문구.
+
+    주문 하나하나가 반영됐는지는 알 수 없다 - 샵마인 결과 창이 건수와 오류
+    여부만 주기 때문에, 실행 단위 결과를 성공 건 전체에 그대로 붙인다.
+    """
+    if result.apply_ok:
+        return "반영완료"
+    if result.applied:
+        return "반영결과 확인필요"
+    if result.stopped_reason:
+        return "미반영 (중단)"
+    return "미반영"
 
 
 def _attention_summary(result: PipelineResult) -> list[str]:

@@ -20,7 +20,7 @@ if sys.platform == "win32" and sys.stdout is not None:
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
 
-from auto_invoice import cjonstyle_bridge, pipeline  # noqa: E402
+from auto_invoice import cjonstyle_bridge, pipeline, result_excel  # noqa: E402
 from auto_invoice.orchestrator import run as run_orchestrator  # noqa: E402
 
 DESKTOP = Path.home() / "Desktop"
@@ -57,6 +57,7 @@ class App:
 
         self.selected_file: Path | None = find_latest_export()
         self._output_path: Path | None = None
+        self._result_excel_path: Path | None = None
         self._queue: "queue.Queue" = queue.Queue()
 
         # --- 전자동: 샵마인에서 받아서 반영까지 ---
@@ -114,8 +115,16 @@ class App:
         self.log = tk.Text(root, height=14, state="disabled")
         self.log.pack(fill="both", expand=True, padx=14, pady=8)
 
-        self.open_button = tk.Button(root, text="결과 파일 열기", command=self.open_output, state="disabled")
-        self.open_button.pack(pady=(0, 14))
+        # 업로드용 파일(CSV)과 조회 결과 엑셀은 쓰임새가 달라 따로 연다.
+        # 중간에 멈춘 실행에서도 조회 결과 엑셀은 만들어져 있다.
+        button_frame = tk.Frame(root)
+        button_frame.pack(pady=(0, 14))
+        self.open_button = tk.Button(button_frame, text="업로드용 파일 열기",
+                                     command=self.open_output, state="disabled")
+        self.open_button.pack(side="left", padx=4)
+        self.excel_button = tk.Button(button_frame, text="조회 결과 엑셀 열기",
+                                      command=self.open_result_excel, state="disabled")
+        self.excel_button.pack(side="left", padx=4)
 
         self.root.after(200, self._poll_queue)
 
@@ -183,6 +192,7 @@ class App:
                                text=text if busy else "▶  파일만 만들기")
         if busy:
             self.open_button.config(state="disabled")
+            self.excel_button.config(state="disabled")
             self.log.config(state="normal")
             self.log.delete("1.0", "end")
             self.log.config(state="disabled")
@@ -212,8 +222,17 @@ class App:
             counts = report.summary()
             failure_lines = report.failure_lines()
             attention_blocks = report.attention_blocks()
-            report.save()
-            self._queue.put(("done", (counts, failure_lines, attention_blocks, output_path)))
+            report_path = report.save()
+            # 조회 결과는 JSON 말고 사람이 바로 열어볼 엑셀로도 남긴다.
+            excel_path = result_excel.save_run_result(
+                report.entries, counts,
+                applied_label="미반영 (업로드 전)",
+                paths=(("입력 엑셀", self.selected_file),
+                       ("업로드용 파일", output_path if counts["success"] else None),
+                       ("상세 로그", report_path)),
+                log=lambda msg: self._queue.put(("log", msg)))
+            self._queue.put(
+                ("done", (counts, failure_lines, attention_blocks, output_path, excel_path)))
         except Exception as e:  # noqa: BLE001
             self._queue.put(("error", str(e)))
 
@@ -236,7 +255,8 @@ class App:
                 if kind == "log":
                     self._log(payload)
                 elif kind == "done":
-                    counts, failure_lines, attention_blocks, output_path = payload
+                    counts, failure_lines, attention_blocks, output_path, excel_path = payload
+                    self._set_result_excel(excel_path)
                     self._log(f"\n완료: 성공 {counts['success']} / 실패 {counts['fail']} / 스킵 {counts['skip']}")
                     if failure_lines:
                         self._log("\n실패한 주문 (샵마인에서 직접 확인해주세요):")
@@ -259,6 +279,8 @@ class App:
                     self._log("=" * 40)
                     self._log(pipeline.summarize(result))
                     self._log("=" * 40)
+                    # 반영까지 못 가고 멈췄어도 조회 결과 엑셀은 열 수 있게 한다.
+                    self._set_result_excel(result.result_excel_path)
                     if result.csv_path and Path(result.csv_path).exists():
                         self.open_button.config(state="normal")
                     self._set_busy(False)
@@ -272,9 +294,18 @@ class App:
             pass
         self.root.after(200, self._poll_queue)
 
+    def _set_result_excel(self, path) -> None:
+        self._result_excel_path = Path(path) if path else None
+        if self._result_excel_path and self._result_excel_path.exists():
+            self.excel_button.config(state="normal")
+
     def open_output(self) -> None:
-        if self._output_path and self._output_path.exists():
+        if self._output_path and Path(self._output_path).exists():
             os.startfile(self._output_path)  # noqa: S606 - 사용자가 방금 생성한 자신의 파일
+
+    def open_result_excel(self) -> None:
+        if self._result_excel_path and self._result_excel_path.exists():
+            os.startfile(self._result_excel_path)  # noqa: S606 - 사용자가 방금 생성한 자신의 파일
 
 
 def main() -> None:
