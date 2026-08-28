@@ -3,11 +3,11 @@
 실행:
     python scripts/test_gmarket_adapter.py
 
-최초 실행 시 브라우저 창이 뜨면 직접 지마켓에 로그인하세요(아이디는 .env의
-GMARKET_ID로 자동 입력됨). 로그인이 완료되면 자동으로 감지해서 이어서
-진행합니다. Cloudflare 봇 확인 화면이 뜨면 체크박스를 직접 눌러 통과해야
-합니다. 로그인 세션은 auth/gmarket_state.json 에 저장되어 다음 실행부터는
-다시 로그인하지 않아도 됩니다.
+.env에 GMARKET_ID/GMARKET_PW가 있으면 최초 실행부터 자동으로 로그인합니다.
+GMARKET_PW를 비워두면 브라우저 창이 떠서 직접 로그인해야 합니다(아이디는
+GMARKET_ID로 자동 입력됨). Cloudflare 봇 확인 화면이 뜨면 체크박스를 직접
+눌러 통과해야 합니다. 로그인 세션은 auth/gmarket_state.json 에 저장되어
+다음 실행부터는 다시 로그인하지 않아도 됩니다.
 """
 
 import sys
