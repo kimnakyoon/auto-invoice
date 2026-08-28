@@ -7,7 +7,7 @@
     python scripts/run_all.py                             # 기본 상한 100건
     python scripts/run_all.py --limit 5 --max-apply 5      # 소량 테스트
     python scripts/run_all.py --stop-before-apply          # 일괄등록까지만
-    python scripts/run_all.py --csv "~/Desktop/송장업로드_....csv"  # 4~6단계만
+    python scripts/run_all.py --csv "~/Desktop/송장업로드_....csv"  # 5~7단계만
 """
 
 import argparse
@@ -40,7 +40,7 @@ def main() -> int:
     p.add_argument("--headless", action="store_true",
                    help="공급사 조회를 브라우저 창 없이 (최초 로그인 이후에만)")
     p.add_argument("--csv", default=None,
-                   help="이미 만들어둔 업로드용 CSV로 4~6단계만 실행 "
+                   help="이미 만들어둔 업로드용 CSV로 5~7단계만 실행 "
                         "(상한 초과로 멈춘 뒤 확인하고 재실행할 때)")
     p.add_argument("--skip-cjonstyle", action="store_true",
                    help="CJ온스타일(실제 크롬으로 조회하는 느린 경로)을 건너뛴다")
@@ -48,7 +48,7 @@ def main() -> int:
 
     log("=" * 60)
     if args.csv:
-        log(f"기존 CSV로 4~6단계 실행  ({datetime.now():%Y-%m-%d %H:%M:%S})")
+        log(f"기존 CSV로 5~7단계 실행  ({datetime.now():%Y-%m-%d %H:%M:%S})")
     else:
         log(f"송장 자동화 전체 실행  ({datetime.now():%Y-%m-%d %H:%M:%S})")
     log("=" * 60)
