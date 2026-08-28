@@ -176,26 +176,73 @@ def ensure_template(export_hwnd, template: str = TEMPLATE_NAME, timeout: float =
 FILENAME_EDIT_ID = 1001
 
 
+def _find_filename_edit(save_hwnd):
+    """저장 대화상자의 '파일 이름' 입력칸 핸들 (없으면 None)."""
+    edits = winui.find_descendants(save_hwnd, class_name="Edit", ctrl_id=FILENAME_EDIT_ID)
+    return edits[0] if edits else None
+
+
+def _wait_for_default_filename(edit, timeout: float = 6.0) -> str:
+    """샵마인이 기본 파일명을 채워 넣고 잠잠해질 때까지 기다린다.
+
+    창이 뜬 직후에 우리 경로를 넣으면 **그 뒤에 앱이 기본 파일명으로 덮어쓴다**.
+    실제로 이것 때문에, 우리가 넣고 검증까지 마친 경로가 저장 시점에는 앱의
+    기본 이름으로 바뀌어 있었다(2026-08-28: 우리가 기다린 이름 대신
+    "주문목록-선택-송장 자동화(...).xls"로 저장돼서, 파일은 만들어졌는데도
+    "생성되지 않았습니다"로 중단됐다).
+
+    그래서 값이 비어 있지 않고 연속으로 같게 읽힐 때까지(=앱이 다 채웠을 때까지)
+    기다린 다음에 우리 값을 넣는다.
+    """
+    end = time.time() + timeout
+    last, stable = None, 0
+    while time.time() < end:
+        current = winui.ctrl_text(edit)
+        if current and current == last:
+            stable += 1
+            if stable >= 2:
+                return current
+        else:
+            stable = 0
+        last = current
+        time.sleep(0.25)
+    return last or ""
+
+
 def _fill_save_filename(save_hwnd, wanted: str, log=print) -> str:
     """저장 대화상자의 '파일 이름' 칸을 채우고, 실제로 들어간 값을 돌려준다.
 
-    예전에는 Ctrl+A 후 type_text로 한 글자씩 타이핑했는데, 키 입력이 한 글자
-    유실되는 사고가 실제로 났다(2026-08-28: "Desktop"이 "Deskto"로 들어가
-    존재하지 않는 폴더가 되는 바람에 저장이 되지 않고 대화상자가 그대로 남았다).
-    화면에는 멀쩡해 보이는 경로가 로그에 찍혀서 원인을 찾기도 어려웠다.
+    반드시 '타이핑'으로 채운다. WM_SETTEXT로 값을 넣으면 입력칸 글자만 바뀌고
+    대화상자 내부 상태에는 반영되지 않아서, 저장할 때 앱의 기본 파일명과
+    기본 폴더가 그대로 쓰인다(2026-08-28 실측: 우리가 넣은 경로는 무시되고
+    바탕화면에 "주문목록-선택-송장 자동화(...).xls"로 저장됐다).
 
-    그래서 WM_SETTEXT로 값을 통째로 넣고(키 유실이 원리적으로 불가능하다),
-    되읽어서 검증한다. WM_SETTEXT가 먹지 않는 경우에만 예전처럼 타이핑으로
-    한 번 더 시도하고, 그것도 실패하면 실제로 들어간 값을 호출자에게 알려준다.
+    타이핑은 글자가 유실될 수 있어서(같은 날 "Desktop"이 "Deskto"로 들어가
+    저장이 통째로 실패했다) 넣은 뒤 반드시 되읽어 검증하고, 다르면 다시 넣는다.
+    이 두 사고가 이 함수가 존재하는 이유다 - 어느 쪽도 조용히 넘어가면 안 된다.
     """
-    edits = winui.find_descendants(save_hwnd, class_name="Edit", ctrl_id=FILENAME_EDIT_ID)
-    if edits:
-        if winui.set_ctrl_text(edits[0], wanted):
-            return wanted
-        log("  파일 이름 칸에 값을 직접 넣지 못해 타이핑으로 다시 시도합니다.")
-    else:
-        log("  파일 이름 입력칸을 찾지 못해 타이핑으로 입력합니다.")
+    edit = _find_filename_edit(save_hwnd)
+    if edit is None:
+        log("  파일 이름 입력칸을 찾지 못했습니다 - 검증 없이 타이핑합니다.")
+        _type_filename(save_hwnd, wanted)
+        return wanted
 
+    default_name = _wait_for_default_filename(edit)
+    if default_name:
+        log(f"  앱이 넣은 기본 파일명 확인: {default_name}")
+
+    entered = ""
+    for attempt in range(1, 4):
+        _type_filename(save_hwnd, wanted)
+        entered = winui.ctrl_text(edit)
+        if entered == wanted:
+            return entered
+        log(f"  입력값이 다릅니다({attempt}/3) - 다시 입력합니다: {entered!r}")
+    return entered
+
+
+def _type_filename(save_hwnd, wanted: str) -> None:
+    """대화상자를 앞으로 가져와 파일 이름 칸에 경로를 타이핑한다."""
     if not winui.bring_to_front(save_hwnd):
         raise ExportError("저장 대화상자를 앞으로 가져오지 못했습니다.")
     time.sleep(0.4)
@@ -203,7 +250,85 @@ def _fill_save_filename(save_hwnd, wanted: str, log=print) -> str:
     time.sleep(0.2)
     winui.type_text(wanted)
     time.sleep(0.4)
-    return winui.ctrl_text(edits[0]) if edits else wanted
+
+
+def _commit_save_dialog(save_hwnd, wanted: str, log=print) -> None:
+    """저장 버튼을 누른다. 누르기 직전에 파일 이름을 한 번 더 확인한다.
+
+    Enter 키 대신 [저장] 버튼을 BM_CLICK으로 누른다 - 키 입력은 대화상자가
+    앞에 있어야 먹지만 BM_CLICK은 포커스와 무관하고, 마우스도 쓰지 않는다.
+    """
+    edit = _find_filename_edit(save_hwnd)
+    if edit is not None:
+        current = winui.ctrl_text(edit)
+        if current != wanted:
+            log(f"  저장 직전 파일 이름이 바뀌어 있어 다시 넣습니다: {current!r}")
+            _type_filename(save_hwnd, wanted)
+            current = winui.ctrl_text(edit)
+            if current != wanted:
+                raise ExportError(
+                    f"저장 직전에 파일 이름을 되돌리지 못했습니다 (현재 값: {current!r})."
+                )
+
+    button, _ = winui.dlg_button(save_hwnd, winui.DLG_OK)
+    if button:
+        winui.press_button(button)
+        return
+    log("  [저장] 버튼을 찾지 못해 Enter로 저장합니다.")
+    if not winui.bring_to_front(save_hwnd):
+        raise ExportError("저장 대화상자를 앞으로 가져오지 못했습니다.")
+    time.sleep(0.3)
+    winui.key(VK_RETURN)
+
+
+def _nearby_new_files_hint(target: Path, since: float) -> str:
+    """기대한 이름이 없을 때, 같은 폴더에 방금 생긴 다른 파일을 알려준다.
+
+    앱이 우리가 넣은 경로를 무시하고 자기 기본 파일명으로 저장해버린 적이
+    있는데(2026-08-28), 그때 메시지가 "생성되지 않았습니다"뿐이라 파일이
+    멀쩡히 바탕화면에 있는데도 원인을 알 수 없었다.
+    """
+    try:
+        recent = [
+            f for f in target.parent.iterdir()
+            if f.is_file() and f.suffix.lower() in (".xls", ".xlsx") and f.stat().st_mtime >= since
+        ]
+    except OSError:
+        return ""
+    if not recent:
+        return ""
+    names = ", ".join(f.name for f in sorted(recent, key=lambda f: f.stat().st_mtime, reverse=True)[:3])
+    return (
+        f" - 다만 같은 폴더에 방금 만들어진 파일이 있습니다: {names}. "
+        "샵마인이 우리가 넣은 파일명을 무시하고 기본 이름으로 저장했을 수 있습니다."
+    )
+
+
+def _commit_save_dialog(save_hwnd, wanted: str, log=print) -> None:
+    """저장 버튼을 누른다. 누르기 직전에 파일 이름을 한 번 더 확인한다.
+
+    Enter 키 대신 [저장] 버튼을 BM_CLICK으로 누른다 - 키 입력은 대화상자가
+    앞에 있어야 먹지만 BM_CLICK은 포커스와 무관하고, 마우스도 쓰지 않는다.
+    """
+    edit = _find_filename_edit(save_hwnd)
+    if edit is not None:
+        current = winui.ctrl_text(edit)
+        if current != wanted:
+            log(f"  저장 직전 파일 이름이 바뀌어 있어 다시 넣습니다: {current!r}")
+            if not winui.set_ctrl_text(edit, wanted):
+                raise ExportError(
+                    f"저장 직전에 파일 이름을 되돌리지 못했습니다 (현재 값: {current!r})."
+                )
+
+    button, _ = winui.dlg_button(save_hwnd, winui.DLG_OK)
+    if button:
+        winui.press_button(button)
+        return
+    log("  [저장] 버튼을 찾지 못해 Enter로 저장합니다.")
+    if not winui.bring_to_front(save_hwnd):
+        raise ExportError("저장 대화상자를 앞으로 가져오지 못했습니다.")
+    time.sleep(0.3)
+    winui.key(VK_RETURN)
 
 
 def export_to(target_path, tab_title: str = "배송중", timeout: float = 40.0,
@@ -274,7 +399,7 @@ def export_to(target_path, tab_title: str = "배송중", timeout: float = 40.0,
             f"저장 경로가 정확히 입력되지 않았습니다. 입력하려던 값: {wanted!r} / "
             f"실제로 들어간 값: {entered!r}"
         )
-    winui.key(VK_RETURN)
+    _commit_save_dialog(save_hwnd, wanted, log=log)
     log(f"  저장 경로 입력: {target}")
 
     # 6) '엑셀파일을 여시겠습니까?' -> 아니요
@@ -284,13 +409,16 @@ def export_to(target_path, tab_title: str = "배송중", timeout: float = 40.0,
         log(f"  {msg}")
 
     # 7) 결과 확인
+    started_at = time.time() - 120  # 이 실행에서 만들어졌다고 볼 시간 범위
     end = time.time() + timeout
     while time.time() < end:
         if target.exists() and target.stat().st_size > 0:
             break
         time.sleep(0.5)
     else:
-        raise ExportError(f"엑셀 파일이 생성되지 않았습니다: {target}")
+        raise ExportError(
+            f"엑셀 파일이 생성되지 않았습니다: {target}{_nearby_new_files_hint(target, started_at)}"
+        )
 
     if winui.find_windows(title_equals=SAVE_DIALOG_TITLE):
         raise ExportError("저장 대화상자가 아직 열려 있습니다 - 경로가 거부됐을 수 있습니다.")
