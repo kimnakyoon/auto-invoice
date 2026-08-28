@@ -20,6 +20,15 @@
   쿠키 파일이 잠겨 있어 복사에 실패할 수 있다).
 - 네이버는 계정 전환 기능 특성상 크롬에는 한 번에 한 계정만 로그인되어
   있으므로, 지금 크롬에 로그인된 계정이 어느 쪽인지 실행 중에 물어본다.
+  다만 2026-08-28 실측 결과 **네이버는 이 방식이 통하지 않는다** - 크롬에서
+  가져온 쿠키로는 Playwright 브라우저에서 로그인 상태가 유지되지 않고
+  로그인 페이지로 튕긴다(무신사와 같은 양상으로, 세션을 브라우저에
+  묶어두는 것으로 보인다). 네이버는 헤드리스가 아닌 실행으로 직접 1회
+  로그인하는 방법밖에 없다. 같은 날 확인한 바로는 패션플러스/GSSHOP은
+  이 방식으로 정상 동작했다.
+- 가져온 세션이 실제로 유효한지는 저장 시점에 알 수 없으므로, 덮어쓰기
+  전에 기존 파일을 <사이트>_state.json.bak 으로 남긴다. 가져온 뒤에는 각
+  사이트 테스트 스크립트로 확인하고, 문제가 있으면 .bak을 되돌리면 된다.
 - 무신사는 이 스크립트로 세션을 가져올 수 없다 - Cloudflare로 보이는 봇
   차단이 있어서, 쿠키만 다른 브라우저로 옮기면 서버가 세션을 무효 처리한다
   (로그인 페이지로 리다이렉트됨). 무신사는 대신 scripts/musinsa_login_setup.py로
@@ -29,6 +38,7 @@
 
 from __future__ import annotations
 
+import argparse
 import json
 import shutil
 import sys
@@ -104,12 +114,39 @@ def filter_state(state: dict, domains: list[str]) -> dict:
 
 
 def write_state(site_key: str, state: dict) -> None:
+    """쿠키를 하나도 못 찾았으면 저장하지 않는다.
+
+    예전에는 무조건 덮어썼는데, 지금 크롬에 그 사이트 로그인이 안 되어 있으면
+    빈 파일을 써서 **이미 잘 동작하던 세션을 날려버렸다**. 크롬에 없는 사이트는
+    건드리지 않고 그대로 두는 게 맞다.
+    """
     out = AUTH_DIR / f"{site_key}_state.json"
+    if not state["cookies"]:
+        existing = " (기존 세션 파일은 그대로 둡니다)" if out.exists() else ""
+        print(f"  -> {site_key}: 크롬에 로그인 세션이 없어 건너뜁니다{existing}.")
+        return
+    # 가져온 쿠키가 그 사이트에서 실제로 유효한지는 여기서 알 수 없다(네이버가
+    # 그랬듯 다른 브라우저로 옮기면 무효 처리하는 사이트가 있다). 잘 되던
+    # 세션을 되돌릴 수 있도록 덮어쓰기 전에 .bak으로 남긴다.
+    if out.exists():
+        shutil.copy2(out, out.with_suffix(".json.bak"))
     out.write_text(json.dumps(state, ensure_ascii=False, indent=2), encoding="utf-8")
     print(f"  -> {site_key}: 쿠키 {len(state['cookies'])}개 저장 ({out})")
 
 
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument(
+        "--naver-account",
+        choices=["1", "2", "skip"],
+        help="지금 크롬에 로그인된 네이버 계정 (1=NAVER_ID, 2=NAVER_ID2, skip=건너뛰기). "
+        "생략하면 실행 중에 물어봅니다. 콘솔 입력을 받을 수 없는 환경에서 쓰세요.",
+    )
+    return parser.parse_args()
+
+
 def main() -> None:
+    args = parse_args()
     print("크롬 프로필 복사 중...")
     try:
         copy_profile()
@@ -148,10 +185,14 @@ def main() -> None:
 
         if naver_filtered["cookies"]:
             print(f"  네이버 로그인 세션 {len(naver_filtered['cookies'])}개 쿠키 발견.")
-            answer = input(
-                "  지금 크롬에 로그인된 네이버 계정은 어느 쪽인가요? "
-                "[1] NAVER_ID  [2] NAVER_ID2  [s] 건너뛰기: "
-            ).strip().lower()
+            if args.naver_account:
+                answer = args.naver_account.replace("skip", "s")
+                print(f"  --naver-account={args.naver_account} 로 지정됨.")
+            else:
+                answer = input(
+                    "  지금 크롬에 로그인된 네이버 계정은 어느 쪽인가요? "
+                    "[1] NAVER_ID  [2] NAVER_ID2  [s] 건너뛰기: "
+                ).strip().lower()
             if answer == "1":
                 write_state("naver", naver_filtered)
             elif answer == "2":

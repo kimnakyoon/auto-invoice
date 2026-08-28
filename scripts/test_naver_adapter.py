@@ -25,7 +25,7 @@ from playwright.sync_api import sync_playwright  # noqa: E402
 
 from auto_invoice import browser as browser_mod  # noqa: E402
 from auto_invoice.suppliers import naver  # noqa: E402
-from auto_invoice.suppliers.base import TrackingNotAvailableYet  # noqa: E402
+from auto_invoice.suppliers.base import OrderCancelled, TrackingNotAvailableYet  # noqa: E402
 
 # 대화에서 확인했던 실제 주문 URL/송장번호로 결과가 맞는지 검증한다.
 # 첫 번째 계정(NAVER_ID) 소유의 주문 - 배송중, 롯데택배로 발송됨.
@@ -60,7 +60,12 @@ def main() -> None:
                 print("[계정2] 송장번호:", result2.tracking_no, "/ 택배사:", result2.courier)
                 print("✅ 계정 전환 로직이 두 번째 계정에서 주문을 찾았습니다.")
             except TrackingNotAvailableYet as e:
-                print("✅ 계정 전환 로직이 두 번째 계정에서 주문을 찾았습니다 (취소된 주문이라 송장 없음):", e)
+                print("✅ 계정 전환 로직이 두 번째 계정에서 주문을 찾았습니다 (아직 송장 미발급):", e)
+            except OrderCancelled as e:
+                # 이 검증용 주문은 취소완료 상태다. raise_if_cancelled가 생기기
+                # 전에는 TrackingNotAvailableYet으로 뭉뚱그려졌지만, 지금은
+                # 취소/품절로 따로 분류되므로 이것도 정상 통과로 본다.
+                print("✅ 계정 전환 로직이 두 번째 계정에서 주문을 찾았습니다 (취소된 주문):", e)
         finally:
             browser_mod.save_state(context, naver.SITE_KEY)
             browser.close()
