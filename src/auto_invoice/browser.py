@@ -13,6 +13,10 @@ from playwright.sync_api import Browser, BrowserContext, Playwright
 
 AUTH_DIR = Path("auth")
 
+# 사이트가 모바일 페이지를 쓰면 앞쪽, PC 페이지를 쓰면 뒤쪽을 쓴다.
+MOBILE_VIEWPORT = {"width": 412, "height": 900}
+DESKTOP_VIEWPORT = {"width": 1280, "height": 900}
+
 # 실행 중인 Playwright 인스턴스. 어댑터는 BrowserContext만 받기 때문에,
 # 로그인만 별도의 브라우저로 띄워야 하는 사이트(현대몰)가 인스턴스를 다시
 # 구할 방법이 없어서 여기에 담아둔다.
@@ -58,7 +62,9 @@ def real_chrome_profile_dir(site_key: str) -> Path:
 
 
 def real_chrome_context(
-    site_key: str, playwright: Playwright | None = None
+    site_key: str,
+    playwright: Playwright | None = None,
+    viewport: dict[str, int] | None = None,
 ) -> BrowserContext:
     """설치된 진짜 크롬을, 계속 재사용되는 프로필로 띄운 컨텍스트.
 
@@ -74,6 +80,10 @@ def real_chrome_context(
 
     프로필은 auth/chrome_profile_<사이트>에 남는다(auth/는 .gitignore 대상).
     쓸수록 이력이 쌓여 점수에 유리하므로 지우지 않는다.
+
+    viewport는 사이트가 모바일 페이지를 쓰는지 PC 페이지를 쓰는지에 맞춰
+    호출한 쪽이 정한다 - 기본값(모바일)으로 PC 로그인 페이지를 열면 레이아웃이
+    잘려서, 사람이 눌러야 하는 요소가 화면 가장자리에 반쯤 걸치는 일이 있었다.
     """
     pw = playwright or _playwright
     if pw is None:
@@ -84,7 +94,7 @@ def real_chrome_context(
         user_data_dir=str(profile),
         channel="chrome",
         headless=False,
-        viewport={"width": 412, "height": 900},
+        viewport=viewport or MOBILE_VIEWPORT,
         locale="ko-KR",
         timezone_id="Asia/Seoul",
     )

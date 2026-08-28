@@ -4,8 +4,11 @@ auth/gsshop_state.json(저장된 로그인 세션)을 **쓰지 않고** 빈 브�
 시작하기 때문에, 반드시 로그인 경로를 타게 된다. .env의 GSSHOP_ID/GSSHOP_PW로
 자동 로그인이 실제로 되는지 확인하는 용도다.
 
-GSSHOP 로그인 폼에는 reCAPTCHA Enterprise v3(점수 기반)가 걸려 있어서 자동
-로그인이 거부될 수 있다 - 거부되면 사유가 그대로 출력된다.
+GSSHOP만은 완전 무인이 아니다. 로그인 폼의 reCAPTCHA가 자동화 브라우저에는
+항상 체크박스 확인을 요구하기 때문에(자세한 내용은 suppliers/gsshop.py),
+**뜬 크롬 창에서 "로봇이 아닙니다"를 통과시켜 줘야 한다**(체크박스만 눌러도
+끝날 때가 있고, 구글이 안 믿으면 이미지 고르기가 뜨기도 한다). 아이디와
+비밀번호는 자동으로 채워지고, 통과되면 로그인 제출은 사이트가 알아서 한다.
 
 실행:
     python scripts/test_gsshop_login.py
@@ -33,9 +36,13 @@ TEST_PRODUCT_URL = "https://with.gsshop.com/ord/dlvcursta/popup/ordDtl.gs?ordNo=
 EXPECTED_TRACKING_NO = "311920754250"
 EXPECTED_COURIER = "롯데택배"
 
-# 자동 로그인(headless, 사람 개입 없음)만 보는 게 목적이라 창을 띄우지 않는다.
-# 실패하면 아래에서 마지막 화면을 저장해 사람이 확인할 수 있게 한다.
-HEADLESS = True
+# 조회 쪽은 평소 실행과 같은 조건(번들 Chromium, headless)으로 둔다 - 로그인
+# 창에서 받은 쿠키가 여기로 제대로 옮겨오는지까지 봐야 하기 때문이다. 로그인
+# 창은 어댑터가 따로 띄운다.
+QUERY_HEADLESS = True
+# get_tracking의 headless 인자는 "사람이 안 보고 있다"는 뜻이라 False로 준다.
+# True면 체크박스가 떴을 때 눌러줄 사람이 없다고 보고 바로 포기한다.
+NOBODY_WATCHING = False
 
 
 def main() -> None:
@@ -48,13 +55,17 @@ def main() -> None:
         print("⚠️ .env에 GSSHOP_PW가 비어 있습니다. 자동 로그인을 건너뜁니다.")
         return
 
+    print("ℹ️ 크롬 창이 뜨면 '로봇이 아닙니다'를 통과시켜 주세요 (나머지는 자동입니다).")
+
     with sync_playwright() as p:
-        browser = p.chromium.launch(headless=HEADLESS)
+        # 로그인용 진짜 크롬 창은 이 인스턴스로 만들어진다.
+        browser_mod.remember_playwright(p)
+        browser = p.chromium.launch(headless=QUERY_HEADLESS)
         # 저장된 세션을 일부러 쓰지 않는다 - 로그인 경로를 반드시 타게 하려고.
         context = browser.new_context()
         try:
-            result = gsshop.get_tracking(context, TEST_PRODUCT_URL, headless=HEADLESS)
-            print("✅ 자동 로그인 + 조회 성공")
+            result = gsshop.get_tracking(context, TEST_PRODUCT_URL, headless=NOBODY_WATCHING)
+            print("✅ 로그인 + 조회 성공")
             print("   송장번호:", result.tracking_no)
             print("   택배사:", result.courier)
             if result.tracking_no == EXPECTED_TRACKING_NO and result.courier == EXPECTED_COURIER:

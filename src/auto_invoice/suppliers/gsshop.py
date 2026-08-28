@@ -6,31 +6,34 @@
   호스트는 with.gsshop.com과 www.gsshop.com 두 가지로 들어오는데, 경로/응답
   구조가 완전히 같고 로그인 쿠키도 .gsshop.com 스코프라 서로 공유된다 -
   들어온 URL의 호스트를 그대로 따라가면 된다.
-- GSSHOP_ID/GSSHOP_PW 환경변수가 있으면 세션 만료 시 자동 로그인을 시도한다.
-  다만 다른 어댑터와 달리 두 가지 함정이 있어 구조가 다르다(2026-08-28 실측):
-    * **Playwright 기본 headless UA로는 로그인 페이지 자체가 안 열린다.** UA에
-      "HeadlessChrome"이 들어있으면 로그인 페이지 대신 941바이트짜리 에러
-      페이지(JSESSIONID를 지우는 스크립트가 들어있다)를 돌려주고, 리다이렉트
-      주소도 /cust/login/popup/login.gs 로 달라진다. 평범한 크롬 UA를 쓰면
-      정상적으로 /cust/login/login.gs 가 뜬다. 로그인이 끝난 뒤의 주문상세
-      페이지는 기본 UA로도 멀쩡히 열리므로(확인함), UA를 바꾸는 범위를 최소로
-      하려고 **로그인만 별도 컨텍스트(정상 UA)에서 하고 쿠키만 원래
-      컨텍스트로 옮긴다**. GSSHOP은 다른 브라우저에서 만든 쿠키를 그대로
-      받아들인다(import_chrome_session.py가 통하는 사이트라 이미 확인된 성질).
+- GSSHOP_ID/GSSHOP_PW 환경변수가 있으면 세션 만료 시 로그인을 시도한다. 다만
+  이 사이트는 사람 손이 한 번 필요할 수 있어 다른 어댑터와 구조가 다르다
+  (2026-08-28 실측):
     * **비밀번호 칸은 page.fill()로 채우면 사이트가 빈 칸으로 인식한다.** 값은
       DOM에도 jQuery val()에도 정상으로 들어가지만, 로그인 버튼을 누르면
       "비밀번호를 입력해주세요."가 뜨고 제출 자체가 안 된다(아이디 칸은 fill로도
       통과한다). 실제 키 입력(press_sequentially)으로 채우면 정상 진행된다 -
       이 폼의 커스텀 입력 컴포넌트가 키 이벤트로 입력 상태를 추적하는 것으로
       보인다. 그래서 이 어댑터만 타이핑 방식으로 채운다.
-    * 로그인 폼에 **reCAPTCHA Enterprise v3**가 걸려 있다(reCaptchaFlg=true,
+    * 로그인 폼에 **reCAPTCHA Enterprise**가 걸려 있다(reCaptchaFlg=true,
       sitekey 6LeYTRgs...). 로그인 버튼을 누르면 먼저
       POST /cust/cert/reCAPTCHA/createAssessment.gs 로 점수를 평가받는데,
-      자동화 브라우저는 {"result":"need"}(추가 인증 필요)를 받고 **로그인 폼이
-      아예 제출되지 않는다**(2026-08-28 실측 - 가짜 계정으로 확인해서 자격증명과
-      무관하게 이 단계에서 끊긴다). 현대몰과 같은 부류다. 그래서 자동 로그인은
-      사실상 막혀 있고, "need"를 받으면 기다리지 않고 바로 수동 경로로 넘긴다.
-      나중에 사이트 정책이 바뀌어 통과하게 되면 이 코드가 그대로 동작한다.
+      login.min.js를 읽어보면 응답 처리가 이렇다:
+          "pass" -> encToken을 폼에 심고 그대로 제출
+          "need" -> encToken을 심고 **v2 체크박스 위젯을 띄운다**. 그리고
+                    ("need" && reCAPTCHA_2_token != "")일 때 버튼을 한 번 더
+                    누르면 제출된다.
+      즉 need는 거부가 아니라 "체크박스를 통과시켜라"는 신호다. 자동화
+      브라우저는 항상 need를 받는다 - 진짜 크롬 + 재사용 프로필 + 창 띄움
+      (현대몰을 통과시킨 조합)도, navigator.webdriver를 끈 것도 소용없었다.
+      체크박스를 코드로 눌러봤더니 이미지 챌린지로 넘어가서 더 나빠졌다.
+      그래서 **체크박스는 사람이 누르고, 나머지는 전부 자동**으로 한다:
+      아이디/비밀번호를 채우고 제출까지 하고, need가 오면 창을 열어둔 채
+      기다렸다가, 토큰이 차면 로그인 버튼을 대신 눌러준다.
+    * 로그인 창은 browser.real_chrome_context()로 띄운다. 진짜 크롬이라 예전에
+      쓰던 UA 우회(headless UA로는 로그인 페이지가 941바이트 에러 페이지로
+      온다)가 더 이상 필요 없다. 조회는 원래 컨텍스트에서 headless로 이어간다 -
+      GSSHOP은 다른 브라우저에서 만든 쿠키를 그대로 받아들인다.
   GSSHOP_PW를 비워두면 예전처럼 아이디만 자동 입력하고 사람이 직접 로그인한다.
   로그인 폼 셀렉터: 아이디 "#id", 비밀번호 "#passwd", 버튼 "#btnLogin".
 - 로그인이 안 되어 있으면 /cust/login/login.gs?returnurl=... 로 리다이렉트되는데,
@@ -65,6 +68,7 @@ from urllib.parse import parse_qs, urlparse
 from dotenv import load_dotenv
 from playwright.sync_api import BrowserContext
 
+from .. import browser as browser_mod
 from ..models import TrackingResult
 from .base import (
     BlockedError,
@@ -89,10 +93,6 @@ RECAPTCHA_BLOCKED_RESULT = "need"
 
 # Playwright 기본 headless UA("HeadlessChrome")로는 로그인 페이지가 에러 페이지로
 # 바뀐다(위 docstring 참고). 로그인 전용 컨텍스트에만 이 UA를 쓴다.
-LOGIN_USER_AGENT = (
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) "
-    "Chrome/151.0.0.0 Safari/537.36"
-)
 
 # 같은 주문상세 팝업이 with.gsshop.com / www.gsshop.com 두 호스트로 모두
 # 들어온다(경로와 응답 구조는 동일). registry는 "www." 접두사를 떼고 찾지만,
@@ -105,7 +105,10 @@ TRACE_PATH = "/ord/dlvcursta/popup/dlvTrace.gs?ordNo={ord_no}&ordItemId={ord_ite
 DEFAULT_COURIER = "택배"  # 배송현황조회 팝업에서 택배사명을 못 읽었을 때만 쓰는 기본값
 
 LOGIN_WAIT_TIMEOUT_MS = 5 * 60 * 1000  # 수동 로그인 대기 최대 5분
-AUTO_LOGIN_WAIT_TIMEOUT_MS = 30 * 1000  # 자동 로그인은 사람을 기다리지 않으니 짧게
+AUTO_LOGIN_WAIT_TIMEOUT_MS = 30 * 1000  # 사람 손이 필요 없는 구간은 짧게
+CHECKBOX_WAIT_TIMEOUT_MS = 5 * 60 * 1000  # 사람이 체크박스를 누르기를 기다리는 시간
+# 체크박스가 의심스러울 때 구글이 띄우는 이미지 고르기 화면(평소엔 숨어 있다).
+RECAPTCHA_CHALLENGE_FRAME = "iframe[src*='bframe']"
 
 # "택배업체\t롯데택배 대표번호 : 1588-2121" 형태 - 대표번호가 없는 택배사도
 # 있을 수 있어(예: 편의점 락커 배송) "대표번호"가 없으면 줄 끝까지를 쓴다.
@@ -186,92 +189,166 @@ def _safe_print(message: str) -> None:
         pass
 
 
-def _auto_login(context: BrowserContext, product_url: str) -> bool:
-    """GSSHOP_ID/GSSHOP_PW로 자동 로그인하고, 받은 쿠키를 원래 컨텍스트에 옮긴다.
+def _checkbox_solved(page) -> bool:
+    """체크박스가 통과됐는지 - 통과하면 사이트가 reCAPTCHA_2_token에 값을 채운다."""
+    try:
+        return bool(page.evaluate(
+            "() => typeof reCAPTCHA_2_token !== 'undefined' && !!reCAPTCHA_2_token"
+        ))
+    except Exception:
+        return False
 
-    로그인 페이지가 Playwright 기본 headless UA를 거부하기 때문에(docstring 참고)
-    로그인만 평범한 크롬 UA를 쓰는 임시 컨텍스트에서 하고, 성공하면 쿠키만
-    원래 컨텍스트로 옮긴다. 원래 컨텍스트의 UA는 건드리지 않는다 - 다른
-    어댑터와 이미 저장된 세션에 영향을 주지 않기 위해서다.
 
-    비밀번호가 없으면 False를 돌려주고 호출자가 수동 로그인 경로로 넘어간다.
+def _image_challenge_visible(page) -> bool:
+    """구글이 체크박스만으로 안 믿고 이미지 고르기를 띄웠는지."""
+    try:
+        return page.frame_locator(RECAPTCHA_CHALLENGE_FRAME).locator(
+            "#rc-imageselect"
+        ).is_visible(timeout=1000)
+    except Exception:
+        return False
+
+
+def _auto_login(context: BrowserContext, product_url: str, headless: bool = True) -> bool:
+    """GSSHOP_ID/GSSHOP_PW로 로그인하고, 받은 쿠키를 원래 컨텍스트에 옮긴다.
+
+    로그인은 browser.real_chrome_context()로 띄운 진짜 크롬 창에서 한다.
+    창이 필요한 이유는 두 가지다: reCAPTCHA 점수가 조금이라도 나으려면
+    진짜 크롬이어야 하고, 점수가 모자라 체크박스가 뜨면 사람이 그걸 눌러야
+    한다. 조회는 원래 컨텍스트에서 그대로 이어간다.
+
+    사이트 동작(login.min.js 실측):
+      createAssessment 응답이 "pass"  -> 그대로 로그인이 진행된다.
+                          응답이 "need" -> 사이트가 v2 체크박스 위젯을 띄운다.
+                          체크박스를 통과시키면 위젯 콜백(reCaptchaVerifyCallback)이
+                          validateToken.gs를 거쳐 **로그인까지 알아서 제출한다** -
+                          우리가 버튼을 또 누르면 안 된다.
+    그래서 need일 때는 창을 열어둔 채 사람이 체크박스 통과시키기를 기다린다.
+    사람이 타이핑할 일도, 버튼을 누를 일도 없다. 다만 구글이 체크박스만으로
+    안 믿고 이미지 고르기를 띄우는 경우가 있어(실제로 확인했다) 사람 손이
+    클릭 한 번보다 더 갈 수 있다.
+
+    --headless로 돌릴 때는(사람이 안 보고 있다는 뜻) need에서 기다리지 않고
+    바로 수동 경로로 넘긴다 - 아무도 없는데 5분씩 멈춰 있으면 안 되기 때문이다.
+
+    비밀번호가 없거나 끝까지 로그인이 안 되면 False를 돌려주고 호출자가 기존
+    수동 로그인 경로로 넘어간다.
     """
     login_id = os.environ.get("GSSHOP_ID")
     login_pw = os.environ.get("GSSHOP_PW")
     if not login_id or not login_pw:
         return False
 
-    browser = context.browser
-    if browser is None:  # 이론상 없지만, 있으면 수동 경로로 넘긴다
+    try:
+        # 이 사이트 로그인은 PC 페이지다 - 모바일 폭으로 열면 체크박스 위젯이
+        # 왼쪽으로 잘려 사람이 누르기 어렵다.
+        login_context = browser_mod.real_chrome_context(
+            SITE_KEY, viewport=browser_mod.DESKTOP_VIEWPORT
+        )
+    except Exception as exc:  # 크롬 미설치 등 - 수동 경로로 넘긴다
+        _safe_print(f"[gsshop] 로그인용 크롬을 띄우지 못했습니다({exc}) - 직접 로그인으로 넘어갑니다.")
         return False
 
-    login_context = browser.new_context(user_agent=LOGIN_USER_AGENT)
     alerts: list[str] = []
+    assess_results: list[str] = []
     try:
-        page = login_context.new_page()
+        page = login_context.pages[0] if login_context.pages else login_context.new_page()
         page.on("dialog", lambda d: (alerts.append(d.message), d.dismiss()))
-
-        # 실제 흐름 그대로 - 주문상세로 들어가서 로그인 페이지로 리다이렉트시킨다.
-        page.goto(product_url, wait_until="domcontentloaded")
-        if not _looks_like_login_page(page):
-            # 로그인 페이지가 아니면(=이미 로그인됨) 쿠키만 옮기고 끝낸다.
-            context.add_cookies(login_context.cookies())
-            return True
-
-        if page.locator(LOGIN_ID_SELECTOR).count() == 0:
-            _safe_print(
-                "[gsshop] 로그인 페이지에서 아이디 입력창을 찾지 못했습니다 - 수동 로그인으로 넘어갑니다."
-            )
-            return False
-
-        # fill()로 채우면 사이트가 빈 칸으로 인식한다(docstring 참고) - 실제로 타이핑한다.
-        page.locator(LOGIN_ID_SELECTOR).click()
-        page.locator(LOGIN_ID_SELECTOR).press_sequentially(login_id, delay=30)
-        page.locator(LOGIN_PW_SELECTOR).click()
-        page.locator(LOGIN_PW_SELECTOR).press_sequentially(login_pw, delay=30)
-
-        blocked_by_recaptcha: list[str] = []
 
         def _on_response(response) -> None:
             if RECAPTCHA_ASSESS_MARKER not in response.url:
                 return
             try:
-                result = (response.json() or {}).get("result")
+                assess_results.append(str((response.json() or {}).get("result")))
             except Exception:
                 return
-            if result == RECAPTCHA_BLOCKED_RESULT:
-                blocked_by_recaptcha.append(str(result))
 
         page.on("response", _on_response)
+
+        # 실제 흐름 그대로 - 주문상세로 들어가서 로그인 페이지로 리다이렉트시킨다.
+        page.goto(product_url, wait_until="domcontentloaded")
+        if not _looks_like_login_page(page):
+            # 로그인 페이지가 아니면(=이 프로필에 로그인이 남아 있으면) 쿠키만 옮기고 끝낸다.
+            context.add_cookies(login_context.cookies())
+            return True
+
+        if page.locator(LOGIN_ID_SELECTOR).count() == 0:
+            _safe_print(
+                "[gsshop] 로그인 페이지에서 아이디 입력창을 찾지 못했습니다 - 직접 로그인으로 넘어갑니다."
+            )
+            return False
+
+        # fill()로 채우면 사이트가 빈 칸으로 인식한다(docstring 참고) - 실제로 타이핑한다.
+        page.locator(LOGIN_ID_SELECTOR).click()
+        page.locator(LOGIN_ID_SELECTOR).press_sequentially(login_id, delay=60)
+        page.locator(LOGIN_PW_SELECTOR).click()
+        page.locator(LOGIN_PW_SELECTOR).press_sequentially(login_pw, delay=60)
+        page.wait_for_timeout(500)
         page.locator(LOGIN_BUTTON_SELECTOR).first.click()
 
+        deadline_ms = AUTO_LOGIN_WAIT_TIMEOUT_MS
         elapsed_ms = 0
-        while elapsed_ms < AUTO_LOGIN_WAIT_TIMEOUT_MS:
+        asked_for_checkbox = False
+        checkbox_solved = False
+        announced_challenge = False
+
+        while elapsed_ms < deadline_ms:
             # 로그인 페이지를 벗어났으면 성공이다. alert이 떴더라도 로그인
             # 자체는 된 경우(비밀번호 변경 안내 등)가 있어 화면을 먼저 본다.
             if not _looks_like_login_page(page):
                 context.add_cookies(login_context.cookies())
                 return True
-            if blocked_by_recaptcha:
-                # reCAPTCHA가 추가 인증을 요구하면 사이트가 로그인 제출을
-                # 아예 하지 않는다 - 더 기다릴 이유가 없으니 바로 사람에게 넘긴다.
-                _safe_print(
-                    "[gsshop] 로그인 폼의 reCAPTCHA가 추가 인증을 요구해(result=need) "
-                    "자동 로그인을 건너뜁니다."
-                )
-                return False
             if alerts:
-                _safe_print(f"[gsshop] 자동 로그인이 거부됐습니다: {alerts[0].strip()}")
+                _safe_print(f"[gsshop] 로그인이 거부됐습니다: {alerts[0].strip()}")
                 return False
             if _captcha_is_visible(page):
-                _safe_print("[gsshop] 로그인에 보안문자(캡차)가 요구돼 자동 로그인을 건너뜁니다.")
+                _safe_print("[gsshop] 로그인에 사이트 자체 보안문자가 요구돼 자동 로그인을 건너뜁니다.")
                 return False
+
+            if assess_results and assess_results[-1] == RECAPTCHA_BLOCKED_RESULT:
+                if headless:
+                    _safe_print(
+                        "[gsshop] reCAPTCHA가 체크박스 확인을 요구합니다(result=need). "
+                        "--headless로는 눌러줄 사람이 없어 수동 로그인으로 넘어갑니다."
+                    )
+                    return False
+                if not asked_for_checkbox:
+                    asked_for_checkbox = True
+                    deadline_ms = CHECKBOX_WAIT_TIMEOUT_MS  # 사람을 기다리는 동안은 넉넉하게
+                    _safe_print(
+                        "[gsshop] 아이디와 비밀번호는 넣었습니다. 뜬 크롬 창에서 "
+                        "'로봇이 아닙니다' 체크박스만 눌러주세요."
+                    )
+                    _safe_print("[gsshop] 체크가 끝나면 로그인은 자동으로 이어서 누릅니다 (최대 5분 대기).")
+                if not checkbox_solved and _checkbox_solved(page):
+                    # 통과시키면 위젯 콜백(reCaptchaVerifyCallback)이 validateToken을
+                    # 거쳐 로그인까지 알아서 제출한다 - 우리가 버튼을 또 누르면 안 된다.
+                    checkbox_solved = True
+                    _safe_print("[gsshop] 체크박스 통과를 확인했습니다 - 로그인이 이어서 진행됩니다.")
+                elif not announced_challenge and _image_challenge_visible(page):
+                    # 구글이 이미지 고르기를 띄운 경우. 사람이 풀면 그대로 진행되므로
+                    # 기다리되, 왜 클릭만으로 안 끝나는지는 알려준다.
+                    announced_challenge = True
+                    _safe_print(
+                        "[gsshop] 구글이 체크박스만으로 안 믿고 이미지 확인을 띄웠습니다. "
+                        "풀기 어려우면 그냥 두세요 - 시간이 지나면 기존 수동 경로로 넘어갑니다."
+                    )
+
             elapsed_ms += 1500  # _looks_like_login_page 내부에서 1500ms 대기함
 
-        _safe_print("[gsshop] 자동 로그인이 시간 안에 끝나지 않아 수동 로그인으로 넘어갑니다.")
+        if asked_for_checkbox:
+            _safe_print("[gsshop] 체크박스 대기 시간(5분)이 지났습니다 - 수동 로그인으로 넘어갑니다.")
+        else:
+            _safe_print("[gsshop] 로그인이 시간 안에 끝나지 않아 수동 로그인으로 넘어갑니다.")
+        return False
+    except Exception as exc:
+        _safe_print(f"[gsshop] 로그인 중 오류({exc}) - 직접 로그인으로 넘어갑니다.")
         return False
     finally:
-        login_context.close()
+        try:
+            login_context.close()
+        except Exception:
+            pass
 
 
 def _captcha_is_visible(page) -> bool:
@@ -371,13 +448,15 @@ def get_tracking(
         page.goto(product_url, wait_until="domcontentloaded")
 
         if _looks_like_login_page(page):
-            if _auto_login(context, product_url):
-                _safe_print("[gsshop] 로그인 세션이 없어 자동 로그인했습니다.")
+            # 로그인은 자체 크롬 창에서 하므로 headless 실행 중에도 시도할 수 있다.
+            # (다만 체크박스가 뜨면 --headless에서는 눌러줄 사람이 없어 포기한다.)
+            if _auto_login(context, product_url, headless=headless):
+                _safe_print("[gsshop] 로그인 세션이 없어 새로 로그인했습니다.")
             elif headless:
                 raise BlockedError(
-                    "GSSHOP 로그인이 필요합니다. 이 사이트는 로그인 폼의 reCAPTCHA 때문에 "
-                    "자동 로그인이 막혀 있으니(현대몰과 동일), --headless 없이 실행해 직접 "
-                    "로그인하거나 scripts/import_chrome_session.py로 크롬 세션을 가져와주세요."
+                    "GSSHOP 로그인이 필요합니다. 이 사이트는 로그인 폼의 reCAPTCHA가 체크박스 "
+                    "확인을 요구할 때가 있어 사람이 한 번 눌러줘야 하니, --headless 없이 실행하거나 "
+                    "scripts/import_chrome_session.py로 크롬 세션을 가져와주세요."
                 )
             else:
                 _prefill_login_id(page)
