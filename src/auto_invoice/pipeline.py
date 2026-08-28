@@ -72,6 +72,13 @@ class PipelineResult:
         self.applied_count: int = 0     # [송장번호수정]으로 반영한 건수
         self.apply_status: str = ""     # '오류없음.' 등 결과 창 문구
         self.stopped_reason: str | None = None
+        # 샵마인 화면을 건드리기 시작했는가 (3단계 또는 6단계 진입).
+        # 되돌릴 게 있는지 판단하는 기준이다.
+        self.touched_screen: bool = False
+        # 작업 전에 송장수정모드가 이미 켜져 있었는가. 사람이 켜둔 모드를
+        # 우리가 꺼버리면 안 되므로, 우리가 켠 경우에만 끈다.
+        self.edit_mode_was_on: bool | None = None
+        self.restore_note: str = ""     # 되돌린 뒤 요약에 붙일 한 줄
         # 자동으로 처리하지 못해 사람이 직접 손봐야 하는 주문들 - (제목, 줄
         # 목록) 묶음. 5단계 로그에 한 번 나오지만 로그가 길어 묻히기 쉬워서,
         # 마지막 요약에 다시 붙이려고 들고 있는다 (report.attention_blocks).
@@ -152,6 +159,9 @@ def select_and_export(result: PipelineResult, *, tab="배송중", log=print) -> 
     log(f"[3/{STEPS}] 배송중 탭에서 송장을 고칠 주문 고르기 "
         f"({' / '.join(upload.TARGET_COURIERS)})")
     try:
+        # 되돌릴 때 쓰려고, 화면을 바꾸기 전에 지금 상태를 적어둔다
+        result.edit_mode_was_on = upload.edit_mode_on()
+        result.touched_screen = True
         upload.ensure_edit_mode(log=log)
         main = upload.main_window()
         grid.clear_all_checks(main, log=log)
@@ -247,6 +257,9 @@ def apply_csv(csv_path, order_ids, *, max_apply=100, expected_filled=None,
     log("")
     log(f"[6/{STEPS}] CSV 일괄등록 ({rows}건)")
     try:
+        if result.edit_mode_was_on is None:      # --csv 로 여기부터 시작한 경우
+            result.edit_mode_was_on = upload.edit_mode_on()
+        result.touched_screen = True
         upload.ensure_edit_mode(log=log)
         upload.bulk_register(csv_path, log=log)
     except (upload.UploadError, grid.GridError) as e:
@@ -295,23 +308,77 @@ def apply_csv(csv_path, order_ids, *, max_apply=100, expected_filled=None,
     return result
 
 
+def restore_shopmine(result: PipelineResult, *, stop_before_apply=False,
+                     log=print) -> None:
+    """반영한 게 하나도 없으면 샵마인을 작업 전 상태로 되돌린다.
+
+    3단계에서 송장수정모드를 켜고 대상 주문을 전부 체크해두는데, 조회 성공이
+    0건이거나 중간에 멈추면 그 상태가 화면에 그대로 남는다. 사람이 다음에
+    샵마인을 열면 영문 모를 체크가 잔뜩 걸려 있고, 남은 체크는 다음 실행의
+    [송장번호수정] 확인 건수까지 어긋나게 만든다.
+
+    되돌리지 않는 경우가 둘 있다.
+
+      - 한 건이라도 반영됐다: 오류가 있었더라도 화면을 그대로 둬야 사람이
+        무엇이 반영됐는지 확인할 수 있다 (오류가 없을 때만 8단계가 스스로
+        정리한다).
+      - --stop-before-apply: 사람이 이어서 [송장번호수정]을 누를 참이라
+        체크와 송장수정모드가 남아 있어야 한다.
+
+    송장수정모드는 **우리가 켠 경우에만** 끈다. 사람이 미리 켜두고 실행했으면
+    켜둔 채로 두는 것이 '작업 전 상태'다.
+
+    되돌리기는 어디까지나 뒷정리라, 실패해도 실행 결과를 바꾸지 않는다.
+    무엇을 못 했는지만 알리고 넘어간다.
+    """
+    if not result.touched_screen or result.applied or stop_before_apply:
+        return
+
+    log("")
+    log("샵마인에 반영한 건이 없어 작업 전 상태로 되돌립니다.")
+    done = []
+    try:
+        upload.cleanup_stray_dialogs()
+        upload.wait_until_idle(log=log)
+        # 필터가 걸린 채로는 [전체선택]이 그 필터에 걸린 행에만 먹어서, 화면
+        # 밖에 남은 체크를 지우지 못한다. 필터부터 풀고 체크를 해제한다.
+        upload.reset_filter(log=log)
+        grid.clear_all_checks(upload.main_window(), log=log)
+        done.append("체크 해제")
+        if result.edit_mode_was_on:
+            log("  송장수정모드: 실행 전에도 켜져 있어서 그대로 둡니다")
+        else:
+            upload.disable_edit_mode(log=log)
+            done.append("송장수정모드 끔")
+        result.restore_note = f"샵마인은 작업 전 상태로 되돌렸습니다 ({' / '.join(done)})."
+        log(f"  {result.restore_note}")
+    except Exception as e:  # noqa: BLE001 - 뒷정리 실패가 실행 결과를 덮지 않게
+        result.restore_note = (
+            f"샵마인을 작업 전 상태로 되돌리지 못했습니다 - {e} "
+            "(화면에서 체크 상태와 송장수정모드를 직접 확인해주세요)")
+        log(f"  경고: {result.restore_note}")
+
+
 def run_full(*, limit=None, max_apply=100, tab="배송중", stop_before_apply=False,
              headless=False, skip_cjonstyle=False, log=print) -> PipelineResult:
-    """1~8단계 전체."""
-    result = PipelineResult()
-    if not ensure_shipping_tab(result, tab=tab, log=log):
-        return result
-    if not ensure_malls_connected(result, log=log):
-        return result
-    if not select_and_export(result, tab=tab, log=log):
-        return result
+    """1~8단계 전체.
 
-    lookup_tracking(result, limit=limit, headless=headless,
-                    skip_cjonstyle=skip_cjonstyle, log=log)
-    # 조회가 끝난 뒤로는 무슨 일이 생기든 결과를 들고 돌아온다. 반영 단계에서
-    # 멈추든 예상 못 한 오류로 죽든, 이미 끝낸 송장조회 결과는 사람에게 그대로
-    # 넘겨줘야 한다 - 결과 엑셀로 남기고 마지막 요약에도 싣는다.
+    어디서 어떻게 멈추든 결과를 들고 돌아온다. 반영 단계에서 멈추든 예상 못 한
+    오류로 죽든, 마지막에 두 가지는 반드시 한다.
+
+      - 이미 끝낸 송장조회 결과를 넘겨준다 (바탕화면 결과 엑셀 + 마지막 요약)
+      - 샵마인에 반영한 게 없으면 화면을 건드리기 전 상태로 되돌린다
+    """
+    result = PipelineResult()
     try:
+        if not ensure_shipping_tab(result, tab=tab, log=log):
+            return result
+        if not ensure_malls_connected(result, log=log):
+            return result
+        if not select_and_export(result, tab=tab, log=log):
+            return result
+        lookup_tracking(result, limit=limit, headless=headless,
+                        skip_cjonstyle=skip_cjonstyle, log=log)
         _apply_after_lookup(result, max_apply=max_apply,
                             stop_before_apply=stop_before_apply, log=log)
     except Exception as e:  # noqa: BLE001 - 조회 결과를 잃지 않는 것이 우선
@@ -320,6 +387,7 @@ def run_full(*, limit=None, max_apply=100, tab="배송중", stop_before_apply=Fa
         log(f"중단: {result.stopped_reason}")
         log(traceback.format_exc())
     finally:
+        restore_shopmine(result, stop_before_apply=stop_before_apply, log=log)
         save_result_excel(result, log=log)
     return result
 
@@ -328,7 +396,7 @@ def _apply_after_lookup(result: PipelineResult, *, max_apply, stop_before_apply,
                         log=print) -> None:
     """조회가 끝난 뒤의 6~8단계. 결과는 전부 result에 쌓는다."""
     if result.lookup_counts.get("success", 0) == 0:
-        result.stopped_reason = "조회 성공 건이 없어 종료했습니다 (샵마인은 건드리지 않음)."
+        result.stopped_reason = "조회 성공 건이 없어 종료했습니다 (샵마인에 반영한 건 없음)."
         log("")
         log(result.stopped_reason)
         return
@@ -360,12 +428,15 @@ def run_from_csv(csv_path, *, max_apply=100, tab="배송중",
         result.stopped_reason = "CSV에 주문번호가 없습니다."
         log(f"중단: {result.stopped_reason}")
         return result
-    if not ensure_shipping_tab(result, tab=tab, log=log):
-        return result
-    if not ensure_malls_connected(result, log=log):
-        return result
-    return apply_csv(csv_path, order_ids, max_apply=max_apply,
-                     stop_before_apply=stop_before_apply, log=log, result=result)
+    try:
+        if not ensure_shipping_tab(result, tab=tab, log=log):
+            return result
+        if not ensure_malls_connected(result, log=log):
+            return result
+        return apply_csv(csv_path, order_ids, max_apply=max_apply,
+                         stop_before_apply=stop_before_apply, log=log, result=result)
+    finally:
+        restore_shopmine(result, stop_before_apply=stop_before_apply, log=log)
 
 
 def summarize(result: PipelineResult) -> str:
@@ -376,8 +447,16 @@ def summarize(result: PipelineResult) -> str:
     그 위로 로그가 길게 쌓여 묻히기 쉬워서, 맨 마지막 요약에 수령인 이름과
     함께 다시 붙인다 (report.attention_blocks).
     """
-    return "\n".join([_apply_summary(result), *_lookup_summary(result),
+    return "\n".join([*_head_summary(result), *_lookup_summary(result),
                       *_attention_summary(result)])
+
+
+def _head_summary(result: PipelineResult) -> list[str]:
+    """맨 위 두 줄: 반영 결과와, 되돌렸다면 되돌린 결과."""
+    lines = [_apply_summary(result)]
+    if result.restore_note:
+        lines.append(result.restore_note)
+    return lines
 
 
 def _lookup_summary(result: PipelineResult) -> list[str]:

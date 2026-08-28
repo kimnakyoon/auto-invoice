@@ -510,9 +510,20 @@ def result_is_clean(status: str) -> bool:
 
 
 def cleanup_stray_dialogs():
-    """중단 후 남아 있을 수 있는 확인창/결과창을 정리한다."""
+    """중단 후 남아 있을 수 있는 확인창/결과창을 정리한다.
+
+    중간에 멈추면 '발송정보일괄등록' 창이나 결과 창이 떠 있는 채로 남는데,
+    그대로 두면 다음 실행에서 Alt+U 가 새 창을 못 열거나 그리드가 가려져
+    화면을 읽지 못한다. 여기서 닫히지 않아도 진행에는 지장이 없으므로
+    조용히 시도만 한다.
+    """
     for h, _t, _r in winui.find_windows(title_equals=CONFIRM_WINDOW):
         winui.click_dlg_button(h, winui.DLG_NO, label="확인 취소")
         time.sleep(0.6)
-    _close_window(APPLY_RESULT_WINDOW, log=lambda m: None)
+
+    def quiet(_msg):
+        pass
+
+    for title in (APPLY_RESULT_WINDOW, UPLOAD_RESULT_WINDOW, UPLOAD_WINDOW):
+        _close_window(title, log=quiet)
 
