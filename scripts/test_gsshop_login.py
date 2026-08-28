@@ -4,11 +4,14 @@ auth/gsshop_state.json(저장된 로그인 세션)을 **쓰지 않고** 빈 브�
 시작하기 때문에, 반드시 로그인 경로를 타게 된다. .env의 GSSHOP_ID/GSSHOP_PW로
 자동 로그인이 실제로 되는지 확인하는 용도다.
 
-GSSHOP만은 완전 무인이 아니다. 로그인 폼의 reCAPTCHA가 자동화 브라우저에는
-항상 체크박스 확인을 요구하기 때문에(자세한 내용은 suppliers/gsshop.py),
-**뜬 크롬 창에서 "로봇이 아닙니다"를 통과시켜 줘야 한다**(체크박스만 눌러도
-끝날 때가 있고, 구글이 안 믿으면 이미지 고르기가 뜨기도 한다). 아이디와
-비밀번호는 자동으로 채워지고, 통과되면 로그인 제출은 사이트가 알아서 한다.
+로그인하는 동안에만 크롬 창이 떴다가 닫힌다 - 로그인 폼의 reCAPTCHA가
+"크롬을 직접 실행해 CDP로 붙었고, 그 프로필이 구글에 로그인되어 있는" 창에만
+통과 점수를 주기 때문이다(자세한 내용은 suppliers/gsshop.py). 사람이 타이핑하거나
+체크박스를 누를 일은 없다.
+
+**단, 그 프로필의 구글 로그인은 최초 1회 사람이 해줘야 한다** -
+scripts/setup_gsshop_login_profile.py를 실행하면 된다. 이 스크립트에서
+'로봇이 아닙니다' 체크박스가 떴다면 그 구글 로그인이 풀린 것이다.
 
 실행:
     python scripts/test_gsshop_login.py
@@ -40,9 +43,12 @@ EXPECTED_COURIER = "롯데택배"
 # 창에서 받은 쿠키가 여기로 제대로 옮겨오는지까지 봐야 하기 때문이다. 로그인
 # 창은 어댑터가 따로 띄운다.
 QUERY_HEADLESS = True
-# get_tracking의 headless 인자는 "사람이 안 보고 있다"는 뜻이라 False로 준다.
-# True면 체크박스가 떴을 때 눌러줄 사람이 없다고 보고 바로 포기한다.
-NOBODY_WATCHING = False
+# get_tracking의 headless 인자는 "사람이 안 보고 있다"는 뜻이다. True로 준다 -
+# 이제 이 사이트는 사람 손 없이 로그인되는 것이 정상이라, 체크박스가 뜨면
+# 기다리지 말고 실패해야 검증이 된다(기다리면 사람이 눌러서 통과시켜 버린다).
+# 체크박스가 떴다면 로그인 프로필의 구글 로그인이 풀린 것이다 -
+# scripts/setup_gsshop_login_profile.py를 다시 실행하면 된다.
+NOBODY_WATCHING = True
 
 
 def main() -> None:
@@ -55,7 +61,7 @@ def main() -> None:
         print("⚠️ .env에 GSSHOP_PW가 비어 있습니다. 자동 로그인을 건너뜁니다.")
         return
 
-    print("ℹ️ 크롬 창이 뜨면 '로봇이 아닙니다'를 통과시켜 주세요 (나머지는 자동입니다).")
+    print("ℹ️ 로그인하는 동안만 크롬 창이 떴다가 닫힙니다 (사람이 할 일은 없습니다).")
 
     with sync_playwright() as p:
         # 로그인용 진짜 크롬 창은 이 인스턴스로 만들어진다.

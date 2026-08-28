@@ -28,12 +28,16 @@
     python scripts/setup_gsshop_login_profile.py
 
     --skip-setup : 구글 로그인 창은 띄우지 않고 지금 프로필로 점수만 다시 확인한다.
+    --relogin    : 프로필에 남은 GSSHOP 로그인을 지우고 다시 로그인시킨다
+                   (구글 로그인은 그대로 둔다). 점수가 재현되는지 볼 때 쓴다.
+    --times N    : 위 확인을 N번 반복한다.
 """
 
 from __future__ import annotations
 
 import argparse
 import os
+import re
 import subprocess
 import sys
 from pathlib import Path
@@ -77,6 +81,11 @@ def open_plain_chrome_for_google_login(profile_dir: Path) -> None:
     )
     proc.wait()
     print("창이 닫혔습니다.\n")
+
+
+def forget_gsshop_login(context) -> None:
+    """이 프로필의 GSSHOP 쿠키만 지운다 (구글 로그인은 건드리지 않는다)."""
+    context.clear_cookies(domain=re.compile(r"gsshop\.com$"))
 
 
 def google_signed_in(page) -> bool:
@@ -140,6 +149,8 @@ def try_gsshop_login(context) -> tuple[bool, list[str]]:
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--skip-setup", action="store_true", help="구글 로그인 창 없이 점수만 확인")
+    parser.add_argument("--relogin", action="store_true", help="GSSHOP 쿠키를 지우고 다시 로그인시킨다")
+    parser.add_argument("--times", type=int, default=1, help="확인 반복 횟수")
     args = parser.parse_args()
 
     load_dotenv()
@@ -148,19 +159,28 @@ def main() -> None:
     if not args.skip_setup:
         open_plain_chrome_for_google_login(profile_dir)
 
-    print("이 프로필로 GSSHOP 로그인을 시도합니다...")
-    with sync_playwright() as p:
-        browser_mod.remember_playwright(p)
-        with browser_mod.real_chrome_cdp_context(gsshop.SITE_KEY) as context:
-            ok, assess = try_gsshop_login(context)
+    results = []
+    for n in range(1, max(1, args.times) + 1):
+        if args.times > 1:
+            print(f"\n[{n}/{args.times}]", end=" ")
+        print("이 프로필로 GSSHOP 로그인을 시도합니다...")
+        with sync_playwright() as p:
+            browser_mod.remember_playwright(p)
+            with browser_mod.real_chrome_cdp_context(gsshop.SITE_KEY) as context:
+                if args.relogin:
+                    forget_gsshop_login(context)
+                ok, assess = try_gsshop_login(context)
+        results.append((ok, assess))
+        print(f"  -> {'성공' if ok else '실패'} (assess={assess or '없음'})")
 
     print()
-    if ok:
-        print(f"✅ 사람 손 없이 로그인됐습니다! (createAssessment 응답: {assess or '없음'})")
+    if all(ok for ok, _ in results):
+        print(f"✅ 사람 손 없이 로그인됐습니다! ({len(results)}번 시도 전부 성공)")
         print("   구글 로그인이 점수를 올려준 것이므로, 어댑터를 완전 자동으로 바꿀 수 있습니다.")
     else:
-        print(f"❌ 아직 막힙니다 (createAssessment 응답: {assess or '없음'}).")
-        print("   구글 로그인만으로는 부족하다는 뜻입니다 - 프로필을 며칠 더 쓰면 달라질 수 있습니다.")
+        failed = [a for ok, a in results if not ok]
+        print(f"❌ {len(failed)}/{len(results)}번 막혔습니다 (막힌 응답: {failed}).")
+        print("   재현되지 않으면 어댑터를 바꾸면 안 됩니다 - 반자동 경로를 남겨둬야 합니다.")
 
 
 if __name__ == "__main__":
