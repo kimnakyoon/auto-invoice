@@ -12,6 +12,7 @@ from __future__ import annotations
 from urllib.parse import urlparse
 
 from . import (
+    akplaza,
     auction,
     elevenst,
     fashionplus,
@@ -64,6 +65,7 @@ register(thehyundai)
 register(nsmall)
 register(elevenst)
 register(auction)
+register(akplaza)
 # register(cjonstyle)  # 위 설명 참고 - Playwright로는 로그인이 막혀 미등록
 # 새 공급사 추가 예시:
 # from . import newsupplier

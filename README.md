@@ -180,7 +180,7 @@ python scripts/test_lotteon_adapter.py
 
 `.env`에 `LOTTEON_ID`/`LOTTEON_PW`를 넣어두면 로그인 세션이 없을 때 사람
 개입 없이 자동으로 로그인한다(SSG·더현대·NS홈쇼핑·11번가·옥션·패션플러스·
-롯데아이몰과 동일한 방식). `LOTTEON_PW`를 비워두면 예전처럼 브라우저 창이 뜨고, 직접 로그인하면
+롯데아이몰·AK플라자와 동일한 방식). `LOTTEON_PW`를 비워두면 예전처럼 브라우저 창이 뜨고, 직접 로그인하면
 자동으로 감지해서 이어서 진행한다.
 
 로그인 세션은 `auth/lotteon_state.json`에 저장되어 다음부터는 다시 로그인하지
