@@ -5,24 +5,34 @@
   (구매내역 목록의 "주문 상세 보기" 링크와 동일. 목록 페이지
   https://pay.naver.com/pc/history 자체는 주문 식별 정보가 없어 조회에
   쓸 수 없다.)
-- 네이버는 롯데온/지마켓과 달리 아이디+비밀번호를 스크립트로 채워 넣으면
-  "보안을 위해 추가 확인을 해주세요"라는 캡차(가상 영수증의 빈칸 채우기)를
-  띄워 로그인 자체를 막는다. 2026-08-28에 다시 실측해 확인했다: 다른
-  어댑터와 똑같이 page.fill로 채우고 로그인 버튼을 눌렀더니 즉시 그 캡차
-  화면이 떴다(정상 로그인 페이지에는 그 문구가 없어서 오탐이 아니다).
-  NAVER_PW/NAVER_PW2가 설정되어 있으면 _auto_login이 이 정공법을 한 번
-  시도하고, 캡차가 뜨면 통과를 시도하지 않고 즉시 포기해 사람에게 넘긴다.
-  그래서 SSG처럼 완전 자동 로그인은 불가능하고, 롯데온/지마켓과 동일하게
-  아이디만 자동 입력한 뒤
-  사람이 직접 비밀번호+보안 확인을 완료하게 한다. 이 캡차는 자동 로그인을
-  막으려고 네이버가 일부러 걸어둔 장치라, 통과하는 입력 방식을 찾는 대신
-  "사람이 로그인하는 횟수 자체를 줄이는" 쪽으로 만들었다:
-    * 로그인 폼의 "로그인 상태 유지"(#loginStay)를 사람이 로그인하기 전에
-      켜둔다. 기본값이 꺼짐이라 그냥 두면 NID_AUT/NID_SES가 만료일 없는
-      세션 쿠키로만 저장된다(실측). 켜두면 장기 쿠키로 내려온다.
-    * 매 실행마다 최신 쿠키를 storage_state에 다시 저장해 세션을 이어간다.
+- NAVER_PW/NAVER_PW2가 있으면 세션이 끊겼을 때 사람 개입 없이 완전 자동으로
+  재로그인한다. 오래 "네이버는 자동 로그인 불가"로 두었던 사이트인데,
+  2026-08-28에 CJ온스타일을 뚫은 방법으로 다시 시도해 뒤집었다. 갈린 것은
+  **크롬을 누가 실행했는지**였다(같은 날 대조 실험으로 확인):
+    * 번들 Chromium(평소 조회에 쓰는 컨텍스트, navigator.webdriver=true)
+      -> 아이디/비밀번호를 실제 키 입력으로 한 글자씩 쳐 넣어도 로그인 버튼을
+         누르는 즉시 "보안을 위해 추가 확인을 해주세요" 캡차(가상 영수증의
+         빈칸 채우기)가 떴다.
+    * 우리가 직접 실행한 크롬에 CDP로 붙기(browser.real_chrome_cdp_context,
+      navigator.webdriver=false) -> 캡차 없이 그대로 로그인됐다. 계정 2개를
+      각각 새 프로필로 시도해 둘 다 성공했다.
+  즉 입력 방식이 아니라 브라우저를 띄우는 방식이 원인이었다(현대몰과 같은
+  결론, 자세한 배경은 browser.py의 두 함수 docstring). 그래서 로그인만 그
+  크롬 창에서 하고 쿠키만 원래 컨텍스트로 옮겨온 뒤, 조회는 평소대로
+  headless로 이어간다 - 현대몰/CJ온스타일과 같은 구조다. 사람이 타이핑하거나
+  체크박스를 누를 일은 없다.
+- 비밀번호 칸은 그래도 page.fill()이 아니라 실제 키 입력(press_sequentially)으로
+  채운다. 네이버 로그인 폼은 타이핑 패턴을 hidden 필드에 담아 함께 보내는데,
+  한 번에 값만 꽂아 넣으면 그 필드가 비어서 굳이 위험을 만들 이유가 없다.
+- 캡차가 그래도 뜨면(계정별로 이미 의심 상태일 수 있다) 통과를 시도하지 않고
+  즉시 포기해 사람에게 넘긴다 - 억지로 뚫지 않는다는 다른 어댑터와 같은 규칙.
+  NAVER_PW를 비워두면 예전처럼 아이디만 자동 입력하고 사람이 직접 로그인한다.
+- 로그인 폼의 "로그인 상태 유지"(#loginStay)는 자동/수동 어느 쪽이든 켜둔다.
+  기본값이 꺼짐이라 그냥 두면 NID_AUT/NID_SES가 만료일 없는 세션 쿠키로만
+  저장된다(실측). 켜두면 장기 쿠키로 내려와 재로그인 주기가 길어진다. 매
+  실행마다 최신 쿠키를 storage_state에 다시 저장해 세션을 이어가는 것도 그대로다.
   이미 크롬에 네이버 로그인이 되어 있다면 scripts/import_chrome_session.py로
-  그 세션을 그대로 가져올 수도 있다(이 프로그램에서 로그인할 필요가 없다).
+  그 세션을 그대로 가져올 수도 있다.
 - 사용자가 네이버 계정을 2개(각각 다른 주문을 구매) 쓰고 있어, 어느
   계정에 특정 주문이 있는지 미리 알 수 없다. 로그인되지 않은 계정으로
   다른 계정의 주문상세 URL을 열면 에러 없이 그냥 본인 구매내역 목록
@@ -86,6 +96,19 @@ SECOND_ACCOUNT_STATE_KEY = "naver2"
 # 계정별 비밀번호 환경변수. 비워두면 그 계정은 예전처럼 사람이 직접 로그인한다.
 PW_ENV_BY_ACCOUNT = {"1": "NAVER_PW", "2": "NAVER_PW2"}
 
+# 자동 로그인용 크롬 프로필. 계정마다 따로 둬야 한 프로필에 두 계정이 섞이지 않는다
+# (auth/chrome_profile_naver, auth/chrome_profile_naver2).
+CHROME_PROFILE_BY_ACCOUNT = {"1": SITE_KEY, "2": SECOND_ACCOUNT_STATE_KEY}
+
+# 로그인 여부를 확인하려고 여는 페이지. 로그인이 없으면 nid.naver.com으로 넘어간다.
+LOGIN_CHECK_URL = "https://pay.naver.com/pc/history"
+
+# 로그인 창 크기. 기본(창 크기 그대로)으로 두지 않고 실측에 성공한 값으로 고정한다.
+LOGIN_VIEWPORT = {"width": 1280, "height": 900}
+
+# 한 글자당 입력 간격 - 사람이 치는 속도에 가깝게 둔다.
+TYPING_DELAY_MS = 120
+
 ORDER_STATUS_URL = (
     "https://orders.pay.naver.com/order/status/{order_no}"
     "?returnUrl=https%3A%2F%2Fpay.naver.com%2Fpc%2Fhistory"
@@ -146,7 +169,9 @@ def _redirected_away(page) -> bool:
 
 
 def _prefill_login_id(page, naver_id: str | None) -> None:
-    """비밀번호는 절대 자동 입력하지 않는다 - 아이디만 채워서 타이핑을 줄인다."""
+    """사람이 직접 로그인할 때(자동 로그인이 막혔거나 비밀번호가 없을 때)
+    아이디만 미리 채워 타이핑을 줄인다. 비밀번호는 이 창에서는 채우지 않는다 -
+    자동 로그인은 별도의 크롬 창에서만 하기 때문이다(_auto_login)."""
     if not naver_id:
         return
     locator = page.locator(LOGIN_ID_SELECTOR)
@@ -194,40 +219,63 @@ def _looks_like_captcha(page) -> bool:
     return any(p in body_text for p in CAPTCHA_PATTERNS)
 
 
-def _auto_login(page, naver_id_env: str, account_label: str) -> bool:
-    """아이디/비밀번호로 자동 로그인을 시도한다.
+def _auto_login(context: BrowserContext, naver_id_env: str, account_label: str) -> bool:
+    """NAVER_ID/NAVER_PW로 자동 로그인하고, 받은 쿠키를 원래 컨텍스트에 옮긴다.
 
-    다른 어댑터(지마켓/옥션/SSG)와 완전히 같은 방식으로 폼을 채우고 로그인
-    버튼을 누른다. 네이버는 이걸 자동화로 감지해 "보안을 위해 추가 확인"
-    캡차를 띄우는 경우가 있는데, 그때는 **통과를 시도하지 않고** False를
-    돌려줘서 호출자가 사람에게 넘기도록 한다.
+    로그인은 우리가 직접 실행한 크롬 창(browser.real_chrome_cdp_context)에서만
+    캡차 없이 통과한다 - 이유와 대조 실험은 이 파일 맨 위 docstring 참고.
+    조회까지 그 창에서 하지는 않고, 현대몰/CJ온스타일과 마찬가지로 쿠키만
+    원래 컨텍스트로 옮긴다.
 
-    비밀번호가 설정되어 있지 않아도 False를 돌려준다.
+    비밀번호가 없거나 캡차가 뜨면 False를 돌려주고, 호출자가 기존 수동 로그인
+    경로로 넘어간다.
     """
     login_id = os.environ.get(naver_id_env)
     login_pw = os.environ.get(PW_ENV_BY_ACCOUNT.get(account_label, ""))
     if not login_id or not login_pw:
         return False
 
+    profile_key = CHROME_PROFILE_BY_ACCOUNT.get(account_label, SITE_KEY)
     try:
-        page.fill(LOGIN_ID_SELECTOR, login_id)
-        page.fill(LOGIN_PW_SELECTOR, login_pw)
-        _enable_keep_login(page)
-        page.locator(LOGIN_BUTTON_SELECTOR).locator("visible=true").first.click()
-    except Exception as e:
-        _safe_print(f"[naver] ({account_label}) 자동 로그인 입력에 실패했습니다: {e}")
-        return False
+        with browser_mod.real_chrome_cdp_context(profile_key) as login_context:
+            page = login_context.pages[0] if login_context.pages else login_context.new_page()
+            page.set_viewport_size(LOGIN_VIEWPORT)
 
-    elapsed_ms = 0
-    while elapsed_ms < AUTO_LOGIN_WAIT_TIMEOUT_MS:
-        if not _looks_like_login_page(page):
-            return True
-        if _looks_like_captcha(page):
-            _safe_print(f"[naver] ({account_label}) 추가 확인(캡차)이 떠서 자동 로그인을 중단합니다.")
+            page.goto(LOGIN_CHECK_URL, wait_until="domcontentloaded")
+            page.wait_for_timeout(2500)
+            if not _looks_like_login_page(page):
+                # 이 프로필에 로그인이 남아 있으면 쿠키만 옮기고 끝낸다.
+                context.add_cookies(login_context.cookies())
+                return True
+
+            if page.locator(LOGIN_ID_SELECTOR).count() == 0:
+                _safe_print(f"[naver] ({account_label}) 로그인 페이지에서 아이디 입력창을 찾지 못했습니다.")
+                return False
+
+            # page.fill이 아니라 실제 키 입력으로 채운다 (docstring 참고).
+            page.locator(LOGIN_ID_SELECTOR).click()
+            page.locator(LOGIN_ID_SELECTOR).press_sequentially(login_id, delay=TYPING_DELAY_MS)
+            page.wait_for_timeout(400)
+            page.locator(LOGIN_PW_SELECTOR).click()
+            page.locator(LOGIN_PW_SELECTOR).press_sequentially(login_pw, delay=TYPING_DELAY_MS)
+            page.wait_for_timeout(600)
+            _enable_keep_login(page)
+            page.locator(LOGIN_BUTTON_SELECTOR).locator("visible=true").first.click()
+
+            elapsed_ms = 0
+            while elapsed_ms < AUTO_LOGIN_WAIT_TIMEOUT_MS:
+                if not _looks_like_login_page(page):
+                    context.add_cookies(login_context.cookies())
+                    return True
+                if _looks_like_captcha(page):
+                    _safe_print(f"[naver] ({account_label}) 추가 확인(캡차)이 떠서 자동 로그인을 중단합니다.")
+                    return False
+                elapsed_ms += 1200  # _looks_like_login_page 내부에서 1200ms 대기함
+            _safe_print(f"[naver] ({account_label}) 자동 로그인이 시간 안에 끝나지 않았습니다.")
             return False
-        elapsed_ms += 1200  # _looks_like_login_page 내부에서 1200ms 대기함
-    _safe_print(f"[naver] ({account_label}) 자동 로그인이 시간 안에 끝나지 않았습니다.")
-    return False
+    except Exception as exc:
+        _safe_print(f"[naver] ({account_label}) 자동 로그인 중 오류({exc}) - 직접 로그인으로 넘어갑니다.")
+        return False
 
 
 def _wait_for_manual_login(page) -> bool:
@@ -258,13 +306,19 @@ def _get_second_context(primary_context: BrowserContext, headless: bool) -> Brow
     return context
 
 
-def _ensure_logged_in(page, headless: bool, naver_id_env: str, account_label: str) -> bool:
-    """수동 로그인을 실제로 수행했으면 True를 반환한다 (호출자가 이때만
-    storage_state를 저장하면 된다)."""
+def _ensure_logged_in(
+    page, context: BrowserContext, headless: bool, naver_id_env: str, account_label: str
+) -> bool:
+    """로그인을 실제로 수행했으면 True를 반환한다 (호출자가 이때만
+    storage_state를 저장하면 된다).
+
+    자동 로그인은 headless 여부와 무관하게 시도한다 - 로그인 창은 이 함수가
+    쓰는 크롬이 따로 띄우고, 조회는 넘겨받은 컨텍스트에서 그대로 이어진다.
+    """
     if not _looks_like_login_page(page):
         return False
 
-    if _auto_login(page, naver_id_env, account_label):
+    if _auto_login(context, naver_id_env, account_label):
         _safe_print(f"[naver] ({account_label}) 로그인 세션이 없어 자동 로그인했습니다.")
         return True
 
@@ -357,7 +411,7 @@ def _get_tracking_from_account(
         url = ORDER_STATUS_URL.format(order_no=order_no)
         page.goto(url, wait_until="domcontentloaded")
 
-        did_login = _ensure_logged_in(page, headless, naver_id_env, account_label)
+        did_login = _ensure_logged_in(page, context, headless, naver_id_env, account_label)
         # 여기까지 왔다면 로그인된 상태다(_ensure_logged_in은 실패 시 예외를
         # 던진다). finally의 세션 저장은 이 플래그가 켜졌을 때만 한다 -
         # 로그인에 실패한 채로 저장하면 살아있던 세션 파일을 로그아웃
