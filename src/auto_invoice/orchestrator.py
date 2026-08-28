@@ -33,9 +33,10 @@ def run(
     settings = load_settings()
     report = RunReport()
 
-    orders = excel_io.read_pending_orders(input_path)
-    if limit is not None:
-        orders = orders[:limit]
+    all_orders = excel_io.read_pending_orders(input_path)
+    orders = all_orders[:limit] if limit is not None else all_orders
+    # 중복 주문 판정은 --limit 로 잘라낸 목록이 아니라 엑셀 전체를 기준으로
+    # 해야 한다 - 잘린 쪽 행도 샵마인 그리드에는 그대로 남아 있다.
     total = len(orders)
 
     upload_rows: list[tuple[str, str, str | None]] = []
@@ -116,7 +117,23 @@ def run(
             browser_mod.save_state(c, site_key)
             b.close()
 
+    upload_rows = _drop_split_orders(all_orders, upload_rows, report)
+
     if upload_rows:
         excel_io.write_upload_file(upload_rows, output_path)
 
     return report
+
+
+def _drop_split_orders(orders, upload_rows, report):
+    """업로드 대상에서 위험한 중복 주문을 빼고, 뺀 건은 리포트에 남긴다.
+
+    판단 기준과 이유는 excel_io.resolve_duplicate_orders 참고.
+    """
+    kept, dropped = excel_io.resolve_duplicate_orders(orders, upload_rows)
+    if dropped:
+        recipients = {o.order_id: o.recipient_name for o in orders}
+        for order_id in dropped:
+            report.exclude(order_id, excel_io.SPLIT_ORDER_REASON,
+                           recipient_name=recipients.get(order_id))
+    return kept

@@ -31,6 +31,18 @@ class RunReport:
             ReportEntry(order_id=order_id, status="fail", reason=reason, recipient_name=recipient_name or None)
         )
 
+    def exclude(self, order_id: str, reason: str, recipient_name: str | None = None) -> None:
+        """조회는 성공했지만 자동 반영에서 뺀 주문 (사람이 직접 처리해야 한다).
+
+        성공 기록을 지우고 실패로 다시 남긴다 - 성공 건수가 곧 '업로드 대상'
+        이어야 뒤따르는 건수 검증이 맞아떨어지고, 실패 목록에 남아야 사람이
+        놓치지 않는다.
+        """
+        self.entries = [
+            e for e in self.entries if not (e.order_id == order_id and e.status == "success")
+        ]
+        self.fail(order_id, reason, recipient_name=recipient_name)
+
     def skip(self, order_id: str, reason: str) -> None:
         self.entries.append(ReportEntry(order_id=order_id, status="skip", reason=reason))
 

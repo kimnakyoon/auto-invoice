@@ -8,6 +8,7 @@ scripts/run_all.py(터미널)와 scripts/gui.pyw(바탕화면 아이콘)가 이 
     2. 체크한 주문만 엑셀로 내보낸다                    (shopmine/export.py)
     3. 공급사에서 송장번호 조회 -> 업로드용 CSV 생성    (orchestrator.py)
        + CJ온스타일은 실제 크롬으로 별도 조회          (cjonstyle_bridge.py)
+       + 한 주문번호가 여러 행인 주문은 여기서 제외    (excel_io.py)
     4. CSV를 [발송정보일괄등록(수정용)]으로 [일괄등록]  (shopmine/upload.py)
        -> 그리드의 '송장번호(수정용)' 컬럼이 채워진다
     5. 그 컬럼이 채워진 행만 체크하고 [송장번호수정]    (shopmine/grid.py)
@@ -31,7 +32,7 @@ from pathlib import Path
 
 from . import cjonstyle_bridge
 from .orchestrator import run as run_orchestrator
-from .shopmine import export, grid, upload
+from .shopmine import excel_io, export, grid, upload
 
 WORK_DIR = Path(__file__).resolve().parent.parent.parent / "work"
 
@@ -135,16 +136,24 @@ def lookup_tracking(result: PipelineResult, *, limit=None, headless=False,
     log(f"  상세 리포트: {report.save()}")
 
 
-def apply_csv(csv_path, order_ids, *, max_apply=100, stop_before_apply=False,
-              log=print, result: PipelineResult | None = None) -> PipelineResult:
-    """4~6단계. 엑셀 내보내기/조회가 이미 끝난 상태에서 실행한다."""
+def apply_csv(csv_path, order_ids, *, max_apply=100, expected_filled=None,
+              stop_before_apply=False, log=print,
+              result: PipelineResult | None = None) -> PipelineResult:
+    """4~6단계. 엑셀 내보내기/조회가 이미 끝난 상태에서 실행한다.
+
+    expected_filled: 일괄등록으로 실제로 채워질 **그리드 행** 수. 한 주문번호가
+    그리드에 여러 행으로 있으면 CSV 한 줄이 그 행을 전부 채우기 때문에 CSV 줄
+    수와 다를 수 있다(excel_io.resolve_duplicate_orders 참고). 모르면 CSV 줄
+    수를 그대로 쓴다.
+    """
     result = result or PipelineResult()
     result.csv_path = Path(csv_path)
     rows = len(order_ids)
+    expected = expected_filled if expected_filled is not None else rows
 
-    if rows > max_apply:
+    if expected > max_apply:
         result.stopped_reason = (
-            f"반영 대상이 {rows}건으로 상한({max_apply}건)을 넘습니다. "
+            f"반영 대상이 {expected}건으로 상한({max_apply}건)을 넘습니다. "
             "CSV는 만들어 두었으니 확인 후 상한을 올려 다시 실행하세요.")
         log(f"중단: {result.stopped_reason}")
         return result
@@ -169,12 +178,13 @@ def apply_csv(csv_path, order_ids, *, max_apply=100, stop_before_apply=False,
     log(f"[5/{STEPS}] 송장이 채워진 행만 체크하고 [송장번호수정]")
     try:
         picked = upload.select_registered_rows(log=log)
-        if picked > rows:
+        if picked > expected:
             raise upload.UploadError(
-                f"송장이 채워진 행이 {picked}건으로 CSV({rows}건)보다 많습니다. "
-                "필터가 제대로 걸리지 않았을 수 있어 아무것도 반영하지 않았습니다.")
-        if picked < rows:
-            log(f"  경고: CSV는 {rows}건인데 화면에서 채워진 건 {picked}건입니다 "
+                f"송장이 채워진 행이 {picked}건으로 예상({expected}건)보다 많습니다. "
+                "필터가 제대로 걸리지 않았거나, 한 주문번호가 그리드 여러 행으로 "
+                "나뉜 주문이 섞였을 수 있어 아무것도 반영하지 않았습니다.")
+        if picked < expected:
+            log(f"  경고: {expected}건이 채워져야 하는데 화면에서 채워진 건 {picked}건입니다 "
                 "- 채워진 건만 반영합니다.")
         result.apply_status = upload.apply_tracking(picked, log=log)
         result.applied_count = picked
@@ -216,8 +226,14 @@ def run_full(*, limit=None, max_apply=100, tab="배송중", stop_before_apply=Fa
 
     order_ids = read_csv_order_ids(result.csv_path)
     log(f"  업로드용 CSV: {result.csv_path} ({len(order_ids)}건)")
+    # CSV 한 줄이 그리드 여러 행을 채우는 주문이 있을 수 있어, 5단계에서 몇
+    # 행이 채워져야 맞는지는 내보내기 엑셀의 행 수로 센다.
+    expected = excel_io.count_export_rows(str(result.export_path), order_ids)
+    if expected != len(order_ids):
+        log(f"  (그리드 기준 {expected}행 - 한 주문번호가 여러 행인 주문 포함)")
     return apply_csv(result.csv_path, order_ids, max_apply=max_apply,
-                     stop_before_apply=stop_before_apply, log=log, result=result)
+                     expected_filled=expected, stop_before_apply=stop_before_apply,
+                     log=log, result=result)
 
 
 def run_from_csv(csv_path, *, max_apply=100, stop_before_apply=False,

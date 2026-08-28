@@ -251,6 +251,14 @@ def process_orders(report, input_path: str, output_path: str, log=print) -> int:
             report.fail(r.order_id, reason, recipient_name=recipient_by_id.get(r.order_id))
             log(f"  {r.order_id}: 실패 ({reason})")
 
+    # orchestrator와 같은 규칙으로 '한 주문번호가 여러 행' 주문을 뺀다.
+    # CJ온스타일 건은 이 경로로만 업로드 파일에 들어가므로 여기서도 걸러야 한다.
+    upload_rows, dropped = excel_io.resolve_duplicate_orders(all_orders, upload_rows)
+    for order_id in dropped:
+        report.exclude(order_id, excel_io.SPLIT_ORDER_REASON,
+                       recipient_name=recipient_by_id.get(order_id))
+        log(f"  {order_id}: 여러 행으로 나뉜 주문이라 자동 반영에서 제외 - 직접 처리해주세요")
+
     if upload_rows:
         excel_io.append_upload_rows(upload_rows, output_path)
     return len(upload_rows)

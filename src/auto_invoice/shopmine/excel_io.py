@@ -145,3 +145,63 @@ def append_upload_rows(rows: list[tuple[str, str, str | None]], path: str) -> No
             writer.writerow([UPLOAD_ORDER_ID_HEADER, UPLOAD_TRACKING_HEADER, UPLOAD_COURIER_HEADER])
         for order_id, tracking_no, courier in rows:
             writer.writerow([order_id, tracking_no, courier or ""])
+
+
+# resolve_duplicate_orders가 뺀 주문을 리포트에 남길 때 쓰는 사유.
+SPLIT_ORDER_REASON = (
+    "한 주문번호가 여러 행으로 나뉜 주문인데 일부 행만 송장이 확인됐거나 "
+    "행마다 송장번호가 달랐습니다. 일괄등록은 주문번호로만 행을 찾아서 "
+    "나머지 행에도 같은 송장이 들어가므로 자동 반영에서 제외했습니다 - "
+    "샵마인에서 직접 처리해주세요."
+)
+
+
+def _order_row_counts(orders: list[PendingOrder]) -> dict[str, int]:
+    counts: dict[str, int] = {}
+    for order in orders:
+        counts[order.order_id] = counts.get(order.order_id, 0) + 1
+    return counts
+
+
+def count_export_rows(export_path: str, order_ids) -> int:
+    """order_ids에 해당하는 주문이 내보내기 엑셀에서 차지하는 '행' 수.
+
+    샵마인 그리드에서 실제로 채워질 행 수와 같다 (아래 resolve_duplicate_orders
+    참고). CSV 줄 수와 다를 수 있어서, 반영 건수 검증은 이 값을 기준으로 한다.
+    """
+    counts = _order_row_counts(read_pending_orders(export_path))
+    return sum(counts.get(order_id, 1) for order_id in order_ids)
+
+
+def resolve_duplicate_orders(
+    orders: list[PendingOrder],
+    upload_rows: list[tuple[str, str, str | None]],
+) -> tuple[list[tuple[str, str, str | None]], list[str]]:
+    """한 주문번호가 여러 행으로 나뉜 주문을 업로드 대상에서 안전하게 정리한다.
+
+    샵마인 일괄등록은 '고객주문번호'로만 행을 찾기 때문에, 한 주문번호가
+    그리드에 여러 행(상품별 행)으로 있으면 CSV 한 줄이 그 행 **전부**를 같은
+    송장번호로 채운다. 실제로 2026-08-28 실행에서 주문 22102471952623이 두
+    행이었고 한 행만 송장이 나왔는데, 그대로 올렸다면 아직 발송되지 않은
+    나머지 행에도 같은 송장번호가 들어갈 뻔했다 (5단계 건수 검증에 걸려 멈춤).
+
+    그래서 규칙을 하나로 둔다: 그 주문의 **모든 행이 같은 송장번호로 조회
+    성공**했을 때만 CSV 한 줄로 합쳐서 올리고, 하나라도 빠지거나 송장번호가
+    서로 다르면 그 주문은 통째로 뺀다. 뺀 주문은 사람이 직접 처리한다.
+
+    반환: (정리된 upload_rows, 제외한 주문번호 목록)
+    """
+    counts = _order_row_counts(orders)
+    by_id: dict[str, list[tuple[str, str, str | None]]] = {}
+    for row in upload_rows:
+        by_id.setdefault(row[0], []).append(row)
+
+    kept: list[tuple[str, str, str | None]] = []
+    dropped: list[str] = []
+    for order_id, rows in by_id.items():
+        expected = counts.get(order_id, 1)
+        if len(rows) == expected and len({r[1] for r in rows}) == 1:
+            kept.append(rows[0])
+        else:
+            dropped.append(order_id)
+    return kept, dropped
