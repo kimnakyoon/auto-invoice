@@ -8,9 +8,20 @@
 정한다 - 이 모듈은 날짜만 다룬다.
 
 날짜를 잘못 읽어 멀쩡한 주문을 '오래됨'으로 올리면 목록 전체를 못 믿게 되므로,
-화면에 있는 아무 날짜나 줍지 않는다. '주문일자/결제일' 같은 라벨 바로 뒤
-40자 안에 붙은 날짜만 주문일로 인정하고, 라벨을 못 찾으면 None으로 둔 채
-아무 표시도 하지 않는다 - 잘못 표시하느니 표시하지 않는 쪽이 낫다.
+화면에 있는 아무 날짜나 줍지 않는다. 아래 세 규칙 중 하나에 걸리는 날짜만
+주문일로 인정하고, 어디에도 안 걸리면 None으로 둔 채 아무 표시도 하지 않는다 -
+잘못 표시하느니 표시하지 않는 쪽이 낫다.
+
+  1) 라벨 뒤   '주문일자/결제일/신청일' 같은 라벨 바로 뒤 40자 안의 날짜
+  2) 주문번호  '주문번호' 뒤 값이 20260825... / 2026-08-24-K87597 처럼
+               날짜로 시작하면 그 앞부분 (11번가/SSG/롯데/CJ온스타일/네이버)
+  3) 섹션 제목 '주문 상세', '주문 정보' 같은 제목 바로 뒤 60자 안의 날짜
+               (NS홈쇼핑/더현대/Hmall/롯데온/G마켓 - 라벨 없이 날짜만 있다)
+
+2)와 3)은 사이트 11곳의 실제 주문상세 화면을 사람이 직접 확인해서 뽑은
+규칙이다(scripts/check_order_date.py로 화면을 띄워 확인했다). 라벨이 붙은
+사이트는 패션플러스('신청일') 한 곳뿐이라, 라벨만 찾던 예전 규칙으로는
+화면에서 읽는 사이트가 사실상 전부 빈칸이었다.
 """
 
 from __future__ import annotations
@@ -29,6 +40,8 @@ _LABELS = (
     "결제일자", "결제일시", "결제일",
     "구매일자", "구매일",
     "결제완료일",
+    # 패션플러스는 주문일을 '신청일'이라고 부른다.
+    "신청일자", "신청일",
 )
 
 # 라벨 뒤 이만큼(글자) 안에서만 날짜를 찾는다. 더 넓히면 옆 항목의 날짜
@@ -45,6 +58,22 @@ _MONTH_DAY = re.compile(r"(?<!\d)(\d{1,2})\s*[월./-]\s*(\d{1,2})\s*일?(?!\d)")
 _JSON_KEY = re.compile(
     r"^(order|ord|pay|payment|purchase|buy|reg)(ed)?(date|dt|day|ymd|datetime|dttm|at)$"
 )
+
+# 주문번호 앞에 붙는 라벨. 이 뒤의 값이 날짜로 시작하는 공급사가 많다
+# (11번가 20260825095273858 / SSG 20260824-58D816 / CJ온스타일 2026-08-27-009262).
+_ORDER_NO_LABELS = ("주문번호", "주문 번호")
+_ORDER_NO_WINDOW = 30
+
+# 주문번호 값의 맨 앞에 붙은 날짜만 인정한다 (중간에 낀 숫자는 보지 않는다).
+_ORDER_NO_DATE = re.compile(r"^(20\d{2})[-.]?(\d{2})[-.]?(\d{2})")
+
+# 라벨 없이 날짜만 있는 사이트를 위한, 날짜가 놓이는 자리의 제목
+# ('주문 상세', '주문상세내역', '상세 주문 내역', '주문 정보' 등).
+_SECTION = re.compile(r"(?:주문|배송)\s*/?\s*(?:상세|정보|내역)")
+
+# 제목 뒤 이만큼(글자) 안에서만 찾는다. 제목과 날짜 사이에 '주문내역삭제',
+# '이용안내' 같은 버튼 글자가 끼는 사이트가 있어 라벨 뒤보다 조금 넓다.
+_SECTION_WINDOW = 60
 
 
 def _build(year: int, month: int, day: int) -> date | None:
@@ -84,15 +113,67 @@ def parse(text: str | None) -> date | None:
     return None
 
 
-def from_text(text: str | None) -> date | None:
-    """주문상세 화면 텍스트에서 주문일을 읽는다 (라벨 뒤에 붙은 날짜만)."""
-    if not text:
+def _not_future(found: date | None) -> date | None:
+    """주문일이 미래일 수는 없다 - 배송예정일 같은 걸 주웠다는 뜻이라 버린다.
+
+    하루치는 시차/시계 오차로 보고 미래로 치지 않는다(_shift_back_if_future와
+    같은 기준).
+    """
+    if found is None or found > date.today() + timedelta(days=1):
         return None
+    return found
+
+
+def _by_label(text: str) -> date | None:
+    """1) '주문일자/신청일' 같은 라벨 바로 뒤에 붙은 날짜."""
     for label in _LABELS:
         for m in re.finditer(re.escape(label), text):
             found = parse(text[m.end():m.end() + _LABEL_WINDOW])
             if found is not None:
                 return found
+    return None
+
+
+def _by_order_no(text: str) -> date | None:
+    """2) 주문번호 맨 앞에 박힌 날짜.
+
+    주문번호가 날짜로 시작하는 공급사가 많아서 라벨 없이도 주문일을 알 수
+    있다. 날짜로 시작하지 않는 주문번호(패션플러스 141262620, 더현대
+    260808...)는 _ORDER_NO_DATE에 안 걸리거나 유효한 날짜가 아니라 그냥
+    넘어간다.
+    """
+    for label in _ORDER_NO_LABELS:
+        for m in re.finditer(label, text):
+            value = text[m.end():m.end() + _ORDER_NO_WINDOW].lstrip(" \t\n:")
+            hit = _ORDER_NO_DATE.match(value)
+            if hit:
+                found = _not_future(_build(int(hit[1]), int(hit[2]), int(hit[3])))
+                if found is not None:
+                    return found
+    return None
+
+
+def _by_section(text: str) -> date | None:
+    """3) '주문 상세' 같은 제목 바로 뒤에 라벨 없이 놓인 날짜."""
+    for m in _SECTION.finditer(text):
+        found = _not_future(parse(text[m.end():m.end() + _SECTION_WINDOW]))
+        if found is not None:
+            return found
+    return None
+
+
+def from_text(text: str | None) -> date | None:
+    """주문상세 화면 텍스트에서 주문일을 읽는다 (모듈 설명의 세 규칙).
+
+    구체적인 규칙부터 본다. 라벨이 있으면 그게 가장 확실하고, 그다음이
+    주문번호에 박힌 날짜다. 제목 뒤 날짜는 셋 중 가장 헐렁해서 맨 뒤에 둔다.
+    """
+    if not text:
+        return None
+    for rule in (_by_label, _by_order_no, _by_section):
+        found = rule(text)
+        if found is not None:
+            return found
     return None
 
 
