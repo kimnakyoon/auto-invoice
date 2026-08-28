@@ -8,9 +8,11 @@
 실행:
     python scripts/musinsa_login_setup.py
 
-브라우저 창이 뜨면 아이디는 자동 입력되어 있으니 비밀번호만 입력하고
-로그인하면 된다. 로그인이 확인되면 자동으로 다음 계정으로 넘어간다.
-3개 계정 전부 끝나면 창이 자동으로 닫힌다.
+.env에 MUSINSA_PW/MUSINSA_PW2/MUSINSA_PW3가 들어 있으면 사람 개입 없이
+세 계정을 차례로 자동 로그인한다. 비밀번호를 넣지 않은 계정은 브라우저 창에
+아이디만 채워진 채로 뜨니 비밀번호만 입력하고 로그인하면 된다. 로그인이
+확인되면 자동으로 다음 계정으로 넘어가고, 3개 계정 전부 끝나면 창이 자동으로
+닫힌다.
 """
 
 import sys
@@ -38,11 +40,8 @@ load_dotenv()
 # 보호된 페이지(주문상세)를 써야 musinsa._looks_like_login_page()가 제대로 감지한다.
 CHECK_URL = "https://www.musinsa.com/order/order-detail/202608250706390001"
 
-ACCOUNTS = [
-    ("1", musinsa.SITE_KEY, "MUSINSA_ID"),
-    ("2", musinsa.SECOND_ACCOUNT_STATE_KEY, "MUSINSA_ID2"),
-    ("3", musinsa.THIRD_ACCOUNT_STATE_KEY, "MUSINSA_ID3"),
-]
+# 계정 목록은 어댑터(musinsa.ACCOUNTS)를 그대로 쓴다 - 여기서 따로 들고 있으면
+# 계정을 늘릴 때 두 군데를 고쳐야 한다.
 
 
 def _goto(page, url: str) -> None:
@@ -60,7 +59,7 @@ def main() -> None:
     with sync_playwright() as p:
         browser = p.chromium.launch(headless=False)
         try:
-            for label, state_key, id_env in ACCOUNTS:
+            for label, (state_key, id_env, _pw_env) in musinsa.ACCOUNTS.items():
                 state_path = browser_mod.state_path(state_key)
                 context = (
                     browser.new_context(storage_state=str(state_path))
@@ -71,12 +70,24 @@ def main() -> None:
                 _goto(page, CHECK_URL)
 
                 if musinsa._looks_like_login_page(page):
-                    print(f"[계정{label}] 로그인이 필요합니다. 브라우저 창에서 비밀번호를 입력하고 로그인해주세요.")
-                    musinsa._prefill_login_id(page, os.environ.get(id_env))
-                    if not musinsa._wait_for_manual_login(page):
-                        print(f"[계정{label}] 로그인 대기 시간(5분)이 지났습니다. 다시 실행해주세요.")
-                        context.close()
-                        continue
+                    # 자동 로그인이 막히면(봇 확인 등) 그 계정만 사람이 직접 로그인하게
+                    # 넘기고, 나머지 계정 처리는 계속한다.
+                    try:
+                        logged_in = musinsa._auto_login(page, label)
+                        if logged_in:
+                            print(f"[계정{label}] 자동 로그인했습니다.")
+                        else:
+                            print(f"[계정{label}] 비밀번호가 .env에 없습니다. 브라우저 창에서 로그인해주세요.")
+                    except Exception as e:
+                        logged_in = False
+                        print(f"[계정{label}] 자동 로그인 실패({e}). 브라우저 창에서 직접 로그인해주세요.")
+
+                    if not logged_in:
+                        musinsa._prefill_login_id(page, os.environ.get(id_env))
+                        if not musinsa._wait_for_manual_login(page):
+                            print(f"[계정{label}] 로그인 대기 시간(5분)이 지났습니다. 다시 실행해주세요.")
+                            context.close()
+                            continue
                     _goto(page, CHECK_URL)
 
                 context.storage_state(path=str(state_path))

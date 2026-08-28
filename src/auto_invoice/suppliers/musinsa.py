@@ -24,6 +24,29 @@
 - 로그인이 안 되어 있으면(위 API로 판별) member.one.musinsa.com/login 으로
   리다이렉트되는 실제 화면을 띄워서 로그인을 유도한다. 로그인 폼은
   placeholder "통합계정 또는 이메일" / "비밀번호"로 되어 있다.
+- MUSINSA_PW/MUSINSA_PW2/MUSINSA_PW3가 있으면 세션이 끊겼을 때 사람 개입 없이
+  완전 자동으로 재로그인한다(롯데온/패션플러스/롯데아이몰과 동일한 방식).
+  로그인 페이지를 실측해 확인한 것(2026-08-28):
+  - Vue로 그려지는 폼이라 id/name이 없다 - 입력창은 placeholder로, 로그인
+    버튼은 폼 안의 submit 버튼으로 잡는다(폼 안의 나머지 버튼은 비밀번호
+    보기 눈 아이콘 하나뿐이라 type=submit으로 충분히 구분된다).
+  - 아이디/비밀번호는 폼 제출 직전에 페이지 JS가 암호화해서 hidden 필드
+    (encryptMemberId/encryptPassword)에 넣는다. 그래서 hidden 필드를 직접
+    채우면 안 되고, 반드시 보이는 입력창에 넣고 버튼을 눌러야 한다.
+  - 봇 확인(reCAPTCHA)은 평소 꺼져 있다(hidden 필드 isCheckGoogleRecaptcha가
+    "false"). 로그인 실패가 반복되면 켜지는 것으로 보이는데, 켜져 있으면
+    자동 로그인을 포기하고 사람에게 넘긴다(억지로 뚫지 않는다).
+  - 로그인 실패는 화면 문구가 아니라 alert()으로 온다(롯데온/롯데아이몰과
+    같다) - 예: "아이디 또는 패스워드를 확인하세요." Playwright는 핸들러가
+    없으면 alert을 조용히 닫아버려 실패를 감지하지 못하므로 dialog 핸들러로
+    그 문구를 받아 실패 사유째로 올린다.
+  - "자동 로그인" 체크박스를 켜면 세션이 훨씬 오래 유지된다 - 로그인 횟수를
+    줄이면 봇 확인이 켜질 일도 줄어드니 자동 로그인 때는 켜고 들어간다.
+    체크박스 자체는 CSS로 숨겨져 있어(class="blind") 짝이 되는 label을
+    클릭해야 한다.
+  - 이 사이트는 headless 브라우저로도 로그인 페이지가 정상적으로 뜬다
+    (롯데아이몰과 달리 403으로 막지 않는다).
+  MUSINSA_PW를 비워두면 예전처럼 아이디만 자동 입력하고 사람이 직접 로그인한다.
 - 크롬에 이미 로그인되어 있는 세션의 쿠키를 그대로 가져와 쓰는 방식
   (scripts/import_chrome_session.py)은 무신사에서는 통하지 않았다 -
   Cloudflare로 보이는 봇 차단이 있어서, 쿠키만 다른 브라우저(Playwright
@@ -60,6 +83,15 @@ from .base import BlockedError, OrderNotFound, ParseError, TrackingNotAvailableY
 load_dotenv()
 
 LOGIN_ID_PLACEHOLDER = "통합계정 또는 이메일"
+LOGIN_PW_PLACEHOLDER = "비밀번호"
+# Vue가 그리는 폼이라 버튼에 id가 없다. 폼 안의 나머지 버튼은 "비밀번호 보기" 눈
+# 아이콘(type=button)뿐이라 type=submit으로 로그인 버튼을 정확히 짚을 수 있다.
+LOGIN_SUBMIT_SELECTOR = "#loginForm button[type=submit]"
+# "자동 로그인" 체크박스는 class="blind"로 숨겨져 있어 직접 못 누른다 - label을 누른다.
+AUTOLOGIN_CHECKBOX_SELECTOR = "#login-v2-member__util__login-auto"
+AUTOLOGIN_LABEL_SELECTOR = "label[for='login-v2-member__util__login-auto']"
+# 봇 확인(reCAPTCHA) 사용 여부를 담고 있는 hidden 필드. 평소에는 "false"다.
+RECAPTCHA_FLAG_SELECTOR = "#isCheckGoogleRecaptcha"
 
 DOMAINS = {"musinsa.com", "www.musinsa.com"}
 SITE_KEY = "musinsa"
@@ -67,10 +99,18 @@ SITE_KEY = "musinsa"
 SECOND_ACCOUNT_STATE_KEY = "musinsa2"
 THIRD_ACCOUNT_STATE_KEY = "musinsa3"
 
+# 계정번호 -> (storage_state 키, 아이디 환경변수, 비밀번호 환경변수)
+ACCOUNTS = {
+    "1": (SITE_KEY, "MUSINSA_ID", "MUSINSA_PW"),
+    "2": (SECOND_ACCOUNT_STATE_KEY, "MUSINSA_ID2", "MUSINSA_PW2"),
+    "3": (THIRD_ACCOUNT_STATE_KEY, "MUSINSA_ID3", "MUSINSA_PW3"),
+}
+
 ORDER_DETAIL_URL = "https://www.musinsa.com/order/order-detail/{order_no}"
 ORDER_VIEW_API_URL = "https://www.musinsa.com/order-service/my/order/get_order_view/{order_no}"
 
-LOGIN_WAIT_TIMEOUT_MS = 5 * 60 * 1000  # 로그인 대기 최대 5분
+LOGIN_WAIT_TIMEOUT_MS = 5 * 60 * 1000  # 수동 로그인 대기 최대 5분
+AUTO_LOGIN_WAIT_TIMEOUT_MS = 30 * 1000  # 자동 로그인은 사람을 기다리지 않으니 짧게
 
 # 무신사가 쓰는 택배사 코드(스마트택배 표준 코드와 동일 체계로 보임) -> 정식 명칭.
 # 확인된 건 CJGLS/LOTTE 뿐이고 나머지는 흔히 쓰이는 코드를 추정으로 채워뒀다 -
@@ -140,7 +180,7 @@ def _looks_like_login_page(page) -> bool:
 
 
 def _prefill_login_id(page, musinsa_id: str | None) -> None:
-    """비밀번호는 절대 자동 입력하지 않는다 - 아이디만 채워서 타이핑을 줄인다."""
+    """수동 로그인 폴백용 - 아이디만 채워서 사람이 칠 것을 비밀번호만 남긴다."""
     if not musinsa_id:
         return
     locator = page.get_by_placeholder(LOGIN_ID_PLACEHOLDER)
@@ -158,6 +198,101 @@ def _safe_print(message: str) -> None:
         print(message)
     except Exception:
         pass
+
+
+def _recaptcha_required(page) -> bool:
+    """봇 확인(reCAPTCHA)이 켜져 있는지 본다.
+
+    평소에는 hidden 필드 isCheckGoogleRecaptcha가 "false"고, 로그인 실패가
+    반복되면 켜지는 것으로 보인다. 켜져 있으면 자동 로그인을 시도하지 않고
+    사람에게 넘긴다.
+    """
+    locator = page.locator(RECAPTCHA_FLAG_SELECTOR)
+    if locator.count() == 0:
+        return False
+    try:
+        return (locator.first.get_attribute("value") or "").strip().lower() == "true"
+    except Exception:
+        return False
+
+
+def _check_autologin(page) -> None:
+    """"자동 로그인"을 켜서 세션이 오래 가게 한다 (best effort).
+
+    체크박스가 class="blind"로 숨겨져 있어 Playwright의 check()로는 못 누른다 -
+    짝이 되는 label을 클릭해서 토글한다. 실패해도 로그인 자체에는 지장이
+    없으니 조용히 넘어간다.
+    """
+    try:
+        checkbox = page.locator(AUTOLOGIN_CHECKBOX_SELECTOR)
+        if checkbox.count() == 0 or checkbox.first.is_checked():
+            return
+        page.locator(AUTOLOGIN_LABEL_SELECTOR).first.click()
+    except Exception:
+        pass
+
+
+def _auto_login(page, account_label: str) -> bool:
+    """계정별 MUSINSA_ID/MUSINSA_PW로 완전 자동 로그인한다 (사용자 명시 요청).
+
+    비밀번호가 설정되어 있지 않으면 False를 돌려주고, 호출자가 기존의 수동
+    로그인 방식으로 넘어간다 (비밀번호를 저장하고 싶지 않은 계정을 위해 수동
+    로그인 경로를 그대로 남겨뒀다).
+
+    롯데온/롯데아이몰 어댑터와 같은 패턴이다 - 이 사이트도 로그인 실패를 화면
+    문구가 아니라 alert()으로 알려주기 때문에 dialog 핸들러로 그 문구를 받아
+    실패 사유째로 올린다. 핸들러가 없으면 Playwright가 alert을 조용히
+    닫아버려서 원인도 모른 채 대기 시간만 다 쓰고 실패한다.
+    """
+    _, id_env, pw_env = ACCOUNTS[account_label]
+    login_id = os.environ.get(id_env)
+    login_pw = os.environ.get(pw_env)
+    if not login_id or not login_pw:
+        return False
+
+    if _recaptcha_required(page):
+        raise BlockedError(
+            f"무신사({account_label})가 봇 확인(reCAPTCHA)을 요구하고 있어 자동 로그인을 할 수 없습니다 "
+            "- 뜬 브라우저 창에서 직접 로그인해주세요."
+        )
+
+    alerts: list[str] = []
+
+    def _on_dialog(dialog) -> None:
+        alerts.append(dialog.message)
+        dialog.dismiss()
+
+    page.on("dialog", _on_dialog)
+    try:
+        # 아이디/비밀번호는 폼 제출 직전에 페이지 JS가 암호화해서 hidden 필드에
+        # 넣는다 - 반드시 보이는 입력창에 넣고 버튼을 눌러야 한다.
+        page.get_by_placeholder(LOGIN_ID_PLACEHOLDER).fill(login_id)
+        page.get_by_placeholder(LOGIN_PW_PLACEHOLDER, exact=True).fill(login_pw)
+        _check_autologin(page)
+        page.locator(LOGIN_SUBMIT_SELECTOR).first.click()
+
+        elapsed_ms = 0
+        while elapsed_ms < AUTO_LOGIN_WAIT_TIMEOUT_MS:
+            # 로그인 페이지를 벗어났으면 성공이다. alert이 떴더라도 로그인 자체는
+            # 된 경우(비밀번호 변경 안내 등)가 있어, 페이지 상태를 alert보다
+            # 먼저 본다 (롯데온/롯데아이몰과 같은 이유).
+            if not _looks_like_login_page(page):
+                return True
+            if alerts:
+                raise BlockedError(f"무신사({account_label}) 자동 로그인이 거부됐습니다: {alerts[0].strip()}")
+            elapsed_ms += 1200  # _looks_like_login_page 내부에서 1200ms 대기함
+
+        if _recaptcha_required(page):
+            raise BlockedError(
+                f"무신사({account_label})가 로그인 도중 봇 확인(reCAPTCHA)을 요구했습니다 "
+                "- 뜬 브라우저 창에서 직접 로그인해주세요."
+            )
+        raise BlockedError(
+            f"무신사({account_label}) 자동 로그인 후에도 로그인 페이지에서 벗어나지 못했습니다 "
+            "(추가 본인인증을 요구받았을 수 있습니다 - 브라우저 창을 확인해주세요)."
+        )
+    finally:
+        page.remove_listener("dialog", _on_dialog)
 
 
 def _wait_for_manual_login(page) -> bool:
@@ -189,18 +324,18 @@ def _get_extra_context(primary_context: BrowserContext, state_key: str, headless
 
 
 def _state_key_for(account_label: str) -> str:
-    return {"1": SITE_KEY, "2": SECOND_ACCOUNT_STATE_KEY, "3": THIRD_ACCOUNT_STATE_KEY}[account_label]
+    return ACCOUNTS[account_label][0]
 
 
-def _ensure_logged_in(
-    context: BrowserContext, order_no: str, headless: bool, musinsa_id_env: str, account_label: str
-) -> None:
+def _ensure_logged_in(context: BrowserContext, order_no: str, headless: bool, account_label: str) -> None:
     """API가 로그인 필요를 감지했을 때만 호출된다. 실제 로그인에 성공하면
     storage_state를 저장한다."""
-    if headless:
+    _, id_env, pw_env = ACCOUNTS[account_label]
+    if headless and not os.environ.get(pw_env):
         raise BlockedError(
-            f"무신사 로그인이 필요합니다({account_label}). 먼저 --headless 없이 실행해 수동으로 "
-            "로그인하거나, scripts/musinsa_login_setup.py로 미리 로그인해주세요."
+            f"무신사 로그인이 필요합니다({account_label}). .env에 {pw_env}를 넣어두면 자동으로 "
+            "로그인합니다. 아니면 --headless 없이 실행해 수동으로 로그인하거나, "
+            "scripts/musinsa_login_setup.py로 미리 로그인해주세요."
         )
 
     page = context.new_page()
@@ -209,11 +344,16 @@ def _ensure_logged_in(
         if not _looks_like_login_page(page):
             return  # 이미 로그인되어 있었음 (레이스 컨디션 등 방어)
 
-        _prefill_login_id(page, os.environ.get(musinsa_id_env))
-        _safe_print(f"[musinsa] ({account_label}) 아이디는 자동으로 입력했습니다. 뜬 브라우저 창에서 비밀번호를 입력하고 로그인해주세요.")
-        _safe_print(f"[musinsa] ({account_label}) 로그인이 완료되면 자동으로 이어서 진행합니다 (최대 5분 대기).")
-        if not _wait_for_manual_login(page):
-            raise BlockedError(f"무신사({account_label}) 로그인 대기 시간(5분)이 지났습니다. 로그인 후 다시 실행해주세요.")
+        if _auto_login(page, account_label):
+            _safe_print(f"[musinsa] ({account_label}) 로그인 세션이 없어 자동 로그인했습니다.")
+        else:
+            if headless:  # pragma: no cover - 위에서 이미 걸러지지만 방어적으로 남긴다
+                raise BlockedError(f"무신사 로그인이 필요합니다({account_label}). --headless 없이 실행해주세요.")
+            _prefill_login_id(page, os.environ.get(id_env))
+            _safe_print(f"[musinsa] ({account_label}) 아이디는 자동으로 입력했습니다. 뜬 브라우저 창에서 비밀번호를 입력하고 로그인해주세요.")
+            _safe_print(f"[musinsa] ({account_label}) 로그인이 완료되면 자동으로 이어서 진행합니다 (최대 5분 대기).")
+            if not _wait_for_manual_login(page):
+                raise BlockedError(f"무신사({account_label}) 로그인 대기 시간(5분)이 지났습니다. 로그인 후 다시 실행해주세요.")
 
         context.storage_state(path=str(browser_mod.state_path(_state_key_for(account_label))))
     finally:
@@ -283,13 +423,12 @@ def _get_tracking_from_account(
     context: BrowserContext,
     order_no: str,
     headless: bool,
-    musinsa_id_env: str,
     account_label: str,
     order_option: str | None,
 ) -> TrackingResult:
     data = _fetch_order_view(context, order_no)
     if data is None:
-        _ensure_logged_in(context, order_no, headless, musinsa_id_env, account_label)
+        _ensure_logged_in(context, order_no, headless, account_label)
         data = _fetch_order_view(context, order_no)
         if data is None:
             raise BlockedError(f"무신사({account_label}) 로그인 후에도 여전히 로그인이 필요합니다.")
@@ -306,15 +445,15 @@ def get_tracking(
     order_no = extract_order_no(product_url)
 
     try:
-        return _get_tracking_from_account(context, order_no, headless, "MUSINSA_ID", "1", order_option)
+        return _get_tracking_from_account(context, order_no, headless, "1", order_option)
     except OrderNotFound:
         pass
 
     second_context = _get_extra_context(context, SECOND_ACCOUNT_STATE_KEY, headless)
     try:
-        return _get_tracking_from_account(second_context, order_no, headless, "MUSINSA_ID2", "2", order_option)
+        return _get_tracking_from_account(second_context, order_no, headless, "2", order_option)
     except OrderNotFound:
         pass
 
     third_context = _get_extra_context(context, THIRD_ACCOUNT_STATE_KEY, headless)
-    return _get_tracking_from_account(third_context, order_no, headless, "MUSINSA_ID3", "3", order_option)
+    return _get_tracking_from_account(third_context, order_no, headless, "3", order_option)

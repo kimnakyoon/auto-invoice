@@ -180,8 +180,14 @@ python scripts/test_lotteon_adapter.py
 
 `.env`에 `LOTTEON_ID`/`LOTTEON_PW`를 넣어두면 로그인 세션이 없을 때 사람
 개입 없이 자동으로 로그인한다(SSG·더현대·NS홈쇼핑·11번가·옥션·패션플러스·
-롯데아이몰·AK플라자와 동일한 방식). `LOTTEON_PW`를 비워두면 예전처럼 브라우저 창이 뜨고, 직접 로그인하면
+롯데아이몰·AK플라자·무신사와 동일한 방식). `LOTTEON_PW`를 비워두면 예전처럼 브라우저 창이 뜨고, 직접 로그인하면
 자동으로 감지해서 이어서 진행한다.
+
+무신사는 계정을 3개 쓰기 때문에 `MUSINSA_ID`/`MUSINSA_PW`,
+`MUSINSA_ID2`/`MUSINSA_PW2`, `MUSINSA_ID3`/`MUSINSA_PW3`를 각각 넣는다.
+최초 세팅은 `python scripts/musinsa_login_setup.py`를 한 번 돌리면 세 계정
+세션이 한꺼번에 만들어지고, 자동 로그인만 따로 검증하려면
+`python scripts/test_musinsa_login.py`를 쓴다.
 
 로그인 세션은 `auth/lotteon_state.json`에 저장되어 다음부터는 다시 로그인하지
 않는다. 스크립트에 미리 넣어둔 테스트 주문번호로 송장번호가 정확히 조회되면
