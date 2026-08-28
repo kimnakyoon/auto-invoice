@@ -43,8 +43,6 @@ def main() -> int:
     p.add_argument("--csv", default=None,
                    help="이미 만들어둔 업로드용 CSV로 6~8단계만 실행 "
                         "(상한 초과로 멈춘 뒤 확인하고 재실행할 때)")
-    p.add_argument("--skip-cjonstyle", action="store_true",
-                   help="CJ온스타일(실제 크롬으로 조회하는 느린 경로)을 건너뛴다")
     args = p.parse_args()
 
     log("=" * 60)
@@ -62,7 +60,7 @@ def main() -> int:
         result = pipeline.run_full(
             limit=args.limit, max_apply=args.max_apply, tab=args.tab,
             stop_before_apply=args.stop_before_apply, headless=args.headless,
-            skip_cjonstyle=args.skip_cjonstyle, log=log)
+            log=log)
 
     log("")
     log("=" * 60)

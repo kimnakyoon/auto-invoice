@@ -17,7 +17,7 @@ from .config import load_settings
 from .report import RunReport
 from .shopmine import excel_io
 from .suppliers.base import AdapterError, BlockedError, OrderCancelled, TrackingNotAvailableYet
-from .suppliers.registry import get_adapter, is_handled_elsewhere
+from .suppliers.registry import get_adapter
 
 ProgressCallback = Callable[[int, int, str, str], None]
 
@@ -53,13 +53,8 @@ def run(
                 adapter = get_adapter(order.product_url)
                 if adapter is None:
                     message = f"등록된 어댑터 없음: {order.product_url}"
-                    if is_handled_elsewhere(order.product_url):
-                        # CJ온스타일처럼 뒤에서 다른 경로로 조회하는 사이트다.
-                        # 그쪽이 이 스킵 기록을 실제 결과로 갈아끼운다.
-                        report.skip(order.order_id, message)
-                    else:
-                        report.unsupported_site(order.order_id, order.product_url,
-                                                recipient_name=order.recipient_name)
+                    report.unsupported_site(order.order_id, order.product_url,
+                                            recipient_name=order.recipient_name)
                     continue
 
                 site_key = adapter.SITE_KEY

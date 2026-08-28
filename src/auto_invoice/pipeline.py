@@ -11,7 +11,6 @@ scripts/run_all.py(터미널)와 scripts/gui.pyw(바탕화면 아이콘)가 이 
        주문만 필터로 골라 전부 체크한다                 (shopmine/upload.py)
     4. 체크한 주문만 엑셀로 내보낸다                    (shopmine/export.py)
     5. 공급사에서 송장번호 조회 -> 업로드용 CSV 생성    (orchestrator.py)
-       + CJ온스타일은 실제 크롬으로 별도 조회          (cjonstyle_bridge.py)
        + 한 주문번호가 여러 행인 주문은 여기서 제외    (excel_io.py)
     6. CSV를 [발송정보일괄등록(수정용)]으로 [일괄등록]  (shopmine/upload.py)
        -> 그리드의 '송장번호(수정용)' 컬럼이 채워진다
@@ -43,7 +42,7 @@ import traceback
 from datetime import datetime
 from pathlib import Path
 
-from . import cjonstyle_bridge, result_excel
+from . import result_excel
 from .orchestrator import run as run_orchestrator
 from .shopmine import connect, excel_io, export, grid, tabs, upload
 
@@ -183,7 +182,7 @@ def select_and_export(result: PipelineResult, *, tab="배송중", log=print) -> 
 
 
 def lookup_tracking(result: PipelineResult, *, limit=None, headless=False,
-                    skip_cjonstyle=False, log=print) -> None:
+                    log=print) -> None:
     """5단계: 공급사에서 송장번호를 조회해 업로드용 CSV를 만든다."""
     log("")
     log(f"[5/{STEPS}] 공급사에서 송장번호 조회")
@@ -197,24 +196,6 @@ def lookup_tracking(result: PipelineResult, *, limit=None, headless=False,
     report = run_orchestrator(str(result.export_path), str(result.csv_path),
                               limit=limit, headless=headless,
                               on_progress=on_progress)
-
-    # CJ온스타일은 Playwright 로그인이 막혀 있어 orchestrator가 전부 스킵한다.
-    # 실제 크롬 브라우저로 따로 조회해서 합친다. (--limit 로 소량만 볼 때는
-    # 이 느린 경로를 타지 않는다.)
-    if not skip_cjonstyle and limit is None:
-        # CJ온스타일은 병렬로 돌아서 주문 순서가 아니라 끝난 순서로 센다.
-        def cj_progress(done, total, order_id, retry):
-            head = "재시도" if retry else "CJ온스타일"
-            log(f"  [{head}] ({done}/{total}) {order_id} 조회 완료")
-
-        try:
-            added = cjonstyle_bridge.process_orders(
-                report, str(result.export_path), str(result.csv_path), log=log,
-                on_progress=cj_progress)
-            if added:
-                log(f"  CJ온스타일 {added}건 추가됨")
-        except Exception as e:  # noqa: BLE001
-            log(f"  CJ온스타일 처리 건너뜀: {e}")
 
     result.lookup_counts = report.summary()
     result.lookup_entries = list(report.entries)
@@ -360,7 +341,7 @@ def restore_shopmine(result: PipelineResult, *, stop_before_apply=False,
 
 
 def run_full(*, limit=None, max_apply=100, tab="배송중", stop_before_apply=False,
-             headless=False, skip_cjonstyle=False, log=print) -> PipelineResult:
+             headless=False, log=print) -> PipelineResult:
     """1~8단계 전체.
 
     어디서 어떻게 멈추든 결과를 들고 돌아온다. 반영 단계에서 멈추든 예상 못 한
@@ -377,8 +358,7 @@ def run_full(*, limit=None, max_apply=100, tab="배송중", stop_before_apply=Fa
             return result
         if not select_and_export(result, tab=tab, log=log):
             return result
-        lookup_tracking(result, limit=limit, headless=headless,
-                        skip_cjonstyle=skip_cjonstyle, log=log)
+        lookup_tracking(result, limit=limit, headless=headless, log=log)
         _apply_after_lookup(result, max_apply=max_apply,
                             stop_before_apply=stop_before_apply, log=log)
     except Exception as e:  # noqa: BLE001 - 조회 결과를 잃지 않는 것이 우선

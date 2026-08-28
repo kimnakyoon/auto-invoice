@@ -3,11 +3,10 @@
 실행:
     python scripts/test_cjonstyle_adapter.py
 
-최초 실행 시 브라우저 창이 뜨면 직접 CJ온스타일에 로그인하세요(아이디는 자동
-입력됨 - CJONSTYLE_ID). 비밀번호 입력과 "사람인지 확인" 체크박스, 로그인
-버튼 클릭은 Cloudflare 봇 차단 때문에 직접 해야 합니다. 로그인이 완료되면
-자동으로 감지해서 이어서 진행합니다. 로그인 세션은 auth/cjonstyle_state.json
-에 저장되어 다음 실행부터는 다시 로그인하지 않아도 됩니다.
+세션이 없거나 만료됐으면 .env의 CJONSTYLE_ID/CJONSTYLE_PW로 사람 개입 없이
+자동 로그인한다(그동안만 크롬 창이 잠깐 뜬다 - suppliers/cjonstyle.py 참고).
+로그인 세션은 auth/cjonstyle_state.json에 저장되어 다음 실행부터는 다시
+로그인하지 않는다. 로그인만 따로 확인하려면 test_cjonstyle_login.py를 쓴다.
 """
 
 import sys

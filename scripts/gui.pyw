@@ -20,7 +20,7 @@ if sys.platform == "win32" and sys.stdout is not None:
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
 
-from auto_invoice import cjonstyle_bridge, pipeline, result_excel  # noqa: E402
+from auto_invoice import pipeline, result_excel  # noqa: E402
 from auto_invoice.orchestrator import run as run_orchestrator  # noqa: E402
 
 DESKTOP = Path.home() / "Desktop"
@@ -218,7 +218,6 @@ class App:
             report = run_orchestrator(
                 str(self.selected_file), str(output_path), headless=False, on_progress=on_progress
             )
-            self._process_cjonstyle_orders(report, output_path)
             counts = report.summary()
             failure_lines = report.failure_lines()
             attention_blocks = report.attention_blocks()
@@ -235,25 +234,6 @@ class App:
                 ("done", (counts, failure_lines, attention_blocks, output_path, excel_path)))
         except Exception as e:  # noqa: BLE001
             self._queue.put(("error", str(e)))
-
-    def _process_cjonstyle_orders(self, report, output_path: Path) -> None:
-        """CJ온스타일 주문을 실제 크롬 브라우저로 조회해 결과에 반영한다.
-
-        실제 처리는 cjonstyle_bridge.process_orders 가 하고(run_all.py 도 같은
-        함수를 쓴다), 여기서는 로그를 창에 흘려보내기만 한다."""
-
-        # 병렬로 돌아서 주문 순서가 아니라 끝난 순서로 센다.
-        def on_progress(done: int, total: int, order_id: str, retry: bool) -> None:
-            head = "재시도" if retry else "CJ온스타일"
-            self._queue.put(("log", f"[{head}] ({done}/{total}) {order_id} 조회 완료"))
-
-        cjonstyle_bridge.process_orders(
-            report,
-            str(self.selected_file),
-            str(output_path),
-            log=lambda msg: self._queue.put(("log", msg)),
-            on_progress=on_progress,
-        )
 
     def _poll_queue(self) -> None:
         try:
