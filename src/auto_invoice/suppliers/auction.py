@@ -79,7 +79,7 @@ from dotenv import load_dotenv
 from playwright.sync_api import BrowserContext, Page
 
 from ..models import TrackingResult
-from .base import BlockedError, ParseError, TrackingNotAvailableYet
+from .base import BlockedError, ParseError, TrackingNotAvailableYet, raise_if_cancelled
 
 load_dotenv()
 
@@ -656,6 +656,8 @@ def get_tracking(
     if order_no is None:
         order = _find_order(context, order_option, recipient_name)
         if not order.has_tracking:
+            # 주문상태를 정확히 읽을 수 있으니 취소/품절 판정을 먼저 한다.
+            raise_if_cancelled(order.status, order.order_no)
             if any(pattern in order.status for pattern in NOT_YET_STATUSES):
                 raise TrackingNotAvailableYet(
                     f"아직 발송 전입니다 (주문번호={order.order_no}, 주문상태={order.status})."

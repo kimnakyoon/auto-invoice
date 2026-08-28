@@ -46,6 +46,49 @@ class BlockedError(AdapterError):
     """봇 차단(Imperva 등) 또는 로그인이 필요한 상태가 감지됨."""
 
 
+class OrderCancelled(AdapterError):
+    """취소되었거나 품절이라 송장번호가 나올 수 없는 주문.
+
+    TrackingNotAvailableYet("아직 미발급")과 반드시 구분해야 한다 - 저쪽은
+    기다리면 해결되지만 이쪽은 아무리 기다려도 송장이 안 나와서, 섞어두면
+    같은 주문이 매 실행마다 조용히 스킵되며 영영 남는다. 따로 모아서 사람이
+    샵마인에서 직접 처리하도록 안내한다.
+    """
+
+
+# 사용자가 지정한 판별 단어. 화면(또는 주문상태) 텍스트에 이 중 하나라도
+# 있으면 취소/품절 주문으로 본다.
+CANCELLED_KEYWORDS = ("취소", "품절")
+
+
+def find_cancelled_keyword(text: str | None) -> str | None:
+    for keyword in CANCELLED_KEYWORDS:
+        if keyword in (text or ""):
+            return keyword
+    return None
+
+
+def raise_if_cancelled(text: str | None, order_no: str) -> None:
+    """취소/품절 표시가 있으면 OrderCancelled를 던진다.
+
+    주의: 주문상태 필드가 아니라 **화면 전체 텍스트**를 넘기면 "주문취소"
+    버튼 이름 같은 것에도 걸린다. 그래서 호출 규칙을 둘로 정해뒀다:
+
+      - 주문상태 문자열을 정확히 읽을 수 있는 공급사(옥션/GS샵/무신사)는
+        그 상태값만 넘기고, NOT_YET 판정보다 **먼저** 부른다.
+      - 화면 전체 텍스트밖에 없는 공급사는 NOT_YET 판정 **뒤에**, 즉 송장도
+        못 찾고 진행중 상태 문구도 없는 실패 경로에서만 부른다. 여기까지 온
+        주문은 어차피 사람이 봐야 하는 건이라, 사유가 "파싱 실패" 대신
+        "취소/품절 의심"으로 조금 넓게 잡혀도 손해가 없다.
+    """
+    keyword = find_cancelled_keyword(text)
+    if keyword:
+        raise OrderCancelled(
+            f"주문 화면에 '{keyword}' 표시가 있습니다 (주문번호={order_no}) - "
+            "취소/품절 주문인지 확인해주세요."
+        )
+
+
 class SupplierAdapter(Protocol):
     """각 공급사 모듈이 구현해야 하는 형태.
 

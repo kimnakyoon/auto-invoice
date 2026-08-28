@@ -41,7 +41,7 @@ from playwright.sync_api import BrowserContext
 
 from .. import browser as browser_mod
 from ..models import TrackingResult
-from .base import BlockedError, OrderNotFound, ParseError, TrackingNotAvailableYet, normalize_option
+from .base import BlockedError, OrderNotFound, ParseError, TrackingNotAvailableYet, normalize_option, raise_if_cancelled
 
 load_dotenv()
 
@@ -62,7 +62,10 @@ LOGIN_WAIT_TIMEOUT_MS = 5 * 60 * 1000  # 로그인 대기 최대 5분
 TRACK_BUTTON_TEXT = "배송조회"
 
 COURIER_TRACKING_PATTERN = re.compile(r"([가-힣A-Za-z0-9()]{2,20})\n송장번호\n([0-9][0-9\-]{5,})")
-NOT_YET_PATTERNS = ["상품준비중", "결제완료", "배송준비중", "발송준비", "취소"]
+# "취소"는 여기 있었지만 뺐다 - 취소된 주문은 기다려도 송장이 안 나와서
+# '아직 미발급'으로 묶어두면 매 실행마다 조용히 스킵되며 영영 남는다.
+# 이제 raise_if_cancelled가 취소/품절로 따로 분류해 결과 정리에 올린다.
+NOT_YET_PATTERNS = ["상품준비중", "결제완료", "배송준비중", "발송준비"]
 
 # CJ대한통운/롯데택배는 화면 표기가 정식 명칭과 달라서(예: "대한통운") 업로드
 # 파일에는 정식 명칭으로 맞춰 넣는다 (지마켓/SSG 어댑터와 동일한 규칙).
@@ -202,6 +205,7 @@ def _scrape_tracking_from_page(page, order_no: str, order_option: str | None = N
         body_text = page.inner_text("body")
         if any(p in body_text for p in NOT_YET_PATTERNS):
             raise TrackingNotAvailableYet(f"아직 송장번호가 발급되지 않았습니다 (주문번호={order_no}).")
+        raise_if_cancelled(body_text, order_no)
         raise ParseError(f"배송조회 버튼을 찾지 못했습니다 (주문번호={order_no}).")
 
     try:
@@ -215,6 +219,7 @@ def _scrape_tracking_from_page(page, order_no: str, order_option: str | None = N
     if not matches:
         if any(p in body_text for p in NOT_YET_PATTERNS):
             raise TrackingNotAvailableYet(f"아직 송장번호가 발급되지 않았습니다 (주문번호={order_no}).")
+        raise_if_cancelled(body_text, order_no)
         raise ParseError(f"화면에서 송장번호 텍스트를 찾지 못했습니다 (주문번호={order_no}).")
 
     distinct_tracking_nos = {re.sub(r"[^0-9]", "", m.group(2)) for m in matches}

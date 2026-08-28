@@ -45,7 +45,7 @@ from dotenv import load_dotenv
 from playwright.sync_api import BrowserContext, Page
 
 from ..models import TrackingResult
-from .base import BlockedError, ParseError, TrackingNotAvailableYet, normalize_option
+from .base import BlockedError, ParseError, TrackingNotAvailableYet, normalize_option, raise_if_cancelled
 
 load_dotenv()
 
@@ -283,6 +283,7 @@ def _scrape_tracking_from_page(
         normalized_area = normalize_option(area_text)
         if any(normalize_option(p) in normalized_area for p in NOT_YET_PATTERNS):
             raise TrackingNotAvailableYet(f"아직 송장번호가 발급되지 않았습니다 (주문번호={order_no}).")
+        raise_if_cancelled(area_text, order_no)
         raise ParseError(f"화면에서 배송조회 링크를 찾지 못했습니다 (주문번호={order_no}).")
 
     if len(candidates) == 1:

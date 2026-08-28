@@ -209,8 +209,9 @@ class App:
             self._process_cjonstyle_orders(report, output_path)
             counts = report.summary()
             failure_lines = report.failure_lines()
+            attention_blocks = report.attention_blocks()
             report.save()
-            self._queue.put(("done", (counts, failure_lines, output_path)))
+            self._queue.put(("done", (counts, failure_lines, attention_blocks, output_path)))
         except Exception as e:  # noqa: BLE001
             self._queue.put(("error", str(e)))
 
@@ -233,11 +234,16 @@ class App:
                 if kind == "log":
                     self._log(payload)
                 elif kind == "done":
-                    counts, failure_lines, output_path = payload
+                    counts, failure_lines, attention_blocks, output_path = payload
                     self._log(f"\n완료: 성공 {counts['success']} / 실패 {counts['fail']} / 스킵 {counts['skip']}")
                     if failure_lines:
                         self._log("\n실패한 주문 (샵마인에서 직접 확인해주세요):")
                         for line in failure_lines:
+                            self._log(line)
+                    # 조회 자체를 못 한 주문(아직 지원하지 않는 사이트, 취소/품절)
+                    for title, lines in attention_blocks:
+                        self._log(f"\n{title}:")
+                        for line in lines:
                             self._log(line)
                     if counts["success"] > 0:
                         self._output_path = output_path

@@ -66,7 +66,7 @@ _SCHEMA = {
                 "type": "object",
                 "properties": {
                     "order_id": {"type": "string"},
-                    "status": {"type": "string", "enum": ["success", "not_yet", "fail"]},
+                    "status": {"type": "string", "enum": ["success", "not_yet", "cancelled", "fail"]},
                     "tracking_no": {"type": "string"},
                     "courier": {"type": "string"},
                     "reason": {"type": "string"},
@@ -90,6 +90,7 @@ _PROMPT_TEMPLATE = """너는 CJ온스타일(base.cjonstyle.com) 주문의 배송
 1. browser_batch 한 번으로 [navigate(product_url), computer(wait 1.5초), get_page_text]를 순서대로 실행한다.
 2. 그 결과에서 URL이 로그인 페이지이거나 "/p/myzone/" 경로를 벗어나 홈으로 리다이렉트됐으면 status="fail", reason="로그인 필요"로 기록하고 다음 주문으로 넘어간다.
 3. "배송조회" 버튼이 없고 "상품준비중"/"배송준비중"/"결제완료"/"주문접수" 같은 문구가 있으면 status="not_yet"으로 기록하고 다음 주문으로 넘어간다.
+3-1. "배송조회" 버튼이 없고 주문상태에 "취소" 또는 "품절"이 있으면 status="cancelled", reason에 그 상태 문구를 그대로 넣고 다음 주문으로 넘어간다. 주의: 화면 어딘가에 있는 "주문취소" 같은 버튼 이름이 아니라, 이 주문의 상태 표시일 때만 그렇게 판단해라.
 4. "배송조회" 버튼이 있으면(여러 개면 order_option과 가장 관련있는 상품 옆의 것을 find로 찾아서) browser_batch 한 번으로 [computer(click), computer(wait 1.5초), get_page_text]를 순서대로 실행한다. 클릭하면 같은 탭에서 deliveryTracking/sheet 페이지로 이동한다.
 5. 그 get_page_text 결과에서 "송장번호" 다음 줄의 숫자, "택배업체" 다음 줄의 첫 단어(택배사명)를 읽는다.
 6. 택배사명 정규화: "대한통운" 또는 "CJ"가 포함되면 "CJ대한통운", "롯데"가 포함되면 "롯데택배", "DELIBOX"가 포함되면 "딜리박스"로 바꾼다. 매칭 안되면 원문 그대로 쓴다.
@@ -103,7 +104,7 @@ _PROMPT_TEMPLATE = """너는 CJ온스타일(base.cjonstyle.com) 주문의 배송
 @dataclass
 class CjonstyleLookupResult:
     order_id: str
-    status: str  # "success" | "not_yet" | "fail"
+    status: str  # "success" | "not_yet" | "cancelled" | "fail"
     tracking_no: str | None = None
     courier: str | None = None
     reason: str | None = None
@@ -246,6 +247,13 @@ def process_orders(report, input_path: str, output_path: str, log=print) -> int:
         elif r.status == "not_yet":
             report.skip(r.order_id, r.reason or "아직 송장번호 미발급")
             log(f"  {r.order_id}: 아직 송장번호 미발급 - 건너뜀")
+        elif r.status == "cancelled":
+            # 기다려도 송장이 안 나오는 주문이라 일반 스킵과 분리한다
+            # (suppliers/base.py의 OrderCancelled와 같은 취급).
+            reason = f"주문 화면에 취소/품절 표시가 있습니다: {r.reason or '(문구 없음)'}"
+            report.cancelled(r.order_id, reason,
+                             recipient_name=recipient_by_id.get(r.order_id))
+            log(f"  {r.order_id}: 취소/품절로 보임 - 건너뜀")
         else:
             reason = r.reason or "알 수 없는 오류"
             report.fail(r.order_id, reason, recipient_name=recipient_by_id.get(r.order_id))

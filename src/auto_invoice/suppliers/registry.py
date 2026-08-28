@@ -40,6 +40,11 @@ from . import (
 
 _ADAPTERS: dict[str, object] = {}
 
+# 어댑터는 없지만 '아직 지원하지 않는 사이트'는 아닌 도메인. cjonstyle_bridge가
+# 실제 크롬으로 따로 조회하므로(위 설명 참고), 결과 정리에서 "직접 조회해주세요"
+# 목록에 올리면 안 된다.
+HANDLED_ELSEWHERE_DOMAINS = {"base.cjonstyle.com"}
+
 
 def register(adapter_module) -> None:
     for domain in adapter_module.DOMAINS:
@@ -65,8 +70,15 @@ register(auction)
 # register(newsupplier)
 
 
-def get_adapter(product_url: str):
+def _domain_of(product_url: str) -> str:
     netloc = urlparse(product_url).netloc.lower()
-    if netloc.startswith("www."):
-        netloc = netloc[4:]
-    return _ADAPTERS.get(netloc)
+    return netloc[4:] if netloc.startswith("www.") else netloc
+
+
+def get_adapter(product_url: str):
+    return _ADAPTERS.get(_domain_of(product_url))
+
+
+def is_handled_elsewhere(product_url: str) -> bool:
+    """어댑터는 없지만 다른 경로로 조회되는 사이트인지 (HANDLED_ELSEWHERE_DOMAINS)."""
+    return _domain_of(product_url) in HANDLED_ELSEWHERE_DOMAINS

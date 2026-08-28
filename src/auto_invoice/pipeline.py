@@ -52,6 +52,10 @@ class PipelineResult:
         self.applied_count: int = 0     # [송장번호수정]으로 반영한 건수
         self.apply_status: str = ""     # '오류없음.' 등 결과 창 문구
         self.stopped_reason: str | None = None
+        # 자동으로 처리하지 못해 사람이 직접 손봐야 하는 주문들 - (제목, 줄
+        # 목록) 묶음. 3단계 로그에 한 번 나오지만 로그가 길어 묻히기 쉬워서,
+        # 마지막 요약에 다시 붙이려고 들고 있는다 (report.attention_blocks).
+        self.attention_blocks: list[tuple[str, list[str]]] = []
 
     @property
     def applied(self) -> bool:
@@ -131,10 +135,15 @@ def lookup_tracking(result: PipelineResult, *, limit=None, headless=False,
             log(f"  CJ온스타일 처리 건너뜀: {e}")
 
     result.lookup_counts = report.summary()
+    result.attention_blocks = report.attention_blocks()
     log(f"  성공 {result.lookup_counts['success']} / "
         f"실패 {result.lookup_counts['fail']} / 스킵 {result.lookup_counts['skip']}")
     for line in report.failure_lines():
         log(f"  {line}")
+    for title, lines in result.attention_blocks:
+        log(f"  [{title}]")
+        for line in lines:
+            log(f"  {line}")
     log(f"  상세 리포트: {report.save()}")
 
 
@@ -258,7 +267,26 @@ def run_from_csv(csv_path, *, max_apply=100, stop_before_apply=False,
 
 
 def summarize(result: PipelineResult) -> str:
-    """실행 결과를 사람이 읽을 한 덩어리 요약으로."""
+    """실행 결과를 사람이 읽을 한 덩어리 요약으로.
+
+    자동으로 처리하지 못해 사람이 직접 손봐야 하는 주문(아직 지원하지 않는
+    사이트, 취소/품절)은 3단계 로그에 이미 한 번 나오지만 그 위로 로그가 길게
+    쌓여 묻히기 쉬워서, 맨 마지막 요약에 수령인 이름과 함께 다시 붙인다.
+    """
+    return "\n".join([_apply_summary(result), *_attention_summary(result)])
+
+
+def _attention_summary(result: PipelineResult) -> list[str]:
+    lines: list[str] = []
+    for title, entries in result.attention_blocks:
+        lines.append("")
+        lines.append(f"[{title}] {len(entries)}건")
+        lines.extend(entries)
+    return lines
+
+
+def _apply_summary(result: PipelineResult) -> str:
+    """샵마인 반영 결과 한 줄."""
     if result.stopped_reason and not result.applied:
         return f"중단됨: {result.stopped_reason}"
     if not result.applied:

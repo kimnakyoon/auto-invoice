@@ -39,7 +39,7 @@ from dotenv import load_dotenv
 from playwright.sync_api import BrowserContext
 
 from ..models import TrackingResult
-from .base import BlockedError, ParseError, TrackingNotAvailableYet, normalize_option
+from .base import BlockedError, ParseError, TrackingNotAvailableYet, normalize_option, raise_if_cancelled
 
 load_dotenv()
 
@@ -177,6 +177,8 @@ def _select_item(entry: dict, ord_no: str, order_option: str | None) -> dict:
     shipped = [it for it in items if it.get("invNo") and it.get("hopeDlvYn") != "E"]
     if not shipped:
         status_text = items[0].get("ordItemStExposNm", "알 수 없음")
+        # 주문상태를 정확히 읽을 수 있으니 취소/품절 판정을 먼저 한다.
+        raise_if_cancelled(status_text, ord_no)
         raise TrackingNotAvailableYet(f"아직 송장번호가 발급되지 않았습니다 (주문번호={ord_no}, 상태={status_text}).")
 
     matched = _find_item_by_order_option(shipped, order_option)

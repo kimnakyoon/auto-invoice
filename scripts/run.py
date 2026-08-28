@@ -44,6 +44,12 @@ def main() -> None:
         print("\n실패한 주문 (샵마인에서 직접 확인해주세요):")
         for line in failure_lines:
             print(line)
+    # 조회 자체를 못 한 주문(아직 지원하지 않는 사이트, 취소/품절)은 실패와
+    # 성격이 달라 따로 묶어 보여준다 - 사람이 직접 처리해야 하는 목록이다.
+    for title, lines in report.attention_blocks():
+        print(f"\n{title}:")
+        for line in lines:
+            print(line)
     report_path = report.save()
     print(f"상세 리포트: {report_path}")
     if counts["success"] > 0:
