@@ -67,7 +67,7 @@ class OrderCancelled(AdapterError):
 
 # 사용자가 지정한 판별 단어. 화면(또는 주문상태) 텍스트에 이 중 하나라도
 # 있으면 취소/품절 주문으로 본다.
-CANCELLED_KEYWORDS = ("취소", "품절")
+CANCELLED_KEYWORDS = ("취소", "품절", "불가")
 
 
 def find_cancelled_keyword(text: str | None) -> str | None:
