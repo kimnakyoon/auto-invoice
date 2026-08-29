@@ -118,6 +118,48 @@ def _click_control(hwnd, owner, label):
     winui.press_button(hwnd)
 
 
+def _toolbar_click(main_hwnd, rel, label, until, *, attempts=3, timeout=8.0,
+                   log=print):
+    """툴바 버튼을 누르고 **실제로 반응했는지**까지 확인한다. 반응이 없으면 다시 누른다.
+
+    툴바(ToolStrip) 버튼은 좌표 클릭이 조용히 무시될 때가 있다. 창이 활성
+    상태가 아니면 WinForms 가 첫 클릭을 '창 활성화'로 삼켜버리고, 마우스가
+    들어온 것을 아직 인식하지 못했어도 그냥 버린다. 실패 신호가 전혀 없어서
+    '눌렀는가'로는 판정할 수 없고 '반응했는가'로 봐야 한다.
+
+    2026-08-29 에 [송장번호수정]과 [송장수정모드 끄기]가 연달아 이렇게 무시돼
+    파이프라인이 멈췄다. 그때 그리드 읽기와 [전체선택](HWND 메시지)은 멀쩡히
+    동작했다 - 좌표 클릭만 골라서 먹지 않았다. 그래서 좌표를 쓰는 툴바 버튼은
+    전부 이 헬퍼를 거친다.
+
+    until: 반응을 확인하는 함수. 반응했으면 참인 값(창 정보 등)을 돌려준다.
+    반환: (until 이 돌려준 값 또는 None, 사람에게 보여줄 메시지)
+    """
+    last = ""
+    for attempt in range(1, attempts + 1):
+        if not winui.bring_to_front(main_hwnd):
+            last = (f"[{label}] 샵마인 창을 앞으로 가져오지 못했습니다 - "
+                    "다른 창(브라우저 등)이 앞을 막고 있습니다.")
+        else:
+            time.sleep(0.5)
+            ok, msg = winui.safe_click(main_hwnd, rel, label=label)
+            if ok:
+                end = time.time() + timeout
+                while time.time() < end:
+                    got = until()
+                    if got:
+                        return got, msg
+                    time.sleep(0.25)
+                last = (f"{msg} - 그런데 {timeout:.0f}초 동안 아무 반응이 없습니다 "
+                        "(툴바가 클릭을 받지 않았습니다)")
+            else:
+                last = msg
+        if attempt < attempts:
+            log(f"  {last} - 다시 누릅니다 ({attempt}/{attempts})")
+            time.sleep(1.0)
+    return None, last
+
+
 def _close_window(title, log=print):
     for h, _t, _r in winui.find_windows(title_equals=title):
         btn = winui.find_child(h, "BUTTON",
@@ -145,15 +187,15 @@ def edit_mode_on(main_hwnd=None) -> bool:
         main_hwnd, "EDIT", lambda k: _near(k, base, BULK_INPUT_EDIT_HINT)) is not None
 
 
-def _toggle_edit_mode(main_hwnd, label):
-    if not winui.bring_to_front(main_hwnd):
-        raise UploadError("샵마인 창을 앞으로 가져오지 못했습니다.")
-    time.sleep(0.5)
-    ok, msg = winui.safe_click(main_hwnd, REL_EDIT_MODE_TOGGLE, label=label)
-    if not ok:
-        raise UploadError(msg)
-    time.sleep(2.0)
-    return msg
+def _toggle_edit_mode(main_hwnd, label, want_on: bool, log=print):
+    """[송장수정모드 켜기/끄기]를 누르고 모드가 실제로 바뀔 때까지 확인한다.
+
+    예전에는 누른 뒤 2초를 세고 한 번만 확인했다. 실측하면 0.9초면 바뀌지만,
+    클릭이 무시되면 2초를 기다려봐야 소용이 없다. 고정 대기 대신 폴링하고,
+    반응이 없으면 다시 누른다(_toolbar_click).
+    """
+    return _toolbar_click(main_hwnd, REL_EDIT_MODE_TOGGLE, label,
+                          lambda: edit_mode_on(main_hwnd) == want_on, log=log)
 
 
 def ensure_edit_mode(log=print) -> None:
@@ -162,11 +204,12 @@ def ensure_edit_mode(log=print) -> None:
     if edit_mode_on(main):
         log("  송장수정모드: 이미 켜져 있음")
         return
-    log(f"  {_toggle_edit_mode(main, '송장수정모드 켜기')}")
-    if not edit_mode_on(main):
+    ok, msg = _toggle_edit_mode(main, "송장수정모드 켜기", True, log=log)
+    if not ok:
         raise UploadError(
-            "[송장수정모드 켜기]를 눌렀는데 모드가 켜지지 않았습니다. "
+            f"[송장수정모드 켜기]를 눌렀는데 모드가 켜지지 않았습니다 ({msg}). "
             "배송중 탭이 아니거나 화면 상태가 다를 수 있습니다.")
+    log(f"  {msg}")
     log("  송장수정모드 켜짐 확인")
 
 
@@ -176,9 +219,10 @@ def disable_edit_mode(log=print) -> None:
     if not edit_mode_on(main):
         log("  송장수정모드: 이미 꺼져 있음")
         return
-    log(f"  {_toggle_edit_mode(main, '송장수정모드 끄기')}")
-    if edit_mode_on(main):
-        raise UploadError("[송장수정모드 끄기]를 눌렀는데 모드가 꺼지지 않았습니다.")
+    ok, msg = _toggle_edit_mode(main, "송장수정모드 끄기", False, log=log)
+    if not ok:
+        raise UploadError(f"[송장수정모드 끄기]를 눌렀는데 모드가 꺼지지 않았습니다 ({msg}).")
+    log(f"  {msg}")
     log("  송장수정모드 꺼짐 확인")
 
 
@@ -436,6 +480,12 @@ def select_registered_rows(log=print) -> int:
     return total
 
 
+def _confirm_dialog():
+    """지금 떠 있는 [송장번호수정] 확인 대화상자 (없으면 None)."""
+    found = winui.find_windows(title_equals=CONFIRM_WINDOW)
+    return found[0] if found else None
+
+
 def apply_tracking(expected_count: int, log=print, close_result: bool = True) -> str:
     """체크해둔 행을 [송장번호수정]으로 쇼핑몰까지 반영한다.
 
@@ -444,19 +494,17 @@ def apply_tracking(expected_count: int, log=print, close_result: bool = True) ->
     마지막이자 가장 중요한 안전장치다.
     """
     main = main_window()
-    winui.bring_to_front(main)
-    time.sleep(0.5)
 
-    ok, msg = winui.safe_click(main, REL_APPLY_BUTTON, label="송장번호수정")
+    # 확인 대화상자가 뜨는 것이 곧 '클릭이 먹었다'는 신호다. 안 뜨면 다시 누른다.
+    # 이미 떠 있으면 그 창이 모달이라 다음 클릭은 어차피 무시되므로, 눌러서
+    # 두 번 반영될 걱정은 없다.
+    dlg, msg = _toolbar_click(main, REL_APPLY_BUTTON, "송장번호수정",
+                              _confirm_dialog, log=log)
     log(f"  {msg}")
-    if not ok:
-        raise UploadError(msg)
-
-    dlg = winui.wait_for_window(title_equals=CONFIRM_WINDOW, timeout=15.0)
     if dlg is None:
         raise UploadError(
             "[송장번호수정] 확인 대화상자가 뜨지 않았습니다. "
-            "선택된 행이 없거나 화면이 갱신 중일 수 있습니다.")
+            f"선택된 행이 없거나 화면이 갱신 중일 수 있습니다 ({msg}).")
     confirm_hwnd = dlg[0]
 
     message = ""
