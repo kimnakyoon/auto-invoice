@@ -106,10 +106,7 @@ def extract_order_no(product_url: str) -> str:
 
 
 def _looks_like_login_page(page: Page) -> bool:
-    page.wait_for_timeout(1500)
-    if "login" not in page.url.lower():
-        return False
-    return page.locator("input[type='password']").count() > 0
+    return common.looks_like_login_page(page, lambda url: "login" in url.lower())
 
 
 def _prefill_login_id(page: Page) -> None:
@@ -199,6 +196,9 @@ def _auto_login(context: BrowserContext) -> bool:
 
         elapsed_ms = 0
         while elapsed_ms < AUTO_LOGIN_WAIT_TIMEOUT_MS:
+            # 로그인이 끝나기를 기다리는 쉼 - 예전에는 _looks_like_login_page가
+            # 매번 자면서 이 역할까지 겸했다(common.looks_like_login_page 주석).
+            page.wait_for_timeout(1500)
             if not _looks_like_login_page(page):
                 context.add_cookies(login_context.cookies())
                 common.safe_print("[hmall] 자동 로그인에 성공했습니다.")
@@ -210,7 +210,7 @@ def _auto_login(context: BrowserContext) -> bool:
                     "- 직접 로그인으로 넘어갑니다."
                 )
                 return False
-            elapsed_ms += 1500  # _looks_like_login_page 내부에서 1500ms 대기함
+            elapsed_ms += 1500
 
         common.safe_print("[hmall] 자동 로그인 결과를 30초 안에 확인하지 못했습니다 - 직접 로그인으로 넘어갑니다.")
         return False
@@ -350,6 +350,8 @@ def get_tracking(
                 if _looks_like_login_page(page):
                     raise BlockedError("로그인 후에도 여전히 로그인 페이지입니다.")
 
+        # 주문상세는 자바스크립트로 그려진다 - 주문번호가 화면에 뜨면 다 그려진 것이다.
+        common.wait_for_text(page, order_no)
         # 주문상세 화면을 떠나기 전에 주문일부터 읽어둔다 (오래된 주문을 결과에 따로 모으는 데 쓴다).
         return with_order_date(page, lambda: _scrape_tracking_from_page(page, product_url, order_no, order_option))
     finally:

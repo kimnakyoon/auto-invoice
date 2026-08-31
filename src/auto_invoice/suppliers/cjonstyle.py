@@ -130,10 +130,11 @@ def extract_order_no(product_url: str) -> str:
 
 
 def _looks_like_login_page(page: Page) -> bool:
-    page.wait_for_timeout(1500)
-    if LOGIN_PATH not in urlparse(page.url).path:
-        return False
-    return page.locator("input[type='password']").count() > 0
+    # 이 사이트는 자바스크립트로 화면을 넘긴다(실측: goto 직후에는 아직 주문상세
+    # 주소) - 그래서 주소가 바뀌는지 잠깐 지켜본다.
+    return common.looks_like_login_page(
+        page, lambda url: LOGIN_PATH in urlparse(url).path,
+        settle_ms=common.LOGIN_REDIRECT_SETTLE_MS)
 
 
 def _looks_authenticated(page: Page) -> bool:
@@ -246,6 +247,9 @@ def _auto_login(context: BrowserContext) -> bool:
 
             elapsed_ms = 0
             while elapsed_ms < AUTO_LOGIN_WAIT_TIMEOUT_MS:
+                # 로그인이 끝나기를 기다리는 쉼 - 예전에는 _looks_like_login_page가
+                # 매번 자면서 이 역할까지 겸했다(common.looks_like_login_page 주석).
+                page.wait_for_timeout(1500)
                 if not _looks_like_login_page(page):
                     context.add_cookies(login_context.cookies())
                     common.safe_print("[cjonstyle] 자동 로그인에 성공했습니다.")
@@ -258,7 +262,7 @@ def _auto_login(context: BrowserContext) -> bool:
                 if message:
                     common.safe_print(f"[cjonstyle] 사이트가 로그인을 거부했습니다: {message}")
                     return False
-                elapsed_ms += 1500  # _looks_like_login_page 내부에서 1500ms 대기함
+                elapsed_ms += 1500
 
             common.safe_print("[cjonstyle] 자동 로그인 결과를 30초 안에 확인하지 못했습니다 - 직접 로그인으로 넘어갑니다.")
             return False

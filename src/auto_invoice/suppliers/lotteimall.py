@@ -7,6 +7,10 @@
   정상적으로 주문상세 페이지가 뜨는 것을 확인했다.)
 - 로그인이 안 되어 있으면 https://www.lotteimall.com/member/login/forward.LCLoginMem.lotte
   로 리다이렉트된다. 로그인 폼 셀렉터: 아이디 "#login_id", 비밀번호 "#password".
+  다만 **세션이 만료된 뒤에는 로그인 페이지가 아니라 메인 화면(/main/viewMain)으로
+  튕긴다**(2026-08-31 실측 - 주문상세도, 마이페이지 주문목록도 그렇다). 그래서
+  로그인 판정에 그 주소도 같이 본다. 예전에는 이걸 몰라서 세션이 끊긴 실행에서
+  롯데아이몰 주문이 전부 '배송추적 링크를 찾지 못했습니다' 실패로 쌓였다.
 - LOTTEIMALL_ID/LOTTEIMALL_PW 환경변수가 있으면 세션 만료 시 사람 개입 없이 완전
   자동으로 재로그인한다(롯데온/SSG/패션플러스와 동일한 방식). 로그인 페이지를
   실측해 확인한 것(2026-08-28):
@@ -57,6 +61,12 @@ from .base import (
 
 load_dotenv()
 
+# 세션이 끊기면 로그인 페이지가 아니라 **로그아웃 주소를 거쳐 메인 화면으로**
+# 튕긴다 (2026-08-31 실측: 주문상세 -> /member/goLogout.lotte -> /main/viewMain).
+LOGIN_PATH_MARKER = "/member/login"
+LOGGED_OUT_MARKER = "/member/goLogout"
+MAIN_PAGE_MARKER = "/main/viewMain"
+
 LOGIN_ID_SELECTOR = "#login_id"
 LOGIN_PW_SELECTOR = "#password"
 # "비회원 주문/조회" 탭에도 같은 클래스의 버튼이 있고 그쪽은 숨겨져 있다 - :visible 필수.
@@ -88,11 +98,25 @@ def extract_order_no(product_url: str) -> str:
     return values[0]
 
 
+def _url_needs_login(url: str) -> bool:
+    return (LOGIN_PATH_MARKER in url or LOGGED_OUT_MARKER in url or MAIN_PAGE_MARKER in url)
+
+
 def _looks_like_login_page(page) -> bool:
-    page.wait_for_timeout(1500)
-    if "login" not in page.url.lower():
-        return False
-    return page.locator("input[type='password']").count() > 0
+    """로그인이 필요한 상태인지 본다.
+
+    이 사이트는 세션이 끊기면 로그인 페이지로 가는 게 아니라 **로그아웃 주소를
+    거쳐 메인 화면으로 튕긴다**(2026-08-31 실측 - 주문상세도 마이페이지
+    주문목록도 그렇다). 그걸 로그인 필요로 보지 않으면 주문마다 '배송추적
+    링크를 찾지 못했습니다' 파싱 실패가 쌓이고, 사람은 어댑터가 깨진 줄 알게
+    된다. 실제로 2026-08-31 실행에서 롯데아이몰 주문이 그렇게 처리됐다.
+
+    비밀번호 입력창 존재는 보지 않는다. 로그인 경로가 /member/login 으로 뚜렷해서
+    주소만으로 충분하고, headless에서는 그 페이지가 403 Forbidden으로 와서
+    입력창이 아예 없기 때문이다(입력창을 요구하면 두 번째 주문부터 로그인
+    안내 대신 파싱 실패가 난다 - 2026-08-31 실측).
+    """
+    return common.looks_like_login_page(page, _url_needs_login, needs_password=False)
 
 
 def _prefill_login_id(page) -> None:
@@ -152,6 +176,9 @@ def _auto_login(page) -> bool:
 
         elapsed_ms = 0
         while elapsed_ms < AUTO_LOGIN_WAIT_TIMEOUT_MS:
+            # 로그인이 끝나기를 기다리는 쉼 - 예전에는 _looks_like_login_page가
+            # 매번 자면서 이 역할까지 겸했다(common.looks_like_login_page 주석).
+            page.wait_for_timeout(1500)
             # 로그인 페이지를 벗어났으면 성공이다. alert이 떴더라도 로그인 자체는
             # 된 경우(비밀번호 변경 안내 등)가 있어, 페이지 상태를 alert보다
             # 먼저 본다 (롯데온과 같은 이유).
@@ -159,7 +186,7 @@ def _auto_login(page) -> bool:
                 return True
             if alerts:
                 raise BlockedError(f"롯데아이몰 자동 로그인이 거부됐습니다: {alerts[0].strip()}")
-            elapsed_ms += 1500  # _looks_like_login_page 내부에서 1500ms 대기함
+            elapsed_ms += 1500
 
         if _captcha_visible(page):
             raise BlockedError(

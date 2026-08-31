@@ -78,13 +78,108 @@ def wait_for_manual_login(page, is_login_page: Callable[[], bool],
     """사람이 직접 로그인을 끝낼 때까지 화면 상태를 보며 기다린다.
 
     is_login_page는 각 어댑터의 _looks_like_login_page를 그대로 넘기면 된다.
-    그 함수가 내부에서 poll_ms만큼 대기하기 때문에 여기서 따로 자지 않는다 -
-    poll_ms는 그 대기 시간과 맞춰야 타임아웃이 실제 시간과 어긋나지 않는다.
     """
     show_page_to_human(page)
     elapsed_ms = 0
     while elapsed_ms < timeout_ms:
         if not is_login_page():
             return True
+        page.wait_for_timeout(poll_ms)
         elapsed_ms += poll_ms
+    return False
+
+
+# 로그인 주소가 되기를 기다리는 시간. 자바스크립트로 로그인 화면에 넘기는
+# 사이트(무신사·CJ온스타일·NS홈쇼핑)만 이 값을 준다 - 아래 함수 주석 참고.
+LOGIN_REDIRECT_SETTLE_MS = 1500
+# 로그인 주소는 맞는데 입력창이 아직 안 그려졌을 때 기다리는 시간.
+LOGIN_FORM_SETTLE_MS = 1500
+
+
+def wait_for_url(page, url_matches: Callable[[str], bool], timeout_ms: int,
+                 poll_ms: int = 100) -> bool:
+    """주소가 이렇게 바뀌는지 그동안만 지켜본다 (자바스크립트 리다이렉트용).
+
+    이미 그 주소면 기다리지 않고 바로 True다. timeout_ms=0이면 지금 주소만
+    본다 - 서버가 302로 넘기는 사이트는 goto가 끝난 순간 이미 끝나 있어서
+    기다릴 이유가 없다.
+    """
+    waited_ms = 0
+    while not url_matches(page.url):
+        if waited_ms >= timeout_ms:
+            return False
+        page.wait_for_timeout(poll_ms)
+        waited_ms += poll_ms
+    return True
+
+
+def looks_like_login_page(page, url_is_login: Callable[[str], bool], *,
+                          needs_password: bool = True,
+                          settle_ms: int = 0,
+                          form_wait_ms: int = LOGIN_FORM_SETTLE_MS,
+                          poll_ms: int = 100) -> bool:
+    """지금 보고 있는 화면이 로그인 화면인지 본다 (어댑터 공통).
+
+    예전에는 어느 어댑터든 판정 전에 **무조건 1.5초를 잤다**. 리다이렉트가
+    자리잡을 시간을 주려던 것인데, 주문 하나당 1.5초면 100건에 2분 반이고
+    로그인이 살아 있는 평소 실행에서는 그 시간이 통째로 낭비다(실측: SSF샵
+    주문 하나 1.87초 중 1.50초).
+
+    2026-08-31에 세션 없는 브라우저로 15곳 주문상세를 열어 재보니 12곳은
+    서버가 302로 넘겨서 **goto가 끝난 순간 이미 로그인 주소**였다. 그래서
+    기본값은 기다리지 않는 것으로 두고, 자바스크립트로 뒤늦게 넘기는 사이트만
+    settle_ms를 줘서 그동안 주소가 바뀌는지 지켜본다(바뀌는 순간 바로 끝낸다).
+
+    반대로 '주소는 로그인인데 입력창이 아직 없는' 경우(현대몰·더현대 실측)는
+    form_wait_ms 동안 기다려준다. 예전의 고정 1.5초로는 아슬아슬하게 놓칠 수
+    있었고, 이쪽은 어차피 로그인이 뒤따르는 느린 경로라 조금 기다려도 된다.
+
+    needs_password=False는 로그인 화면에 비밀번호 입력창이 없거나(GSSHOP 팝업)
+    입력 중에 다시 그려져 믿을 수 없는 사이트(네이버·무신사)용이다.
+    """
+    if not wait_for_url(page, url_is_login, settle_ms, poll_ms=poll_ms):
+        return False
+    if not needs_password:
+        return True
+    try:
+        page.wait_for_selector("input[type='password']", state="attached", timeout=form_wait_ms)
+        return True
+    except Exception:  # noqa: BLE001 - 입력창이 끝내 안 뜨면 로그인 화면이 아니라고 본다
+        return False
+
+
+# 주문상세가 그려지기를 기다리는 최대 시간 (자바스크립트로 그리는 사이트용).
+RENDER_WAIT_TIMEOUT_MS = 8 * 1000
+
+
+def wait_for_text(page, needles, timeout_ms: int = RENDER_WAIT_TIMEOUT_MS,
+                  poll_ms: int = 100) -> bool:
+    """화면 글자에 이 말이 나타날 때까지만 기다린다 (주문상세 렌더 대기).
+
+    롯데온·지마켓처럼 자바스크립트로 주문상세를 그리는 사이트는, 예전에는
+    로그인 판정용 고정 대기(1.5초)가 렌더 대기까지 겸하고 있었다. 그 대기를
+    없애면서 '무엇을 기다리는지'를 명시적으로 적는다 - 주문번호처럼 그 주문
+    화면에서만 나오는 말을 넘기면 **다 그려졌다**와 **맞는 주문이다**를 한
+    번에 확인할 수 있고, 고정 1.5초보다 빠르면서(실측 0.3~0.7초) 느린 날에는
+    더 오래 기다려 준다.
+
+    needles는 한 개(문자열)를 넘겨도 되고 여러 개를 넘겨도 된다 - 여러 개면
+    그중 아무거나 먼저 나오는 순간 끝낸다(네이버페이처럼 주문번호를 화면에
+    안 적는 사이트는 '배송조회'나 진행중 상태 문구를 표식으로 쓴다).
+
+    끝내 안 나와도 예외를 내지 않는다(False) - 판단은 호출한 쪽이 한다.
+    """
+    wanted = [needles] if isinstance(needles, str) else [n for n in needles if n]
+    if not wanted:
+        return False
+    waited_ms = 0
+    while waited_ms < timeout_ms:
+        try:
+            text = page.inner_text("body")
+            if any(n in text for n in wanted):
+                return True
+        except Exception:  # noqa: BLE001 - 그리는 중에는 읽기가 실패할 수 있다
+            pass
+        page.wait_for_timeout(poll_ms)
+        waited_ms += poll_ms
     return False

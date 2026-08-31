@@ -208,16 +208,11 @@ def _raise_if_listed_settled(card: dict, od_no: str) -> None:
 
 def _looks_like_login_page(page) -> bool:
     """URL만으로는 오탐이 잦아서(로그인 후에도 잠깐 거치는 리다이렉트 URL에
-    "login"이 들어있는 경우가 있음), 최종적으로 자리잡은 URL + 실제 비밀번호
-    입력창 존재 여부를 함께 본다.
+    "login"이 들어있는 경우가 있음), URL + 실제 비밀번호 입력창 존재 여부를
+    함께 본다. 로그아웃 상태면 서버가 302로 바로 넘기므로 기다리지 않는다
+    (common.looks_like_login_page).
     """
-    # 이 페이지는 백그라운드 통신이 끊이지 않아 networkidle이 끝까지 오지 않는다.
-    # 그냥 잠깐 대기해서 리다이렉트가 자리잡을 시간만 준다.
-    page.wait_for_timeout(1500)
-
-    if "login" not in page.url.lower():
-        return False
-    return page.locator("input[type='password']").count() > 0
+    return common.looks_like_login_page(page, lambda url: "login" in url.lower())
 
 
 def _prefill_login_id(page) -> None:
@@ -256,6 +251,9 @@ def _auto_login(page) -> bool:
 
         elapsed_ms = 0
         while elapsed_ms < AUTO_LOGIN_WAIT_TIMEOUT_MS:
+            # 로그인이 끝나기를 기다리는 쉼 - 예전에는 _looks_like_login_page가
+            # 매번 자면서 이 역할까지 겸했다(common.looks_like_login_page 주석).
+            page.wait_for_timeout(1500)
             # 로그인 페이지를 벗어났으면 성공이다. alert이 떴더라도 로그인
             # 자체가 된 경우(비밀번호 변경 안내 등)가 있어, 페이지 상태를
             # alert보다 먼저 본다.
@@ -263,7 +261,7 @@ def _auto_login(page) -> bool:
                 return True
             if alerts:
                 raise BlockedError(f"롯데온 자동 로그인이 거부됐습니다: {alerts[0].strip()}")
-            elapsed_ms += 1500  # _looks_like_login_page 내부에서 1500ms 대기함
+            elapsed_ms += 1500
 
         raise BlockedError(
             "롯데온 자동 로그인 후에도 로그인 페이지에서 벗어나지 못했습니다 "
@@ -387,6 +385,8 @@ def get_tracking(
             if _looks_like_login_page(page):
                 raise BlockedError("로그인 후에도 여전히 로그인 페이지입니다.")
 
+        # 주문상세는 자바스크립트로 그려진다 - 주문번호가 화면에 뜨면 다 그려진 것이다.
+        common.wait_for_text(page, od_no)
         # 주문상세 화면을 떠나기 전에 주문일부터 읽어둔다 (오래된 주문을 결과에 따로 모으는 데 쓴다).
         return with_order_date(page, lambda: _scrape_tracking_from_page(page, od_no, order_option))
     finally:

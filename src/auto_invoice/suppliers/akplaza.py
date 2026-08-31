@@ -108,8 +108,8 @@ def extract_order_no(product_url: str) -> str:
 
 
 def _looks_like_login_page(page) -> bool:
-    page.wait_for_timeout(1500)
-    return "/login" in page.url.lower()
+    return common.looks_like_login_page(page, lambda url: "/login" in url.lower(),
+                                        needs_password=False)
 
 
 def _prefill_login_id(page) -> None:
@@ -180,9 +180,12 @@ def _auto_login(page) -> bool:
 
     elapsed_ms = 0
     while elapsed_ms < AUTO_LOGIN_WAIT_TIMEOUT_MS:
+        # 로그인이 끝나기를 기다리는 쉼 - 예전에는 _looks_like_login_page가
+        # 매번 자면서 이 역할까지 겸했다(common.looks_like_login_page 주석).
+        page.wait_for_timeout(1500)
         if not _looks_like_login_page(page):
             return True
-        elapsed_ms += 1500  # _looks_like_login_page 내부에서 1500ms 대기함
+        elapsed_ms += 1500
 
     raise BlockedError(
         "AK플라자 자동 로그인 후에도 로그인 페이지에서 벗어나지 못했습니다 "

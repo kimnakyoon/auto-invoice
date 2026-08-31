@@ -174,8 +174,11 @@ def _looks_like_login_page(page) -> bool:
     중 순간적으로 다시 그려져 count()가 잠깐 0이 되는 경우가 있어 신뢰할 수
     없다(네이버 어댑터와 동일한 이유). 로그인 성공 시 반드시
     member.one.musinsa.com을 벗어나므로 URL만으로 판단한다."""
-    page.wait_for_timeout(1200)
-    return "member.one.musinsa.com" in page.url
+    # 무신사는 자바스크립트로 로그인 화면에 넘긴다(실측: goto 직후에는 아직
+    # 주문상세 주소) - 그래서 이 사이트는 주소가 바뀌는지 잠깐 지켜본다.
+    return common.looks_like_login_page(
+        page, lambda url: "member.one.musinsa.com" in url, needs_password=False,
+        settle_ms=common.LOGIN_REDIRECT_SETTLE_MS)
 
 
 def _prefill_login_id(page, musinsa_id: str | None) -> None:
@@ -256,6 +259,9 @@ def _auto_login(page, account_label: str) -> bool:
 
         elapsed_ms = 0
         while elapsed_ms < AUTO_LOGIN_WAIT_TIMEOUT_MS:
+            # 로그인이 끝나기를 기다리는 쉼 - 예전에는 _looks_like_login_page가
+            # 매번 자면서 이 역할까지 겸했다(common.looks_like_login_page 주석).
+            page.wait_for_timeout(1200)
             # 로그인 페이지를 벗어났으면 성공이다. alert이 떴더라도 로그인 자체는
             # 된 경우(비밀번호 변경 안내 등)가 있어, 페이지 상태를 alert보다
             # 먼저 본다 (롯데온/롯데아이몰과 같은 이유).
@@ -263,7 +269,7 @@ def _auto_login(page, account_label: str) -> bool:
                 return True
             if alerts:
                 raise BlockedError(f"무신사({account_label}) 자동 로그인이 거부됐습니다: {alerts[0].strip()}")
-            elapsed_ms += 1200  # _looks_like_login_page 내부에서 1200ms 대기함
+            elapsed_ms += 1200
 
         if _recaptcha_required(page):
             raise BlockedError(

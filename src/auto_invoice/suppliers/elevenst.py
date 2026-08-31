@@ -108,10 +108,7 @@ def extract_order_no(product_url: str) -> str:
 
 
 def _looks_like_login_page(page: Page) -> bool:
-    page.wait_for_timeout(1500)
-    if "login.11st.co.kr" not in page.url:
-        return False
-    return page.locator("input[type='password']").count() > 0
+    return common.looks_like_login_page(page, lambda url: "login.11st.co.kr" in url)
 
 
 def _dismiss_post_login_modals(page: Page) -> None:
@@ -146,10 +143,13 @@ def _auto_login(page: Page) -> bool:
 
     elapsed_ms = 0
     while elapsed_ms < LOGIN_WAIT_TIMEOUT_MS:
+        # 로그인이 끝나기를 기다리는 쉼 - 예전에는 _looks_like_login_page가
+        # 매번 자면서 이 역할까지 겸했다(common.looks_like_login_page 주석).
+        page.wait_for_timeout(1500)
         _dismiss_post_login_modals(page)
         if not _looks_like_login_page(page):
             return True
-        elapsed_ms += 1500  # _looks_like_login_page 내부에서 1500ms 대기함
+        elapsed_ms += 1500
     return False
 
 

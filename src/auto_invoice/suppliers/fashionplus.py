@@ -88,6 +88,9 @@ LOGIN_RESPONSE_TIMEOUT_MS = 15 * 1000  # 로그인 API 응답 대기
 TRACKING_LINK_TEXT = "배송조회"
 NOT_YET_PATTERNS = ["배송준비중", "결제완료", "입금대기", "주문확인중"]
 
+# 주문상세가 그려지기를 기다리는 최대 시간 (평소에는 기다리지 않고 지나간다).
+RENDER_WAIT_MS = 2000
+
 
 def extract_order_no(product_url: str) -> str:
     match = re.search(r"/order/detail/(\d+)", product_url)
@@ -101,8 +104,7 @@ def extract_order_no(product_url: str) -> str:
 
 
 def _looks_like_login_page(page) -> bool:
-    page.wait_for_timeout(1500)
-    return "/auth/login" in page.url
+    return common.looks_like_login_page(page, lambda url: "/auth/login" in url, needs_password=False)
 
 
 def _prefill_login_id(page) -> None:
@@ -163,9 +165,12 @@ def _auto_login(page) -> bool:
 
     elapsed_ms = 0
     while elapsed_ms < AUTO_LOGIN_WAIT_TIMEOUT_MS:
+        # 로그인이 끝나기를 기다리는 쉼 - 예전에는 _looks_like_login_page가
+        # 매번 자면서 이 역할까지 겸했다(common.looks_like_login_page 주석).
+        page.wait_for_timeout(1500)
         if not _looks_like_login_page(page):
             return True
-        elapsed_ms += 1500  # _looks_like_login_page 내부에서 1500ms 대기함
+        elapsed_ms += 1500
 
     raise BlockedError(
         "패션플러스 자동 로그인 후에도 로그인 페이지에서 벗어나지 못했습니다 "
@@ -314,6 +319,11 @@ def get_tracking(
             if _looks_like_login_page(page):
                 raise BlockedError("로그인 후에도 여전히 로그인 페이지입니다.")
 
+        # 화면이 아직 덜 그려진 채로 읽으면 '아직 미발급'으로 잘못 넘길 수 있다
+        # (조용히 틀리는 쪽이라 특히 위험하다). [배송조회]든 진행중 상태 문구든
+        # 판단에 쓸 것이 하나라도 보일 때까지만 기다린다 - 보통은 이미 있어서
+        # 그냥 지나간다.
+        common.wait_for_text(page, [TRACKING_LINK_TEXT, *NOT_YET_PATTERNS], RENDER_WAIT_MS)
         # 주문상세 화면을 떠나기 전에 주문일부터 읽어둔다 (오래된 주문을 결과에 따로 모으는 데 쓴다).
         return with_order_date(page, lambda: _scrape_tracking_from_page(context, page, order_no, order_option))
     finally:

@@ -88,10 +88,8 @@ def extract_order_id(product_url: str) -> str:
 
 
 def _looks_like_login_page(page) -> bool:
-    page.wait_for_timeout(1500)
-    if "signinssl.gmarket.co.kr" not in page.url and "/login" not in page.url.lower():
-        return False
-    return page.locator("input[type='password']").count() > 0
+    return common.looks_like_login_page(
+        page, lambda url: "signinssl.gmarket.co.kr" in url or "/login" in url.lower())
 
 
 def _looks_like_bot_check(page) -> bool:
@@ -152,6 +150,9 @@ def _auto_login(page) -> bool:
 
         elapsed_ms = 0
         while elapsed_ms < AUTO_LOGIN_WAIT_TIMEOUT_MS:
+            # 로그인이 끝나기를 기다리는 쉼 - 예전에는 _looks_like_login_page가
+            # 매번 자면서 이 역할까지 겸했다(common.looks_like_login_page 주석).
+            page.wait_for_timeout(1500)
             # 로그인 페이지를 벗어났으면 성공이다. alert이 떴더라도 로그인
             # 자체는 된 경우(비밀번호 변경 안내 등)가 있어, 페이지 상태를
             # alert보다 먼저 본다 (롯데온과 동일한 순서).
@@ -159,7 +160,7 @@ def _auto_login(page) -> bool:
                 return True
             if alerts:
                 raise BlockedError(f"지마켓 자동 로그인이 거부됐습니다: {alerts[0].strip()}")
-            elapsed_ms += 1500  # _looks_like_login_page 내부에서 1500ms 대기함
+            elapsed_ms += 1500
 
         if _captcha_is_visible(page):
             raise BlockedError(
@@ -316,6 +317,8 @@ def get_tracking(
             if _looks_like_login_page(page):
                 raise BlockedError("로그인 후에도 여전히 로그인 페이지입니다.")
 
+        # 주문상세는 자바스크립트로 그려진다 - 주문번호가 화면에 뜨면 다 그려진 것이다.
+        common.wait_for_text(page, order_id)
         # 주문상세 화면을 떠나기 전에 주문일부터 읽어둔다 (오래된 주문을 결과에 따로 모으는 데 쓴다).
         return with_order_date(page, lambda: _scrape_tracking_from_page(page, order_id, order_option))
     finally:

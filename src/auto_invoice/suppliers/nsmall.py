@@ -82,10 +82,11 @@ def extract_order_no(product_url: str) -> str:
 
 
 def _looks_like_login_page(page: Page) -> bool:
-    page.wait_for_timeout(1500)
-    if urlparse(page.url).path.rstrip("/") != "/customer/login":
-        return False
-    return page.locator("input[type='password']").count() > 0
+    # 이 사이트는 자바스크립트로 로그인 화면에 넘긴다(실측: goto 직후에는 아직
+    # 주문상세 주소) - 그래서 주소가 바뀌는지 잠깐 지켜본다.
+    return common.looks_like_login_page(
+        page, lambda url: urlparse(url).path.rstrip("/") == "/customer/login",
+        settle_ms=common.LOGIN_REDIRECT_SETTLE_MS)
 
 
 def _auto_login(page: Page) -> bool:
@@ -107,9 +108,12 @@ def _auto_login(page: Page) -> bool:
 
     elapsed_ms = 0
     while elapsed_ms < LOGIN_WAIT_TIMEOUT_MS:
+        # 로그인이 끝나기를 기다리는 쉼 - 예전에는 _looks_like_login_page가
+        # 매번 자면서 이 역할까지 겸했다(common.looks_like_login_page 주석).
+        page.wait_for_timeout(1500)
         if not _looks_like_login_page(page):
             return True
-        elapsed_ms += 1500  # _looks_like_login_page 내부에서 1500ms 대기함
+        elapsed_ms += 1500
     return False
 
 

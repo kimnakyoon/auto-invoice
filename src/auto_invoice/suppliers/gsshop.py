@@ -156,8 +156,8 @@ def _looks_like_login_page(page) -> bool:
     경로 접두사로 함께 판정한다 - 예전처럼 비밀번호 입력창 존재까지 요구하면
     폼이 없는 후자를 놓쳐서, 로그인 안내 대신 엉뚱한 파싱 오류가 났다.
     """
-    page.wait_for_timeout(1500)
-    return "/cust/login/" in urlparse(page.url).path
+    return common.looks_like_login_page(
+        page, lambda url: "/cust/login/" in urlparse(url).path, needs_password=False)
 
 
 def _prefill_login_id(page) -> None:
@@ -282,6 +282,9 @@ def _login_in_window(
     announced_challenge = False
 
     while elapsed_ms < deadline_ms:
+        # 로그인이 끝나기를 기다리는 쉼 - 예전에는 _looks_like_login_page가
+        # 매번 자면서 이 역할까지 겸했다(common.looks_like_login_page 주석).
+        page.wait_for_timeout(1500)
         # 로그인 페이지를 벗어났으면 성공이다. alert이 떴더라도 로그인
         # 자체는 된 경우(비밀번호 변경 안내 등)가 있어 화면을 먼저 본다.
         if not _looks_like_login_page(page):
@@ -327,7 +330,7 @@ def _login_in_window(
                     "풀기 어려우면 그냥 두세요 - 시간이 지나면 기존 수동 경로로 넘어갑니다."
                 )
 
-        elapsed_ms += 1500  # _looks_like_login_page 내부에서 1500ms 대기함
+        elapsed_ms += 1500
 
     if asked_for_checkbox:
         common.safe_print("[gsshop] 체크박스 대기 시간(5분)이 지났습니다 - 수동 로그인으로 넘어갑니다.")

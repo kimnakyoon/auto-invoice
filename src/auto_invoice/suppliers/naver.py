@@ -125,6 +125,11 @@ COURIER_TRACKING_PATTERN = re.compile(r"([가-힣A-Za-z0-9()]{2,20})\n송장번�
 # 이제 raise_if_cancelled가 취소/품절로 따로 분류해 결과 정리에 올린다.
 NOT_YET_PATTERNS = ["상품준비중", "결제완료", "배송준비중", "발송준비"]
 
+# 주문상세가 그려지기를 기다리는 최대 시간 (_wait_for_detail_render).
+DETAIL_RENDER_TIMEOUT_MS = 2000
+# 다른 계정의 주문이라 구매내역 목록으로 튕기는지 지켜보는 시간 (_redirected_away).
+REDIRECT_SETTLE_MS = 1200  # 예전 고정 대기(1.2초)와 같은 크기
+
 _second_context_cache: dict[int, BrowserContext] = {}
 
 
@@ -140,14 +145,21 @@ def _looks_like_login_page(page) -> bool:
     """비밀번호 입력창은 네이버가 보안상 타이핑 중 수시로 다시 그려서
     count()가 순간적으로 0이 되는 경우가 있어 신뢰할 수 없다. 로그인
     성공 시 반드시 nid.naver.com을 벗어나므로 URL만으로 판단한다."""
-    page.wait_for_timeout(1200)
-    return "nid.naver.com" in page.url
+    return common.looks_like_login_page(
+        page, lambda url: "nid.naver.com" in url, needs_password=False)
 
 
 def _redirected_away(page) -> bool:
     """로그인은 되어 있지만 그 계정 소유의 주문이 아니면 에러 없이
-    구매내역 목록으로 조용히 리다이렉트된다."""
-    return "orders.pay.naver.com" not in page.url
+    구매내역 목록으로 조용히 리다이렉트된다.
+
+    이 리다이렉트는 자바스크립트로 일어나서 goto가 끝난 뒤 1초쯤 지나야
+    주소가 바뀐다(2026-08-31 실측). 그동안만 지켜본다 - 안 기다리면 다른
+    계정의 주문을 '내 주문'으로 알고 구매내역 목록을 긁어, 엉뚱한 주문의
+    송장을 읽거나 미발급으로 잘못 판정한다.
+    """
+    return common.wait_for_url(page, lambda url: "orders.pay.naver.com" not in url,
+                               REDIRECT_SETTLE_MS)
 
 
 def _prefill_login_id(page, naver_id: str | None) -> None:
@@ -230,13 +242,16 @@ def _auto_login(context: BrowserContext, naver_id_env: str, account_label: str) 
 
             elapsed_ms = 0
             while elapsed_ms < AUTO_LOGIN_WAIT_TIMEOUT_MS:
+                # 로그인이 끝나기를 기다리는 쉼 - 예전에는 _looks_like_login_page가
+                # 매번 자면서 이 역할까지 겸했다(common.looks_like_login_page 주석).
+                page.wait_for_timeout(1200)
                 if not _looks_like_login_page(page):
                     context.add_cookies(login_context.cookies())
                     return True
                 if _looks_like_captcha(page):
                     common.safe_print(f"[naver] ({account_label}) 추가 확인(캡차)이 떠서 자동 로그인을 중단합니다.")
                     return False
-                elapsed_ms += 1200  # _looks_like_login_page 내부에서 1200ms 대기함
+                elapsed_ms += 1200
             common.safe_print(f"[naver] ({account_label}) 자동 로그인이 시간 안에 끝나지 않았습니다.")
             return False
     except Exception as exc:
@@ -321,6 +336,21 @@ def _select_by_order_option(body_text: str, matches: list, order_option: str | N
     return candidates[0] if len(candidates) == 1 else None
 
 
+def _wait_for_detail_render(page) -> None:
+    """주문상세가 그려질 때까지만 기다린다 (조회에 쓰는 [배송조회] 버튼 기준).
+
+    이 사이트는 화면에 주문번호를 적지 않고, 글자만 보면 '배송조회'가 먼저
+    보이는데도 exact 매칭되는 버튼은 조금 늦게 생긴다 - 그래서 글자가 아니라
+    실제로 클릭할 버튼이 생기기를 기다린다. 아직 안 나간 주문은 이 버튼이
+    아예 없으므로, 시간이 지나면 그냥 넘어가 아래 판정(미발급/취소)에 맡긴다.
+    """
+    try:
+        page.get_by_text(TRACK_BUTTON_TEXT, exact=True).first.wait_for(
+            state="attached", timeout=DETAIL_RENDER_TIMEOUT_MS)
+    except Exception:  # noqa: BLE001 - 버튼이 없는 것도 정상이다(아직 발송 전)
+        pass
+
+
 def _scrape_tracking_from_page(page, order_no: str, order_option: str | None = None) -> TrackingResult:
     button = page.get_by_text(TRACK_BUTTON_TEXT, exact=True)
     if button.count() == 0:
@@ -392,6 +422,7 @@ def _get_tracking_from_account(
         if _redirected_away(page):
             raise OrderNotFound(f"이 계정({account_label})에서 주문을 찾을 수 없습니다 (주문번호={order_no}).")
 
+        _wait_for_detail_render(page)
         # 주문상세 화면을 떠나기 전에 주문일부터 읽어둔다 (오래된 주문을 결과에 따로 모으는 데 쓴다).
         return with_order_date(page, lambda: _scrape_tracking_from_page(page, order_no, order_option))
     finally:
