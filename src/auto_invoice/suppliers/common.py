@@ -32,8 +32,12 @@ COURIER_NORMALIZATION = [
 
 
 def normalize_courier(raw: str) -> str:
+    """대소문자를 가리지 않고 본다 - 같은 택배사를 사이트마다 DELIBOX/Delibox
+    처럼 다르게 적어서, 글자 그대로 비교하면 한쪽만 조용히 원문으로 올라간다.
+    """
+    upper = raw.upper()
     for keyword, canonical in COURIER_NORMALIZATION:
-        if keyword in raw:
+        if keyword.upper() in upper:
             return canonical
     return raw
 

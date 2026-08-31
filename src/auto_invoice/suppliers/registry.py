@@ -28,6 +28,7 @@ from . import (
     ssfshop,
     ssg,
     thehyundai,
+    wconcept,
 )
 
 _ADAPTERS: dict[str, object] = {}
@@ -54,6 +55,7 @@ register(auction)
 register(akplaza)
 register(cjonstyle)
 register(ssfshop)
+register(wconcept)
 # 새 공급사 추가 예시:
 # from . import newsupplier
 # register(newsupplier)

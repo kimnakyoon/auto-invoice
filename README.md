@@ -260,7 +260,7 @@ python scripts/check_adapter.py "<공급사 주문상세 상품URL>"
 
 `.env`에 `LOTTEON_ID`/`LOTTEON_PW`를 넣어두면 로그인 세션이 없을 때 사람
 개입 없이 자동으로 로그인한다(SSG·더현대·NS홈쇼핑·11번가·옥션·패션플러스·
-롯데아이몰·AK플라자·무신사·현대몰·CJ온스타일·SSF샵과 동일한 방식). GSSHOP만은 완전
+롯데아이몰·AK플라자·무신사·현대몰·CJ온스타일·SSF샵·W컨셉과 동일한 방식). GSSHOP만은 완전
 무인이 아니다 - 아이디·비밀번호 입력과 제출까지는 자동이지만, 그 사이트의
 reCAPTCHA가 자동화 브라우저에는 늘 사람 확인을 요구해서 뜬 창에서 '로봇이
 아닙니다'를 한 번 통과시켜 줘야 한다(그 뒤는 자동). 현대몰과 CJ온스타일은
@@ -270,6 +270,12 @@ reCAPTCHA, CJ온스타일은 Cloudflare Turnstile)이 설치된 진짜 크롬에
 평소처럼 창 없이 진행된다 - 자세한 내용은 `.env.example`의 `HMALL_PW`/
 `CJONSTYLE_PW` 설명). `LOTTEON_PW`를 비워두면 예전처럼 브라우저 창이 뜨고,
 직접 로그인하면 자동으로 감지해서 이어서 진행한다.
+
+W컨셉도 현대몰·CJ온스타일과 같이 로그인하는 동안만 크롬 창이 떴다가 닫힌다
+(reCAPTCHA Enterprise가 걸려 있어 번들 Chromium으로는 통과되지 않는다). 이
+사이트는 봇 확인에 걸리면 단순히 실패로 끝나지 않고 **30분 간 로그인이
+제한되므로**, 실패 사유를 받으면 그 자리에서 조회를 멈춰 한 번 실행에 로그인
+시도가 최대 1회가 되게 해뒀다.
 
 무신사는 계정을 3개 쓰기 때문에 `MUSINSA_ID`/`MUSINSA_PW`,
 `MUSINSA_ID2`/`MUSINSA_PW2`, `MUSINSA_ID3`/`MUSINSA_PW3`를 각각 넣는다.
