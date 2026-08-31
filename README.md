@@ -216,11 +216,16 @@ playwright install chromium
 copy .env.example .env
 ```
 
-## 1단계 — 롯데온 어댑터 검증
+## 1단계 — 공급사 어댑터 검증
 
 ```
-python scripts/test_lotteon_adapter.py
+python scripts/check_adapter.py "<공급사 주문상세 상품URL>"
 ```
+
+어느 어댑터를 쓸지는 실제 실행과 같이 URL의 도메인으로 정하므로, 사이트마다
+스크립트가 따로 있지 않다. 상품URL은 샵마인 발송대상 엑셀의 `상품URL` 값이나
+`logs/run_*.json`에서 하나 가져다 쓰면 된다 - **지금 살아 있는 주문**으로
+확인해야 실패했을 때 어댑터 문제인지 주문 만료인지 헷갈리지 않는다.
 
 `.env`에 `LOTTEON_ID`/`LOTTEON_PW`를 넣어두면 로그인 세션이 없을 때 사람
 개입 없이 자동으로 로그인한다(SSG·더현대·NS홈쇼핑·11번가·옥션·패션플러스·
@@ -238,18 +243,20 @@ reCAPTCHA, CJ온스타일은 Cloudflare Turnstile)이 설치된 진짜 크롬에
 무신사는 계정을 3개 쓰기 때문에 `MUSINSA_ID`/`MUSINSA_PW`,
 `MUSINSA_ID2`/`MUSINSA_PW2`, `MUSINSA_ID3`/`MUSINSA_PW3`를 각각 넣는다.
 최초 세팅은 `python scripts/musinsa_login_setup.py`를 한 번 돌리면 세 계정
-세션이 한꺼번에 만들어지고, 자동 로그인만 따로 검증하려면
-`python scripts/test_musinsa_login.py`를 쓴다.
+세션이 한꺼번에 만들어진다(계정별 주문 URL을 하나씩 넘기면 조회까지 확인된다).
 
-로그인 세션은 `auth/lotteon_state.json`에 저장되어 다음부터는 다시 로그인하지
-않는다. 스크립트에 미리 넣어둔 테스트 주문번호로 송장번호가 정확히 조회되면
-성공이다.
+로그인 세션은 `auth/<사이트>_state.json`에 저장되어 다음부터는 다시 로그인하지
+않는다. 넘긴 주문의 송장번호가 나오면 성공이다(`--expect <송장번호>`로 값까지
+맞는지 비교할 수 있다).
 
 자동 로그인만 따로 검증하려면(저장된 세션을 무시하고 로그인부터 다시):
 
 ```
-python scripts/test_lotteon_login.py
+python scripts/check_adapter.py --fresh "<상품URL>"
 ```
+
+성공했을 때만 새 세션을 저장한다 - 실패하면 멀쩡한 기존 세션을 건드리지 않고
+마지막 화면을 `logs/`에 남긴다.
 
 ## 2단계 — 샵마인에서 발송대상 엑셀 받기
 

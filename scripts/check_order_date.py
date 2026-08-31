@@ -31,7 +31,7 @@ from auto_invoice import order_date as order_date_mod  # noqa: E402
 from auto_invoice.suppliers import base as supplier_base  # noqa: E402
 from auto_invoice.suppliers import registry  # noqa: E402
 
-# 각 사이트의 실제 주문상세 URL (scripts/test_*_adapter.py에서 쓰던 것과 같은 주문).
+# 각 사이트의 실제 주문상세 URL.
 DEFAULT_URLS = {
     "nsmall": "https://m.nsmall.com/cs/order-detail?orderNum=560824001998",
     "thehyundai": "https://hi.thehyundai.com/mypage/order/detail?ordNo=260808001647316&isLogin=Y",

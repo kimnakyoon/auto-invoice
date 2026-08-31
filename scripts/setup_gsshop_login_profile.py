@@ -55,7 +55,7 @@ from playwright.sync_api import sync_playwright  # noqa: E402
 from auto_invoice import browser as browser_mod  # noqa: E402
 from auto_invoice.suppliers import gsshop  # noqa: E402
 
-# 로그인 시도에 쓰는 주문 - test_gsshop_login.py와 같은 건이다.
+# 로그인 시도에 쓰는 주문.
 TEST_PRODUCT_URL = "https://with.gsshop.com/ord/dlvcursta/popup/ordDtl.gs?ordNo=3468580811&ecOrdTypCd=S"
 
 GOOGLE_LOGIN_URL = "https://accounts.google.com/"
