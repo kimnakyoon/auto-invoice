@@ -50,7 +50,46 @@ def get_context(playwright: Playwright, site_key: str, headless: bool = True) ->
         context = browser.new_context(storage_state=str(sp))
     else:
         context = browser.new_context()
+    block_heavy_resources(context)
     return browser, context
+
+
+# 송장번호를 읽는 데 전혀 쓰지 않는 리소스. 쇼핑몰 주문상세는 상품 이미지가
+# 대부분의 용량이라, 이것만 받지 않아도 페이지가 훨씬 빨리 뜬다.
+BLOCKED_RESOURCE_TYPES = {"image", "media", "font"}
+
+# 이미 라우팅을 걸어둔 컨텍스트. 같은 컨텍스트에 두 번 걸면 요청이 두 번
+# 가로채여 continue_()가 중복 호출된다.
+_ROUTED_CONTEXTS: set[int] = set()
+
+
+def _abort_heavy(route) -> None:
+    if route.request.resource_type in BLOCKED_RESOURCE_TYPES:
+        route.abort()
+    else:
+        route.continue_()
+
+
+def block_heavy_resources(context: BrowserContext) -> None:
+    """이미지/폰트/동영상을 받지 않게 한다 (조회용 컨텍스트 전체에 적용)."""
+    if id(context) in _ROUTED_CONTEXTS:
+        return
+    context.route("**/*", _abort_heavy)
+    _ROUTED_CONTEXTS.add(id(context))
+
+
+def allow_heavy_resources(context: BrowserContext) -> bool:
+    """차단을 푼다. 실제로 풀었으면 True.
+
+    사람에게 화면을 넘길 때(직접 로그인) 부른다 - 캡차가 이미지로 나오는
+    사이트(지마켓 등)에서 이미지를 막아둔 채로 넘기면 사람이 읽을 게 없다.
+    """
+    if id(context) not in _ROUTED_CONTEXTS:
+        return False
+    with contextlib.suppress(Exception):
+        context.unroute("**/*", _abort_heavy)
+    _ROUTED_CONTEXTS.discard(id(context))
+    return True
 
 
 def save_state(context: BrowserContext, site_key: str) -> None:
