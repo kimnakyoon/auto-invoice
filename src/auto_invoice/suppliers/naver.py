@@ -63,6 +63,7 @@ from playwright.sync_api import BrowserContext
 
 from .. import browser as browser_mod
 from ..models import TrackingResult
+from . import common
 from .base import (
     BlockedError,
     OrderNotFound,
@@ -124,26 +125,7 @@ COURIER_TRACKING_PATTERN = re.compile(r"([가-힣A-Za-z0-9()]{2,20})\n송장번�
 # 이제 raise_if_cancelled가 취소/품절로 따로 분류해 결과 정리에 올린다.
 NOT_YET_PATTERNS = ["상품준비중", "결제완료", "배송준비중", "발송준비"]
 
-# CJ대한통운/롯데택배는 화면 표기가 정식 명칭과 달라서(예: "대한통운") 업로드
-# 파일에는 정식 명칭으로 맞춰 넣는다 (지마켓/SSG 어댑터와 동일한 규칙).
-COURIER_NORMALIZATION = [
-    ("대한통운", "CJ대한통운"),
-    ("CJ", "CJ대한통운"),
-    ("롯데", "롯데택배"),
-    ("DELIBOX", "딜리박스"),
-]
-
-# 두 번째 계정용 context 캐시. GUI는 같은 파이썬 프로세스 안에서 실행 버튼을
-# 여러 번 누를 수 있고 그때마다 orchestrator가 새 Browser를 여니, 브라우저
-# 인스턴스별로 캐시해야 지난 실행에서 이미 닫힌 context를 재사용하지 않는다.
 _second_context_cache: dict[int, BrowserContext] = {}
-
-
-def _normalize_courier(raw: str) -> str:
-    for keyword, canonical in COURIER_NORMALIZATION:
-        if keyword in raw:
-            return canonical
-    return raw
 
 
 def extract_order_no(product_url: str) -> str:
@@ -172,15 +154,7 @@ def _prefill_login_id(page, naver_id: str | None) -> None:
     """사람이 직접 로그인할 때(자동 로그인이 막혔거나 비밀번호가 없을 때)
     아이디만 미리 채워 타이핑을 줄인다. 비밀번호는 이 창에서는 채우지 않는다 -
     자동 로그인은 별도의 크롬 창에서만 하기 때문이다(_auto_login)."""
-    if not naver_id:
-        return
-    locator = page.locator(LOGIN_ID_SELECTOR)
-    if locator.count() == 0:
-        return
-    try:
-        locator.fill(naver_id)
-    except Exception:
-        pass
+    common.prefill_login_id(page, page.locator(LOGIN_ID_SELECTOR), naver_id)
 
 
 def _enable_keep_login(page) -> None:
@@ -199,14 +173,6 @@ def _enable_keep_login(page) -> None:
             # input 자체가 화면에서 숨겨져 있고 label이 실제로 보이는 형태라
             # check()가 아니라 label 클릭으로 켠다.
             locator.first.check(force=True)
-    except Exception:
-        pass
-
-
-def _safe_print(message: str) -> None:
-    """GUI(pythonw)로 실행하면 콘솔이 없어 stdout이 없을 수 있다 - 그 경우 조용히 무시한다."""
-    try:
-        print(message)
     except Exception:
         pass
 
@@ -249,7 +215,7 @@ def _auto_login(context: BrowserContext, naver_id_env: str, account_label: str) 
                 return True
 
             if page.locator(LOGIN_ID_SELECTOR).count() == 0:
-                _safe_print(f"[naver] ({account_label}) 로그인 페이지에서 아이디 입력창을 찾지 못했습니다.")
+                common.safe_print(f"[naver] ({account_label}) 로그인 페이지에서 아이디 입력창을 찾지 못했습니다.")
                 return False
 
             # page.fill이 아니라 실제 키 입력으로 채운다 (docstring 참고).
@@ -268,23 +234,19 @@ def _auto_login(context: BrowserContext, naver_id_env: str, account_label: str) 
                     context.add_cookies(login_context.cookies())
                     return True
                 if _looks_like_captcha(page):
-                    _safe_print(f"[naver] ({account_label}) 추가 확인(캡차)이 떠서 자동 로그인을 중단합니다.")
+                    common.safe_print(f"[naver] ({account_label}) 추가 확인(캡차)이 떠서 자동 로그인을 중단합니다.")
                     return False
                 elapsed_ms += 1200  # _looks_like_login_page 내부에서 1200ms 대기함
-            _safe_print(f"[naver] ({account_label}) 자동 로그인이 시간 안에 끝나지 않았습니다.")
+            common.safe_print(f"[naver] ({account_label}) 자동 로그인이 시간 안에 끝나지 않았습니다.")
             return False
     except Exception as exc:
-        _safe_print(f"[naver] ({account_label}) 자동 로그인 중 오류({exc}) - 직접 로그인으로 넘어갑니다.")
+        common.safe_print(f"[naver] ({account_label}) 자동 로그인 중 오류({exc}) - 직접 로그인으로 넘어갑니다.")
         return False
 
 
 def _wait_for_manual_login(page) -> bool:
-    elapsed_ms = 0
-    while elapsed_ms < LOGIN_WAIT_TIMEOUT_MS:
-        if not _looks_like_login_page(page):
-            return True
-        elapsed_ms += 1200  # _looks_like_login_page 내부에서 1200ms 대기함
-    return False
+    return common.wait_for_manual_login(
+        page, lambda: _looks_like_login_page(page), LOGIN_WAIT_TIMEOUT_MS)
 
 
 def _get_second_context(primary_context: BrowserContext, headless: bool) -> BrowserContext:
@@ -319,7 +281,7 @@ def _ensure_logged_in(
         return False
 
     if _auto_login(context, naver_id_env, account_label):
-        _safe_print(f"[naver] ({account_label}) 로그인 세션이 없어 자동 로그인했습니다.")
+        common.safe_print(f"[naver] ({account_label}) 로그인 세션이 없어 자동 로그인했습니다.")
         return True
 
     if headless:
@@ -330,8 +292,8 @@ def _ensure_logged_in(
         )
     _prefill_login_id(page, os.environ.get(naver_id_env))
     _enable_keep_login(page)
-    _safe_print(f"[naver] ({account_label}) 아이디는 자동으로 입력했습니다. 뜬 브라우저 창에서 비밀번호 입력과 보안 확인을 완료해주세요.")
-    _safe_print(f"[naver] ({account_label}) 로그인이 완료되면 자동으로 이어서 진행합니다 (최대 5분 대기).")
+    common.safe_print(f"[naver] ({account_label}) 아이디는 자동으로 입력했습니다. 뜬 브라우저 창에서 비밀번호 입력과 보안 확인을 완료해주세요.")
+    common.safe_print(f"[naver] ({account_label}) 로그인이 완료되면 자동으로 이어서 진행합니다 (최대 5분 대기).")
     if not _wait_for_manual_login(page):
         raise BlockedError(f"네이버페이({account_label}) 로그인 대기 시간(5분)이 지났습니다. 로그인 후 다시 실행해주세요.")
     return True
@@ -391,7 +353,7 @@ def _scrape_tracking_from_page(page, order_no: str, order_option: str | None = N
             # 확인하게 한다 (무신사 어댑터와 동일한 안전 규칙).
             raise ParseError(f"한 주문에 서로 다른 송장번호가 여러 개 있습니다 (주문번호={order_no}) - 상품별로 나눠 배송된 것으로 보입니다.")
         match = matches[0]
-    courier = _normalize_courier(match.group(1).strip())
+    courier = common.normalize_courier(match.group(1).strip())
     tracking_no = re.sub(r"[^0-9]", "", match.group(2))
 
     return TrackingResult(tracking_no=tracking_no, courier=courier)

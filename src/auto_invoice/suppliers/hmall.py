@@ -56,6 +56,7 @@ from playwright.sync_api import BrowserContext, Page
 
 from .. import browser as browser_mod
 from ..models import TrackingResult
+from . import common
 from .base import (
     BlockedError,
     ParseError,
@@ -94,22 +95,6 @@ TRACKING_LINK_TEXT = "배송조회"
 TRACKING_URL_MARKER = "selectDlvTrcUrl"
 NOT_YET_PATTERNS = ["결제완료", "상품준비중", "배송준비중", "주문접수"]
 
-# CJ대한통운/롯데택배/딜리박스가 축약형/코드로 나올 수 있어 업로드 파일에는
-# 정식 명칭으로 맞춰 넣는다 (다른 어댑터와 동일한 규칙).
-COURIER_NORMALIZATION = [
-    ("대한통운", "CJ대한통운"),
-    ("CJ", "CJ대한통운"),
-    ("롯데", "롯데택배"),
-    ("DELIBOX", "딜리박스"),
-]
-
-
-def _normalize_courier(raw: str) -> str:
-    for keyword, canonical in COURIER_NORMALIZATION:
-        if keyword in raw:
-            return canonical
-    return raw
-
 
 def extract_order_no(product_url: str) -> str:
     parsed = urlparse(product_url)
@@ -133,24 +118,7 @@ def _prefill_login_id(page: Page) -> None:
     이 경로에서는 로그인 버튼을 자동으로 누르지 않는다 - 사람이 직접 누르는
     편이 reCAPTCHA 점수에 유리하고, 어차피 사람이 비밀번호를 치는 중이다.
     """
-    hmall_id = os.environ.get("HMALL_ID")
-    if not hmall_id:
-        return
-    locator = page.locator(LOGIN_ID_SELECTOR)
-    if locator.count() == 0:
-        return
-    try:
-        locator.fill(hmall_id)
-    except Exception:
-        pass
-
-
-def _safe_print(message: str) -> None:
-    """GUI(pythonw)로 실행하면 콘솔이 없어 stdout이 없을 수 있다 - 그 경우 조용히 무시한다."""
-    try:
-        print(message)
-    except Exception:
-        pass
+    common.prefill_login_id(page, page.locator(LOGIN_ID_SELECTOR), os.environ.get("HMALL_ID"))
 
 
 def _warm_up(page: Page) -> None:
@@ -185,7 +153,7 @@ def _auto_login(context: BrowserContext) -> bool:
     try:
         login_context = browser_mod.real_chrome_context(SITE_KEY)
     except Exception as exc:  # 크롬 미설치 등 - 수동 경로로 넘긴다
-        _safe_print(f"[hmall] 자동 로그인용 크롬을 띄우지 못했습니다({exc}) - 직접 로그인으로 넘어갑니다.")
+        common.safe_print(f"[hmall] 자동 로그인용 크롬을 띄우지 못했습니다({exc}) - 직접 로그인으로 넘어갑니다.")
         return False
 
     scores: list[float] = []
@@ -213,7 +181,7 @@ def _auto_login(context: BrowserContext) -> bool:
             return True
 
         if page.locator(LOGIN_ID_SELECTOR).count() == 0:
-            _safe_print("[hmall] 로그인 페이지에서 아이디 입력창을 찾지 못했습니다 - 직접 로그인으로 넘어갑니다.")
+            common.safe_print("[hmall] 로그인 페이지에서 아이디 입력창을 찾지 못했습니다 - 직접 로그인으로 넘어갑니다.")
             return False
 
         page.locator(LOGIN_ID_SELECTOR).click()
@@ -225,7 +193,7 @@ def _auto_login(context: BrowserContext) -> bool:
 
         button = page.locator(LOGIN_BUTTON_SELECTOR, has_text="로그인")
         if button.count() == 0:
-            _safe_print("[hmall] 로그인 버튼을 찾지 못했습니다 - 직접 로그인으로 넘어갑니다.")
+            common.safe_print("[hmall] 로그인 버튼을 찾지 못했습니다 - 직접 로그인으로 넘어갑니다.")
             return False
         button.first.click()
 
@@ -233,21 +201,21 @@ def _auto_login(context: BrowserContext) -> bool:
         while elapsed_ms < AUTO_LOGIN_WAIT_TIMEOUT_MS:
             if not _looks_like_login_page(page):
                 context.add_cookies(login_context.cookies())
-                _safe_print("[hmall] 자동 로그인에 성공했습니다.")
+                common.safe_print("[hmall] 자동 로그인에 성공했습니다.")
                 return True
             if scores and scores[-1] < RECAPTCHA_MIN_SCORE:
                 # 점수가 낮으면 사이트가 자격증명과 무관하게 거부한다 - 더 기다릴 이유가 없다.
-                _safe_print(
+                common.safe_print(
                     f"[hmall] reCAPTCHA 점수가 낮아(={scores[-1]}) 사이트가 로그인을 거부했습니다 "
                     "- 직접 로그인으로 넘어갑니다."
                 )
                 return False
             elapsed_ms += 1500  # _looks_like_login_page 내부에서 1500ms 대기함
 
-        _safe_print("[hmall] 자동 로그인 결과를 30초 안에 확인하지 못했습니다 - 직접 로그인으로 넘어갑니다.")
+        common.safe_print("[hmall] 자동 로그인 결과를 30초 안에 확인하지 못했습니다 - 직접 로그인으로 넘어갑니다.")
         return False
     except Exception as exc:
-        _safe_print(f"[hmall] 자동 로그인 중 오류({exc}) - 직접 로그인으로 넘어갑니다.")
+        common.safe_print(f"[hmall] 자동 로그인 중 오류({exc}) - 직접 로그인으로 넘어갑니다.")
         return False
     finally:
         try:
@@ -256,13 +224,9 @@ def _auto_login(context: BrowserContext) -> bool:
             pass
 
 
-def _wait_for_manual_login(page: Page) -> bool:
-    elapsed_ms = 0
-    while elapsed_ms < LOGIN_WAIT_TIMEOUT_MS:
-        if not _looks_like_login_page(page):
-            return True
-        elapsed_ms += 1500  # _looks_like_login_page 내부에서 1500ms 대기함
-    return False
+def _wait_for_manual_login(page) -> bool:
+    return common.wait_for_manual_login(
+        page, lambda: _looks_like_login_page(page), LOGIN_WAIT_TIMEOUT_MS)
 
 
 def _parse_tracking_url(url: str) -> tuple[str, str]:
@@ -273,7 +237,7 @@ def _parse_tracking_url(url: str) -> tuple[str, str]:
     tracking_no = re.sub(r"[^0-9]", "", wbno_values[0])
 
     codename_values = qs.get("codename")
-    courier = _normalize_courier(codename_values[0].strip()) if codename_values and codename_values[0].strip() else DEFAULT_COURIER
+    courier = common.normalize_courier(codename_values[0].strip()) if codename_values and codename_values[0].strip() else DEFAULT_COURIER
 
     return tracking_no, courier
 
@@ -378,8 +342,8 @@ def get_tracking(
                 )
             else:
                 _prefill_login_id(page)
-                _safe_print("[hmall] 아이디는 자동으로 입력했습니다. 뜬 브라우저 창에서 비밀번호를 입력하고 로그인해주세요.")
-                _safe_print("[hmall] 로그인이 완료되면 자동으로 이어서 진행합니다 (최대 5분 대기).")
+                common.safe_print("[hmall] 아이디는 자동으로 입력했습니다. 뜬 브라우저 창에서 비밀번호를 입력하고 로그인해주세요.")
+                common.safe_print("[hmall] 로그인이 완료되면 자동으로 이어서 진행합니다 (최대 5분 대기).")
                 if not _wait_for_manual_login(page):
                     raise BlockedError("로그인 대기 시간(5분)이 지났습니다. 로그인 후 다시 실행해주세요.")
                 page.goto(product_url, wait_until="domcontentloaded")

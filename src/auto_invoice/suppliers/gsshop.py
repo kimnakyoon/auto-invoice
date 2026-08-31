@@ -79,6 +79,7 @@ from playwright.sync_api import BrowserContext
 
 from .. import browser as browser_mod
 from ..models import TrackingResult
+from . import common
 from .base import (
     BlockedError,
     ParseError,
@@ -124,23 +125,6 @@ RECAPTCHA_CHALLENGE_FRAME = "iframe[src*='bframe']"
 COURIER_PATTERN = re.compile(r"택배업체[\t ]*([^\n]+?)(?:\s+대표번호|$)", re.MULTILINE)
 NOT_YET_PATTERNS = ["결제완료", "상품준비중", "배송준비중", "주문확인중", "입금대기"]
 
-# CJ대한통운/롯데택배가 화면에 축약형("CJ", "대한통운", "롯데")으로 나올 수
-# 있어 업로드 파일에는 정식 명칭으로 맞춰 넣는다 (다른 어댑터와 동일한 규칙).
-# DELIBOX(무인택배함/딜리박스)는 코드가 그대로 노출되는 경우가 있어 별도 매핑.
-COURIER_NORMALIZATION = [
-    ("대한통운", "CJ대한통운"),
-    ("CJ", "CJ대한통운"),
-    ("롯데", "롯데택배"),
-    ("DELIBOX", "딜리박스"),
-]
-
-
-def _normalize_courier(raw: str) -> str:
-    for keyword, canonical in COURIER_NORMALIZATION:
-        if keyword in raw:
-            return canonical
-    return raw
-
 
 def extract_order_no(product_url: str) -> str:
     parsed = urlparse(product_url)
@@ -178,24 +162,7 @@ def _looks_like_login_page(page) -> bool:
 
 def _prefill_login_id(page) -> None:
     """비밀번호는 절대 자동 입력하지 않는다 - 아이디만 채워서 타이핑을 줄인다."""
-    gsshop_id = os.environ.get("GSSHOP_ID")
-    if not gsshop_id:
-        return
-    locator = page.locator(LOGIN_ID_SELECTOR)
-    if locator.count() == 0:
-        return
-    try:
-        locator.fill(gsshop_id)
-    except Exception:
-        pass
-
-
-def _safe_print(message: str) -> None:
-    """GUI(pythonw)로 실행하면 콘솔이 없어 stdout이 없을 수 있다 - 그 경우 조용히 무시한다."""
-    try:
-        print(message)
-    except Exception:
-        pass
+    common.prefill_login_id(page, page.locator(LOGIN_ID_SELECTOR), os.environ.get("GSSHOP_ID"))
 
 
 def _checkbox_solved(page) -> bool:
@@ -256,7 +223,7 @@ def _auto_login(context: BrowserContext, product_url: str, headless: bool = True
                 login_context, context, product_url, headless, login_id, login_pw
             )
     except Exception as exc:
-        _safe_print(f"[gsshop] 로그인 중 오류({exc}) - 직접 로그인으로 넘어갑니다.")
+        common.safe_print(f"[gsshop] 로그인 중 오류({exc}) - 직접 로그인으로 넘어갑니다.")
         return False
 
 
@@ -295,7 +262,7 @@ def _login_in_window(
         return True
 
     if page.locator(LOGIN_ID_SELECTOR).count() == 0:
-        _safe_print(
+        common.safe_print(
             "[gsshop] 로그인 페이지에서 아이디 입력창을 찾지 못했습니다 - 직접 로그인으로 넘어갑니다."
         )
         return False
@@ -321,15 +288,15 @@ def _login_in_window(
             context.add_cookies(login_context.cookies())
             return True
         if alerts:
-            _safe_print(f"[gsshop] 로그인이 거부됐습니다: {alerts[0].strip()}")
+            common.safe_print(f"[gsshop] 로그인이 거부됐습니다: {alerts[0].strip()}")
             return False
         if _captcha_is_visible(page):
-            _safe_print("[gsshop] 로그인에 사이트 자체 보안문자가 요구돼 자동 로그인을 건너뜁니다.")
+            common.safe_print("[gsshop] 로그인에 사이트 자체 보안문자가 요구돼 자동 로그인을 건너뜁니다.")
             return False
 
         if assess_results and assess_results[-1] == RECAPTCHA_BLOCKED_RESULT:
             if headless:
-                _safe_print(
+                common.safe_print(
                     "[gsshop] reCAPTCHA가 체크박스 확인을 요구합니다(result=need). "
                     "--headless로는 눌러줄 사람이 없어 수동 로그인으로 넘어갑니다. "
                     "(로그인용 프로필의 구글 로그인이 풀렸을 수 있습니다 - "
@@ -339,23 +306,23 @@ def _login_in_window(
             if not asked_for_checkbox:
                 asked_for_checkbox = True
                 deadline_ms = CHECKBOX_WAIT_TIMEOUT_MS  # 사람을 기다리는 동안은 넉넉하게
-                _safe_print(
+                common.safe_print(
                     "[gsshop] 아이디와 비밀번호는 넣었습니다. 뜬 크롬 창에서 "
                     "'로봇이 아닙니다' 체크박스만 눌러주세요. (로그인용 프로필의 "
                     "구글 로그인이 풀리면 이렇게 됩니다 - 다음부터 안 뜨게 하려면 "
                     "scripts/setup_gsshop_login_profile.py를 다시 실행하세요.)"
                 )
-                _safe_print("[gsshop] 체크가 끝나면 로그인은 자동으로 이어서 누릅니다 (최대 5분 대기).")
+                common.safe_print("[gsshop] 체크가 끝나면 로그인은 자동으로 이어서 누릅니다 (최대 5분 대기).")
             if not checkbox_solved and _checkbox_solved(page):
                 # 통과시키면 위젯 콜백(reCaptchaVerifyCallback)이 validateToken을
                 # 거쳐 로그인까지 알아서 제출한다 - 우리가 버튼을 또 누르면 안 된다.
                 checkbox_solved = True
-                _safe_print("[gsshop] 체크박스 통과를 확인했습니다 - 로그인이 이어서 진행됩니다.")
+                common.safe_print("[gsshop] 체크박스 통과를 확인했습니다 - 로그인이 이어서 진행됩니다.")
             elif not announced_challenge and _image_challenge_visible(page):
                 # 구글이 이미지 고르기를 띄운 경우. 사람이 풀면 그대로 진행되므로
                 # 기다리되, 왜 클릭만으로 안 끝나는지는 알려준다.
                 announced_challenge = True
-                _safe_print(
+                common.safe_print(
                     "[gsshop] 구글이 체크박스만으로 안 믿고 이미지 확인을 띄웠습니다. "
                     "풀기 어려우면 그냥 두세요 - 시간이 지나면 기존 수동 경로로 넘어갑니다."
                 )
@@ -363,9 +330,9 @@ def _login_in_window(
         elapsed_ms += 1500  # _looks_like_login_page 내부에서 1500ms 대기함
 
     if asked_for_checkbox:
-        _safe_print("[gsshop] 체크박스 대기 시간(5분)이 지났습니다 - 수동 로그인으로 넘어갑니다.")
+        common.safe_print("[gsshop] 체크박스 대기 시간(5분)이 지났습니다 - 수동 로그인으로 넘어갑니다.")
     else:
-        _safe_print("[gsshop] 로그인이 시간 안에 끝나지 않아 수동 로그인으로 넘어갑니다.")
+        common.safe_print("[gsshop] 로그인이 시간 안에 끝나지 않아 수동 로그인으로 넘어갑니다.")
     return False
 
 
@@ -381,12 +348,8 @@ def _captcha_is_visible(page) -> bool:
 
 
 def _wait_for_manual_login(page) -> bool:
-    elapsed_ms = 0
-    while elapsed_ms < LOGIN_WAIT_TIMEOUT_MS:
-        if not _looks_like_login_page(page):
-            return True
-        elapsed_ms += 1500  # _looks_like_login_page 내부에서 1500ms 대기함
-    return False
+    return common.wait_for_manual_login(
+        page, lambda: _looks_like_login_page(page), LOGIN_WAIT_TIMEOUT_MS)
 
 
 def _read_entry_data(page, ord_no: str) -> dict:
@@ -453,7 +416,7 @@ def _fetch_courier_name(page, origin: str, ord_no: str, ord_item_id: str) -> str
     match = COURIER_PATTERN.search(body_text)
     if not match:
         return DEFAULT_COURIER
-    return _normalize_courier(match.group(1).strip())
+    return common.normalize_courier(match.group(1).strip())
 
 
 def get_tracking(
@@ -469,7 +432,7 @@ def get_tracking(
             # 로그인은 자체 크롬 창에서 하므로 headless 실행 중에도 시도할 수 있다.
             # (다만 체크박스가 뜨면 --headless에서는 눌러줄 사람이 없어 포기한다.)
             if _auto_login(context, product_url, headless=headless):
-                _safe_print("[gsshop] 로그인 세션이 없어 새로 로그인했습니다.")
+                common.safe_print("[gsshop] 로그인 세션이 없어 새로 로그인했습니다.")
             elif headless:
                 raise BlockedError(
                     "GSSHOP 로그인이 필요합니다. 이 사이트는 로그인 폼의 reCAPTCHA가 체크박스 "
@@ -478,8 +441,8 @@ def get_tracking(
                 )
             else:
                 _prefill_login_id(page)
-                _safe_print("[gsshop] 아이디는 자동으로 입력했습니다. 뜬 브라우저 창에서 비밀번호를 입력하고 로그인해주세요.")
-                _safe_print("[gsshop] 로그인이 완료되면 자동으로 이어서 진행합니다 (최대 5분 대기).")
+                common.safe_print("[gsshop] 아이디는 자동으로 입력했습니다. 뜬 브라우저 창에서 비밀번호를 입력하고 로그인해주세요.")
+                common.safe_print("[gsshop] 로그인이 완료되면 자동으로 이어서 진행합니다 (최대 5분 대기).")
                 if not _wait_for_manual_login(page):
                     raise BlockedError("로그인 대기 시간(5분)이 지났습니다. 로그인 후 다시 실행해주세요.")
             # GSSHOP은 로그인 후 원래 페이지가 아니라 항상 홈으로 이동하므로

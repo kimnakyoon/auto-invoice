@@ -78,8 +78,10 @@ from urllib.parse import parse_qs, urlparse
 from dotenv import load_dotenv
 from playwright.sync_api import BrowserContext, Page
 
+from .. import browser as browser_mod
 from .. import order_date as order_date_mod
 from ..models import TrackingResult
+from . import common
 from .base import (
     BlockedError,
     ParseError,
@@ -165,45 +167,11 @@ MAX_RECIPIENT_LOOKUPS = 15
 DELIVERY_TEXT_SELECTOR = "span.text__delivery-cooper"
 NEXT_DATA_SELECTOR = "#__NEXT_DATA__"
 
-# 화면을 보려는 게 아니라 값만 읽으므로, 이미지/동영상/폰트는 받지 않는다.
-# (CSS는 그대로 받는다 - "더보기" 버튼이 보이는지 판단할 때 필요하다.)
-BLOCKED_RESOURCE_TYPES = {"image", "media", "font"}
-
 BOT_CHECK_PATTERNS = ["사람인지 확인", "봇(Bot)이란"]
 # 목록의 주문상태가 이 값이면 아직 발송 전이라 송장번호가 없는 게 정상이다.
 NOT_YET_STATUSES = ["입금확인중", "결제완료", "배송준비중", "상품준비중", "주문확인중"]
 
 DEFAULT_COURIER = "택배"  # 택배사명을 못 읽었을 때만 쓰는 기본값
-
-# 택배사 표기가 축약형/코드로 나올 수 있어 업로드 파일에는 정식 명칭으로
-# 맞춰 넣는다 (다른 어댑터와 동일한 규칙, 사용자 요청 그대로). 위에서부터
-# 순서대로 검사하므로 더 구체적인 키워드를 먼저 둔다.
-COURIER_NORMALIZATION = [
-    ("대한통운", "CJ대한통운"),
-    ("CJ", "CJ대한통운"),
-    ("롯데", "롯데택배"),
-    ("DELIBOX", "딜리박스"),
-]
-
-
-def _normalize_courier(raw: str) -> str:
-    for keyword, canonical in COURIER_NORMALIZATION:
-        if keyword in raw:
-            return canonical
-    return raw
-
-
-def _safe_print(message: str) -> None:
-    """GUI(pythonw)로 실행하면 콘솔이 없어 stdout이 없을 수 있다 - 그 경우 조용히 무시한다."""
-    try:
-        print(message)
-    except Exception:
-        pass
-
-
-# --------------------------------------------------------------------------
-# 주문옵션 비교
-# --------------------------------------------------------------------------
 
 # 옥션 주문옵션은 "색상 / 사이즈 / 38,500원 / 1개"처럼 슬래시로 구분된다.
 _SEGMENT_SPLIT = re.compile(r"[/|·]")
@@ -302,22 +270,6 @@ def recipient_matches(auction_name: str, shopmine_name: str) -> bool:
 # 페이지 열기 / 로그인
 # --------------------------------------------------------------------------
 
-# 이미지 차단 route를 컨텍스트마다 한 번만 건다.
-_ROUTED_CONTEXTS: set[int] = set()
-
-
-def _block_heavy_resources(context: BrowserContext) -> None:
-    if id(context) in _ROUTED_CONTEXTS:
-        return
-    context.route(
-        "**/*",
-        lambda route: route.abort()
-        if route.request.resource_type in BLOCKED_RESOURCE_TYPES
-        else route.continue_(),
-    )
-    _ROUTED_CONTEXTS.add(id(context))
-
-
 def _looks_like_login_page(page: Page) -> bool:
     """로그인 페이지로 튕겼는지. 서버가 302로 보내주므로 주소만 보면 바로 알 수 있다."""
     if LOGIN_HOST not in page.url:
@@ -375,7 +327,7 @@ def _goto_logged_in(page: Page, url: str, expect_selector: str | None = None) ->
         if not _looks_like_login_page(page):
             return
 
-    _safe_print("[auction] 로그인 세션이 없어 자동 로그인을 시도합니다.")
+    common.safe_print("[auction] 로그인 세션이 없어 자동 로그인을 시도합니다.")
     if not _auto_login(page):
         raise BlockedError("옥션 자동 로그인 후에도 로그인 페이지에서 벗어나지 못했습니다.")
     page.goto(url, wait_until="domcontentloaded")
@@ -384,7 +336,7 @@ def _goto_logged_in(page: Page, url: str, expect_selector: str | None = None) ->
 
 
 def _open_logged_in(context: BrowserContext, url: str, expect_selector: str | None = None) -> Page:
-    _block_heavy_resources(context)
+    browser_mod.block_heavy_resources(context)
     page = context.new_page()
     try:
         _goto_logged_in(page, url, expect_selector)
@@ -484,7 +436,7 @@ def _load_order_list(context: BrowserContext) -> list[ListedOrder]:
                 f"옥션 주문내역조회에서 최근 {LIST_PERIOD_DAYS}일 안의 주문을 하나도 읽지 못했습니다."
             )
         _ORDER_LIST_CACHE[id(context)] = orders
-        _safe_print(f"[auction] 최근 1개월 주문내역 {len(orders)}건을 읽었습니다.")
+        common.safe_print(f"[auction] 최근 1개월 주문내역 {len(orders)}건을 읽었습니다.")
         return orders
     finally:
         page.close()
@@ -531,7 +483,7 @@ def _find_order(
         # (실제로 "RBK / 260 / 40,000원 / 1개" 같은 옵션이 5건 넘게 반복된다)
         # 점수가 높은 순서대로 주문상세를 열어 수령인이 같은 주문을 고른다.
         # 후보마다 페이지를 새로 만들지 않고 하나를 재사용한다 (속도).
-        _block_heavy_resources(context)
+        browser_mod.block_heavy_resources(context)
         page = context.new_page()
         try:
             for _, order in candidates[:MAX_RECIPIENT_LOOKUPS]:
@@ -619,7 +571,7 @@ def _fetch_tracking(context: BrowserContext, order_no: str) -> TrackingResult:
                     f"배송조회 화면에 아직 송장번호가 없습니다 (주문번호={order_no})."
                 )
             tracking_no, raw_courier = fallback
-            return TrackingResult(tracking_no=tracking_no, courier=_normalize_courier(raw_courier))
+            return TrackingResult(tracking_no=tracking_no, courier=common.normalize_courier(raw_courier))
 
         # 엉뚱한 주문의 송장을 가져오지 않았는지 검증한다.
         trace_order_no = str(info.get("orderNo") or "").strip()
@@ -645,7 +597,7 @@ def _fetch_tracking(context: BrowserContext, order_no: str) -> TrackingResult:
 
         # shippingCompany는 "롯데택배                    "처럼 뒤에 공백이 붙어 오는 경우가 있다.
         raw_courier = str(info.get("shippingCompany") or "").strip()
-        courier = _normalize_courier(raw_courier) if raw_courier else DEFAULT_COURIER
+        courier = common.normalize_courier(raw_courier) if raw_courier else DEFAULT_COURIER
         return TrackingResult(tracking_no=distinct.pop(), courier=courier)
     finally:
         page.close()

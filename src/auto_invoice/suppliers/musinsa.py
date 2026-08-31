@@ -79,6 +79,7 @@ from playwright.sync_api import BrowserContext
 from .. import browser as browser_mod
 from .. import order_date as order_date_mod
 from ..models import TrackingResult
+from . import common
 from .base import (
     BlockedError,
     OrderNotFound,
@@ -136,16 +137,6 @@ COURIER_CODE_MAP = {
     "DELIBOX": "딜리박스",
 }
 
-# 혹시 코드가 아니라 이미 한글 명칭(축약형)으로 오는 경우를 대비한 안전망.
-# CJ대한통운/롯데택배는 "CJ", "대한통운", "롯데"처럼 축약되어 나올 수 있어
-# 업로드 파일에는 정식 명칭으로 맞춰 넣는다 (다른 어댑터와 동일한 정규화 규칙).
-COURIER_NORMALIZATION = [
-    ("대한통운", "CJ대한통운"),
-    ("CJ", "CJ대한통운"),
-    ("롯데", "롯데택배"),
-    ("DELIBOX", "딜리박스"),
-]
-
 # 두 번째/세 번째 계정용 context 캐시. GUI는 같은 파이썬 프로세스 안에서 실행
 # 버튼을 여러 번 누를 수 있고 그때마다 orchestrator가 새 Browser를 여니,
 # 브라우저 인스턴스별로 캐시해야 지난 실행에서 이미 닫힌 context를 재사용하지
@@ -154,11 +145,10 @@ _extra_context_cache: dict[tuple[int, str], BrowserContext] = {}
 
 
 def _normalize_courier(raw: str) -> str:
-    mapped = COURIER_CODE_MAP.get(raw, raw)
-    for keyword, canonical in COURIER_NORMALIZATION:
-        if keyword in mapped:
-            return canonical
-    return mapped
+    """무신사만 택배사를 코드("CJGLS")로 준다 - 코드표로 먼저 풀고 나서
+    공통 정규화(축약형 -> 정식 명칭)를 태운다. 코드표에 없으면 이미 한글
+    명칭으로 온 것으로 보고 그대로 넘긴다."""
+    return common.normalize_courier(COURIER_CODE_MAP.get(raw, raw))
 
 
 def extract_order_no(product_url: str) -> str:
@@ -190,23 +180,7 @@ def _looks_like_login_page(page) -> bool:
 
 def _prefill_login_id(page, musinsa_id: str | None) -> None:
     """수동 로그인 폴백용 - 아이디만 채워서 사람이 칠 것을 비밀번호만 남긴다."""
-    if not musinsa_id:
-        return
-    locator = page.get_by_placeholder(LOGIN_ID_PLACEHOLDER)
-    if locator.count() == 0:
-        return
-    try:
-        locator.fill(musinsa_id)
-    except Exception:
-        pass
-
-
-def _safe_print(message: str) -> None:
-    """GUI(pythonw)로 실행하면 콘솔이 없어 stdout이 없을 수 있다 - 그 경우 조용히 무시한다."""
-    try:
-        print(message)
-    except Exception:
-        pass
+    common.prefill_login_id(page, page.get_by_placeholder(LOGIN_ID_PLACEHOLDER), musinsa_id)
 
 
 def _recaptcha_required(page) -> bool:
@@ -305,12 +279,8 @@ def _auto_login(page, account_label: str) -> bool:
 
 
 def _wait_for_manual_login(page) -> bool:
-    elapsed_ms = 0
-    while elapsed_ms < LOGIN_WAIT_TIMEOUT_MS:
-        if not _looks_like_login_page(page):
-            return True
-        elapsed_ms += 1200  # _looks_like_login_page 내부에서 1200ms 대기함
-    return False
+    return common.wait_for_manual_login(
+        page, lambda: _looks_like_login_page(page), LOGIN_WAIT_TIMEOUT_MS, poll_ms=1200)
 
 
 def _get_extra_context(primary_context: BrowserContext, state_key: str, headless: bool) -> BrowserContext:
@@ -354,13 +324,13 @@ def _ensure_logged_in(context: BrowserContext, order_no: str, headless: bool, ac
             return  # 이미 로그인되어 있었음 (레이스 컨디션 등 방어)
 
         if _auto_login(page, account_label):
-            _safe_print(f"[musinsa] ({account_label}) 로그인 세션이 없어 자동 로그인했습니다.")
+            common.safe_print(f"[musinsa] ({account_label}) 로그인 세션이 없어 자동 로그인했습니다.")
         else:
             if headless:  # pragma: no cover - 위에서 이미 걸러지지만 방어적으로 남긴다
                 raise BlockedError(f"무신사 로그인이 필요합니다({account_label}). --headless 없이 실행해주세요.")
             _prefill_login_id(page, os.environ.get(id_env))
-            _safe_print(f"[musinsa] ({account_label}) 아이디는 자동으로 입력했습니다. 뜬 브라우저 창에서 비밀번호를 입력하고 로그인해주세요.")
-            _safe_print(f"[musinsa] ({account_label}) 로그인이 완료되면 자동으로 이어서 진행합니다 (최대 5분 대기).")
+            common.safe_print(f"[musinsa] ({account_label}) 아이디는 자동으로 입력했습니다. 뜬 브라우저 창에서 비밀번호를 입력하고 로그인해주세요.")
+            common.safe_print(f"[musinsa] ({account_label}) 로그인이 완료되면 자동으로 이어서 진행합니다 (최대 5분 대기).")
             if not _wait_for_manual_login(page):
                 raise BlockedError(f"무신사({account_label}) 로그인 대기 시간(5분)이 지났습니다. 로그인 후 다시 실행해주세요.")
 

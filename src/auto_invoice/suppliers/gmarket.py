@@ -43,6 +43,7 @@ from dotenv import load_dotenv
 from playwright.sync_api import BrowserContext
 
 from ..models import TrackingResult
+from . import common
 from .base import (
     BlockedError,
     ParseError,
@@ -77,23 +78,6 @@ TRACKING_LINE_PATTERN = re.compile(r"([가-힣A-Za-z]{2,20})\s*([0-9][0-9\-]{7,}
 NOT_YET_PATTERNS = ["배송준비중", "상품준비중", "결제확인중", "주문확인중"]
 BOT_CHECK_PATTERNS = ["사람인지 확인", "봇(Bot)이란"]
 
-# 지마켓 화면에 뜨는 택배사 표기가 샵마인이 기대하는 정식 명칭과 달라서
-# (예: "CJ택배") 업로드 파일에는 정식 명칭으로 맞춰 넣는다. 위에서부터
-# 순서대로 검사하므로 더 구체적인 키워드를 먼저 둔다.
-COURIER_NORMALIZATION = [
-    ("대한통운", "CJ대한통운"),
-    ("CJ", "CJ대한통운"),
-    ("롯데", "롯데택배"),
-    ("DELIBOX", "딜리박스"),
-]
-
-
-def _normalize_courier(raw: str) -> str:
-    for keyword, canonical in COURIER_NORMALIZATION:
-        if keyword in raw:
-            return canonical
-    return raw
-
 
 def extract_order_id(product_url: str) -> str:
     parsed = urlparse(product_url)
@@ -120,24 +104,7 @@ def _looks_like_bot_check(page) -> bool:
 
 def _prefill_login_id(page) -> None:
     """비밀번호는 절대 자동 입력하지 않는다 - 아이디만 채워서 타이핑을 줄인다."""
-    gmarket_id = os.environ.get("GMARKET_ID")
-    if not gmarket_id:
-        return
-    locator = page.locator(LOGIN_ID_SELECTOR)
-    if locator.count() == 0:
-        return
-    try:
-        locator.fill(gmarket_id)
-    except Exception:
-        pass
-
-
-def _safe_print(message: str) -> None:
-    """GUI(pythonw)로 실행하면 콘솔이 없어 stdout이 없을 수 있다 - 그 경우 조용히 무시한다."""
-    try:
-        print(message)
-    except Exception:
-        pass
+    common.prefill_login_id(page, page.locator(LOGIN_ID_SELECTOR), os.environ.get("GMARKET_ID"))
 
 
 def _captcha_is_visible(page) -> bool:
@@ -168,7 +135,7 @@ def _auto_login(page) -> bool:
         return False
     if _captcha_is_visible(page):
         # 캡차 이미지를 읽어서 푸는 건 우회 시도라 하지 않는다 - 사람에게 넘긴다.
-        _safe_print("[gmarket] 캡차가 요구되어 자동 로그인을 건너뜁니다.")
+        common.safe_print("[gmarket] 캡차가 요구되어 자동 로그인을 건너뜁니다.")
         return False
 
     alerts: list[str] = []
@@ -208,12 +175,8 @@ def _auto_login(page) -> bool:
 
 def _wait_for_manual_login(page) -> bool:
     """비밀번호 입력창이 사라질 때까지(=로그인 완료) 화면 상태를 폴링하며 대기한다."""
-    elapsed_ms = 0
-    while elapsed_ms < LOGIN_WAIT_TIMEOUT_MS:
-        if not _looks_like_login_page(page):
-            return True
-        elapsed_ms += 1500  # _looks_like_login_page 내부에서 1500ms 대기함
-    return False
+    return common.wait_for_manual_login(
+        page, lambda: _looks_like_login_page(page), LOGIN_WAIT_TIMEOUT_MS)
 
 
 def _wait_for_bot_check_to_clear(page) -> bool:
@@ -311,7 +274,7 @@ def _scrape_tracking_from_page(page, order_id: str, order_option: str | None = N
         matched_idx = max(tracking_matches)  # 기존 동작(마지막 매치) 유지
 
     tracking_match = tracking_matches[matched_idx]
-    courier = _normalize_courier(tracking_match.group(1).strip() or DEFAULT_COURIER)
+    courier = common.normalize_courier(tracking_match.group(1).strip() or DEFAULT_COURIER)
     tracking_no = re.sub(r"[^0-9]", "", tracking_match.group(2))
 
     return TrackingResult(tracking_no=tracking_no, courier=courier)
@@ -330,14 +293,14 @@ def get_tracking(
                 raise BlockedError(
                     "지마켓 봇 확인(Cloudflare) 화면이 떴습니다. 먼저 --headless 없이 실행해 수동으로 통과해주세요."
                 )
-            _safe_print("[gmarket] 봇 확인 화면이 떴습니다. 뜬 브라우저 창에서 직접 체크박스를 눌러 통과해주세요.")
+            common.safe_print("[gmarket] 봇 확인 화면이 떴습니다. 뜬 브라우저 창에서 직접 체크박스를 눌러 통과해주세요.")
             if not _wait_for_bot_check_to_clear(page):
                 raise BlockedError("봇 확인 대기 시간(3분)이 지났습니다. 통과 후 다시 실행해주세요.")
             page.goto(product_url, wait_until="domcontentloaded")
 
         if _looks_like_login_page(page):
             if _auto_login(page):
-                _safe_print("[gmarket] 로그인 세션이 없어 자동 로그인했습니다.")
+                common.safe_print("[gmarket] 로그인 세션이 없어 자동 로그인했습니다.")
             elif headless:
                 raise BlockedError(
                     "지마켓 로그인이 필요합니다. .env에 GMARKET_PW를 넣으면 자동 로그인하고, "
@@ -345,8 +308,8 @@ def get_tracking(
                 )
             else:
                 _prefill_login_id(page)
-                _safe_print("[gmarket] 아이디는 자동으로 입력했습니다. 뜬 브라우저 창에서 비밀번호를 입력하고 로그인해주세요.")
-                _safe_print("[gmarket] 로그인이 완료되면 자동으로 이어서 진행합니다 (최대 5분 대기).")
+                common.safe_print("[gmarket] 아이디는 자동으로 입력했습니다. 뜬 브라우저 창에서 비밀번호를 입력하고 로그인해주세요.")
+                common.safe_print("[gmarket] 로그인이 완료되면 자동으로 이어서 진행합니다 (최대 5분 대기).")
                 if not _wait_for_manual_login(page):
                     raise BlockedError("로그인 대기 시간(5분)이 지났습니다. 로그인 후 다시 실행해주세요.")
             page.goto(product_url, wait_until="domcontentloaded")

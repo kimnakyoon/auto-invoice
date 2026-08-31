@@ -32,6 +32,7 @@ from dotenv import load_dotenv
 from playwright.sync_api import BrowserContext
 
 from ..models import TrackingResult
+from . import common
 from .base import (
     BlockedError,
     ParseError,
@@ -62,22 +63,6 @@ NOT_YET_PATTERNS = [
     "배송준비중",
 ]
 
-# CJ대한통운은 화면에 "대한통운"으로 짧게 나오는 경우가 많아, 정식 명칭으로
-# 맞춰 넣는다 (지마켓 어댑터와 동일한 정규화 규칙).
-COURIER_NORMALIZATION = [
-    ("대한통운", "CJ대한통운"),
-    ("CJ", "CJ대한통운"),
-    ("롯데", "롯데택배"),
-    ("DELIBOX", "딜리박스"),
-]
-
-
-def _normalize_courier(raw: str) -> str:
-    for keyword, canonical in COURIER_NORMALIZATION:
-        if keyword in raw:
-            return canonical
-    return raw
-
 
 def extract_order_no(product_url: str) -> str:
     parsed = urlparse(product_url)
@@ -93,14 +78,6 @@ def _looks_like_login_page(page) -> bool:
     if "member.ssg.com" not in page.url and "login" not in page.url.lower():
         return False
     return page.locator("input[type='password']").count() > 0
-
-
-def _safe_print(message: str) -> None:
-    """GUI(pythonw)로 실행하면 콘솔이 없어 stdout이 없을 수 있다 - 그 경우 조용히 무시한다."""
-    try:
-        print(message)
-    except Exception:
-        pass
 
 
 def _auto_login(page) -> bool:
@@ -180,7 +157,7 @@ def _scrape_tracking_from_page(page, order_no: str, order_option: str | None = N
             raise ParseError(f"한 주문에 서로 다른 송장번호가 여러 개 있습니다 (orordNo={order_no}) - 상품별로 나눠 배송된 것으로 보입니다.")
         tracking_match = anchor_matches[0][1]
 
-    courier = _normalize_courier(tracking_match.group(1).strip())
+    courier = common.normalize_courier(tracking_match.group(1).strip())
     tracking_no = re.sub(r"[^0-9]", "", tracking_match.group(2))
 
     return TrackingResult(tracking_no=tracking_no, courier=courier)
@@ -195,7 +172,7 @@ def get_tracking(
         page.goto(product_url, wait_until="domcontentloaded")
 
         if _looks_like_login_page(page):
-            _safe_print("[ssg] 로그인 세션이 없어 자동 로그인을 시도합니다.")
+            common.safe_print("[ssg] 로그인 세션이 없어 자동 로그인을 시도합니다.")
             if not _auto_login(page):
                 raise BlockedError("SSG 자동 로그인 후에도 로그인 페이지에서 벗어나지 못했습니다.")
             if _looks_like_login_page(page):

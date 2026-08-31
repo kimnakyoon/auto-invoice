@@ -34,6 +34,7 @@ from dotenv import load_dotenv
 from playwright.sync_api import BrowserContext
 
 from ..models import TrackingResult
+from . import common
 from .base import (
     BlockedError,
     ParseError,
@@ -64,23 +65,6 @@ COURIER_PATTERN = re.compile(r"택배사\n([^\n]{1,20})")
 TRACKING_NO_PATTERN = re.compile(r"(?:송장번호|운송장번호)\n([0-9][0-9\-]{5,})")
 NOT_YET_PATTERNS = ["상품준비중", "배송준비중", "결제완료"]
 
-# 택배사 표기가 축약형/코드로 나올 수 있어 업로드 파일에는 정식 명칭으로
-# 맞춰 넣는다 (다른 어댑터와 동일한 규칙, 사용자 요청 그대로). 위에서부터
-# 순서대로 검사하므로 더 구체적인 키워드를 먼저 둔다.
-COURIER_NORMALIZATION = [
-    ("대한통운", "CJ대한통운"),
-    ("CJ", "CJ대한통운"),
-    ("롯데", "롯데택배"),
-    ("DELIBOX", "딜리박스"),
-]
-
-
-def _normalize_courier(raw: str) -> str:
-    for keyword, canonical in COURIER_NORMALIZATION:
-        if keyword in raw:
-            return canonical
-    return raw
-
 
 def extract_od_no(product_url: str) -> str:
     parsed = urlparse(product_url)
@@ -107,24 +91,7 @@ def _looks_like_login_page(page) -> bool:
 
 def _prefill_login_id(page) -> None:
     """비밀번호는 절대 자동 입력하지 않는다 - 아이디만 채워서 타이핑을 줄인다."""
-    lotteon_id = os.environ.get("LOTTEON_ID")
-    if not lotteon_id:
-        return
-    locator = page.locator(LOGIN_ID_SELECTOR)
-    if locator.count() == 0:
-        return
-    try:
-        locator.fill(lotteon_id)
-    except Exception:
-        pass
-
-
-def _safe_print(message: str) -> None:
-    """GUI(pythonw)로 실행하면 콘솔이 없어 stdout이 없을 수 있다 - 그 경우 조용히 무시한다."""
-    try:
-        print(message)
-    except Exception:
-        pass
+    common.prefill_login_id(page, page.locator(LOGIN_ID_SELECTOR), os.environ.get("LOTTEON_ID"))
 
 
 def _auto_login(page) -> bool:
@@ -182,12 +149,8 @@ def _wait_for_manual_login(page) -> bool:
     받을 수 없다 (stdin이 없어 예외가 나거나 그대로 멈춘다). 그래서 사람이
     직접 로그인 버튼을 눌러 페이지가 바뀌는 것을 감지하는 방식으로 바꿨다.
     """
-    elapsed_ms = 0
-    while elapsed_ms < LOGIN_WAIT_TIMEOUT_MS:
-        if not _looks_like_login_page(page):
-            return True
-        elapsed_ms += 1500  # _looks_like_login_page 내부에서 1500ms 대기함
-    return False
+    return common.wait_for_manual_login(
+        page, lambda: _looks_like_login_page(page), LOGIN_WAIT_TIMEOUT_MS)
 
 
 def _click_tracking_button(page) -> None:
@@ -256,7 +219,7 @@ def _scrape_tracking_from_page(page, od_no: str, order_option: str | None = None
     window_start = max(0, tracking_match.start() - 60)
     window = body_text[window_start : tracking_match.start()]
     courier_match = COURIER_PATTERN.search(window)
-    courier = _normalize_courier(courier_match.group(1).strip()) if courier_match else DEFAULT_COURIER
+    courier = common.normalize_courier(courier_match.group(1).strip()) if courier_match else DEFAULT_COURIER
 
     return TrackingResult(tracking_no=tracking_no, courier=courier)
 
@@ -271,7 +234,7 @@ def get_tracking(
 
         if _looks_like_login_page(page):
             if _auto_login(page):
-                _safe_print("[lotteon] 로그인 세션이 없어 자동 로그인했습니다.")
+                common.safe_print("[lotteon] 로그인 세션이 없어 자동 로그인했습니다.")
             elif headless:
                 raise BlockedError(
                     "롯데온 로그인이 필요합니다. .env에 LOTTEON_PW를 넣으면 자동 로그인하고, "
@@ -279,8 +242,8 @@ def get_tracking(
                 )
             else:
                 _prefill_login_id(page)
-                _safe_print("[lotteon] 아이디는 자동으로 입력했습니다. 뜬 브라우저 창에서 비밀번호를 입력하고 로그인해주세요.")
-                _safe_print("[lotteon] 로그인이 완료되면 자동으로 이어서 진행합니다 (최대 5분 대기).")
+                common.safe_print("[lotteon] 아이디는 자동으로 입력했습니다. 뜬 브라우저 창에서 비밀번호를 입력하고 로그인해주세요.")
+                common.safe_print("[lotteon] 로그인이 완료되면 자동으로 이어서 진행합니다 (최대 5분 대기).")
                 if not _wait_for_manual_login(page):
                     raise BlockedError("로그인 대기 시간(5분)이 지났습니다. 로그인 후 다시 실행해주세요.")
             page.goto(product_url, wait_until="domcontentloaded")

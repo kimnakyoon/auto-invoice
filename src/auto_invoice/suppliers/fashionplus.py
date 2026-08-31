@@ -51,6 +51,7 @@ from playwright.sync_api import BrowserContext
 from playwright.sync_api import TimeoutError as PlaywrightTimeoutError
 
 from ..models import TrackingResult
+from . import common
 from .base import (
     BlockedError,
     ParseError,
@@ -87,22 +88,6 @@ LOGIN_RESPONSE_TIMEOUT_MS = 15 * 1000  # 로그인 API 응답 대기
 TRACKING_LINK_TEXT = "배송조회"
 NOT_YET_PATTERNS = ["배송준비중", "결제완료", "입금대기", "주문확인중"]
 
-# CJ대한통운/롯데택배가 화면/응답에 축약형("CJ", "대한통운", "롯데")으로 나올 수
-# 있어 업로드 파일에는 정식 명칭으로 맞춰 넣는다 (다른 어댑터와 동일한 규칙).
-COURIER_NORMALIZATION = [
-    ("대한통운", "CJ대한통운"),
-    ("CJ", "CJ대한통운"),
-    ("롯데", "롯데택배"),
-    ("DELIBOX", "딜리박스"),
-]
-
-
-def _normalize_courier(raw: str) -> str:
-    for keyword, canonical in COURIER_NORMALIZATION:
-        if keyword in raw:
-            return canonical
-    return raw
-
 
 def extract_order_no(product_url: str) -> str:
     match = re.search(r"/order/detail/(\d+)", product_url)
@@ -122,24 +107,7 @@ def _looks_like_login_page(page) -> bool:
 
 def _prefill_login_id(page) -> None:
     """비밀번호는 절대 자동 입력하지 않는다 - 아이디만 채워서 타이핑을 줄인다."""
-    fashionplus_id = os.environ.get("FASHIONPLUS_ID")
-    if not fashionplus_id:
-        return
-    locator = page.locator(LOGIN_ID_SELECTOR)
-    if locator.count() == 0:
-        return
-    try:
-        locator.fill(fashionplus_id)
-    except Exception:
-        pass
-
-
-def _safe_print(message: str) -> None:
-    """GUI(pythonw)로 실행하면 콘솔이 없어 stdout이 없을 수 있다 - 그 경우 조용히 무시한다."""
-    try:
-        print(message)
-    except Exception:
-        pass
+    common.prefill_login_id(page, page.locator(LOGIN_ID_SELECTOR), os.environ.get("FASHIONPLUS_ID"))
 
 
 def _enable_keep_login(page) -> None:
@@ -215,12 +183,8 @@ def _login_error_message(response) -> str:
 
 
 def _wait_for_manual_login(page) -> bool:
-    elapsed_ms = 0
-    while elapsed_ms < LOGIN_WAIT_TIMEOUT_MS:
-        if not _looks_like_login_page(page):
-            return True
-        elapsed_ms += 1500  # _looks_like_login_page 내부에서 1500ms 대기함
-    return False
+    return common.wait_for_manual_login(
+        page, lambda: _looks_like_login_page(page), LOGIN_WAIT_TIMEOUT_MS)
 
 
 def _collect_tracking_links(page) -> list[str]:
@@ -318,7 +282,7 @@ def _scrape_tracking_from_page(
         chosen = tracked[0][1]
 
     tracking_no = re.sub(r"[^0-9]", "", chosen["invoiceNo"])
-    courier = _normalize_courier((chosen.get("logisticsName") or "").strip() or DEFAULT_COURIER)
+    courier = common.normalize_courier((chosen.get("logisticsName") or "").strip() or DEFAULT_COURIER)
     return TrackingResult(tracking_no=tracking_no, courier=courier)
 
 
@@ -333,7 +297,7 @@ def get_tracking(
 
         if _looks_like_login_page(page):
             if _auto_login(page):
-                _safe_print("[fashionplus] 로그인 세션이 없어 자동 로그인했습니다.")
+                common.safe_print("[fashionplus] 로그인 세션이 없어 자동 로그인했습니다.")
             elif headless:
                 raise BlockedError(
                     "패션플러스 로그인이 필요합니다. .env에 FASHIONPLUS_PW를 넣으면 자동 로그인하고, "
@@ -342,8 +306,8 @@ def get_tracking(
             else:
                 _prefill_login_id(page)
                 _enable_keep_login(page)
-                _safe_print("[fashionplus] 아이디는 자동으로 입력했습니다. 뜬 브라우저 창에서 비밀번호를 입력하고 로그인해주세요.")
-                _safe_print("[fashionplus] 로그인이 완료되면 자동으로 이어서 진행합니다 (최대 5분 대기).")
+                common.safe_print("[fashionplus] 아이디는 자동으로 입력했습니다. 뜬 브라우저 창에서 비밀번호를 입력하고 로그인해주세요.")
+                common.safe_print("[fashionplus] 로그인이 완료되면 자동으로 이어서 진행합니다 (최대 5분 대기).")
                 if not _wait_for_manual_login(page):
                     raise BlockedError("로그인 대기 시간(5분)이 지났습니다. 로그인 후 다시 실행해주세요.")
             page.goto(url, wait_until="domcontentloaded")

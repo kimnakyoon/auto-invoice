@@ -44,6 +44,7 @@ from dotenv import load_dotenv
 from playwright.sync_api import BrowserContext, Page
 
 from ..models import TrackingResult
+from . import common
 from .base import (
     BlockedError,
     ParseError,
@@ -70,22 +71,6 @@ TRACKING_LINK_TEXT = "배송조회"
 TRACKING_API_MARKER = "order-dlvr-detail-with-gift"
 NOT_YET_PATTERNS = ["결제완료", "상품준비중", "배송준비중", "주문접수"]
 
-# CJ대한통운/롯데택배/딜리박스가 축약형/코드로 나올 수 있어 업로드 파일에는
-# 정식 명칭으로 맞춰 넣는다 (다른 어댑터와 동일한 규칙, 사용자 요청 그대로).
-COURIER_NORMALIZATION = [
-    ("대한통운", "CJ대한통운"),
-    ("CJ", "CJ대한통운"),
-    ("롯데", "롯데택배"),
-    ("DELIBOX", "딜리박스"),
-]
-
-
-def _normalize_courier(raw: str) -> str:
-    for keyword, canonical in COURIER_NORMALIZATION:
-        if keyword in raw:
-            return canonical
-    return raw
-
 
 def extract_order_no(product_url: str) -> str:
     parsed = urlparse(product_url)
@@ -101,14 +86,6 @@ def _looks_like_login_page(page: Page) -> bool:
     if urlparse(page.url).path.rstrip("/") != "/customer/login":
         return False
     return page.locator("input[type='password']").count() > 0
-
-
-def _safe_print(message: str) -> None:
-    """GUI(pythonw)로 실행하면 콘솔이 없어 stdout이 없을 수 있다 - 그 경우 조용히 무시한다."""
-    try:
-        print(message)
-    except Exception:
-        pass
 
 
 def _auto_login(page: Page) -> bool:
@@ -147,7 +124,7 @@ def _parse_tracking_response(body: dict, order_no: str) -> tuple[str, str]:
     tracking_no = re.sub(r"[^0-9]", "", wbl_num)
 
     courier_raw = (tracking_list[0].get("lscNm") if tracking_list else None) or order_items.get("dlvrEntCdNm")
-    courier = _normalize_courier(courier_raw.strip()) if courier_raw and courier_raw.strip() else "택배"
+    courier = common.normalize_courier(courier_raw.strip()) if courier_raw and courier_raw.strip() else "택배"
 
     return tracking_no, courier
 
@@ -234,7 +211,7 @@ def get_tracking(
         page.goto(product_url, wait_until="domcontentloaded")
 
         if _looks_like_login_page(page):
-            _safe_print("[nsmall] 로그인 세션이 없어 자동 로그인을 시도합니다.")
+            common.safe_print("[nsmall] 로그인 세션이 없어 자동 로그인을 시도합니다.")
             if not _auto_login(page):
                 raise BlockedError("NS홈쇼핑 자동 로그인 후에도 로그인 페이지에서 벗어나지 못했습니다.")
             if _looks_like_login_page(page):

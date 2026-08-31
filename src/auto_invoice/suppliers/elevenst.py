@@ -45,6 +45,7 @@ from dotenv import load_dotenv
 from playwright.sync_api import BrowserContext, Page
 
 from ..models import TrackingResult
+from . import common
 from .base import (
     BlockedError,
     ParseError,
@@ -94,24 +95,7 @@ ORDER_NO_LABEL = "주문번호"
 # "CJ대한통운 1588-1255"처럼 택배사명 뒤에 고객센터 전화번호가 붙어서 나온다.
 COURIER_PHONE_PATTERN = re.compile(r"\s*[0-9][0-9\-]{5,}\s*$")
 
-# 택배사 표기가 축약형/코드로 나올 수 있어 업로드 파일에는 정식 명칭으로
-# 맞춰 넣는다 (다른 어댑터와 동일한 규칙, 사용자 요청 그대로). 위에서부터
-# 순서대로 검사하므로 더 구체적인 키워드를 먼저 둔다.
-COURIER_NORMALIZATION = [
-    ("대한통운", "CJ대한통운"),
-    ("CJ", "CJ대한통운"),
-    ("롯데", "롯데택배"),
-    ("DELIBOX", "딜리박스"),
-]
-
 DEFAULT_COURIER = "택배"  # 택배사명을 못 읽었을 때만 쓰는 기본값
-
-
-def _normalize_courier(raw: str) -> str:
-    for keyword, canonical in COURIER_NORMALIZATION:
-        if keyword in raw:
-            return canonical
-    return raw
 
 
 def extract_order_no(product_url: str) -> str:
@@ -128,14 +112,6 @@ def _looks_like_login_page(page: Page) -> bool:
     if "login.11st.co.kr" not in page.url:
         return False
     return page.locator("input[type='password']").count() > 0
-
-
-def _safe_print(message: str) -> None:
-    """GUI(pythonw)로 실행하면 콘솔이 없어 stdout이 없을 수 있다 - 그 경우 조용히 무시한다."""
-    try:
-        print(message)
-    except Exception:
-        pass
 
 
 def _dismiss_post_login_modals(page: Page) -> None:
@@ -242,7 +218,7 @@ def _fetch_tracking_by_dlv_no(context: BrowserContext, dlv_no: str, order_no: st
         raw_courier = _read_field_value(page, COURIER_FIELD_LABEL) or ""
         # "CJ대한통운 1588-1255" -> "CJ대한통운"
         courier_name = COURIER_PHONE_PATTERN.sub("", raw_courier).strip()
-        courier = _normalize_courier(courier_name) if courier_name else DEFAULT_COURIER
+        courier = common.normalize_courier(courier_name) if courier_name else DEFAULT_COURIER
 
         return tracking_no, courier
     finally:
@@ -323,7 +299,7 @@ def get_tracking(
         page.goto(product_url, wait_until="domcontentloaded")
 
         if _looks_like_login_page(page):
-            _safe_print("[11st] 로그인 세션이 없어 자동 로그인을 시도합니다.")
+            common.safe_print("[11st] 로그인 세션이 없어 자동 로그인을 시도합니다.")
             if not _auto_login(page):
                 raise BlockedError("11번가 자동 로그인 후에도 로그인 페이지에서 벗어나지 못했습니다.")
             page.goto(product_url, wait_until="domcontentloaded")
