@@ -11,6 +11,7 @@ import contextlib
 import os
 import socket
 import subprocess
+import threading
 import time
 from pathlib import Path
 
@@ -25,7 +26,11 @@ DESKTOP_VIEWPORT = {"width": 1280, "height": 900}
 # 실행 중인 Playwright 인스턴스. 어댑터는 BrowserContext만 받기 때문에,
 # 로그인만 별도의 브라우저로 띄워야 하는 사이트(현대몰)가 인스턴스를 다시
 # 구할 방법이 없어서 여기에 담아둔다.
-_playwright: Playwright | None = None
+#
+# 스레드마다 따로 담는다 - 공급사를 동시에 조회할 때(orchestrator) 스레드마다
+# 자기 Playwright를 열고, sync API 객체는 만든 스레드 밖에서 쓰면 안 된다.
+# 전역 하나로 두면 나중에 시작한 스레드의 인스턴스를 다른 스레드가 집어간다.
+_local = threading.local()
 
 
 def state_path(site_key: str) -> Path:
@@ -38,8 +43,7 @@ def remember_playwright(playwright: Playwright) -> None:
 
     get_context()를 거치지 않는 검증 스크립트는 이걸 직접 불러줘야 한다.
     """
-    global _playwright
-    _playwright = playwright
+    _local.playwright = playwright
 
 
 def get_context(playwright: Playwright, site_key: str, headless: bool = True) -> tuple[Browser, BrowserContext]:
@@ -97,8 +101,8 @@ def save_state(context: BrowserContext, site_key: str) -> None:
 
 
 def current_playwright() -> Playwright | None:
-    """get_context()가 마지막으로 받은 Playwright 인스턴스."""
-    return _playwright
+    """이 스레드의 get_context()가 마지막으로 받은 Playwright 인스턴스."""
+    return getattr(_local, "playwright", None)
 
 
 def real_chrome_profile_dir(site_key: str) -> Path:
@@ -129,7 +133,7 @@ def real_chrome_context(
     호출한 쪽이 정한다 - 기본값(모바일)으로 PC 로그인 페이지를 열면 레이아웃이
     잘려서, 사람이 눌러야 하는 요소가 화면 가장자리에 반쯤 걸치는 일이 있었다.
     """
-    pw = playwright or _playwright
+    pw = playwright or current_playwright()
     if pw is None:
         raise RuntimeError("Playwright 인스턴스가 없습니다 - get_context()를 먼저 호출해야 합니다.")
     profile = real_chrome_profile_dir(site_key)
@@ -199,7 +203,7 @@ def real_chrome_cdp_context(site_key: str, playwright: Playwright | None = None)
     창은 반드시 보이는 상태로 띄운다 - headless 크롬은 Turnstile/reCAPTCHA
     양쪽 모두에서 점수가 바닥이다.
     """
-    pw = playwright or _playwright
+    pw = playwright or current_playwright()
     if pw is None:
         raise RuntimeError("Playwright 인스턴스가 없습니다 - get_context()를 먼저 호출해야 합니다.")
 

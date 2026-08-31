@@ -234,11 +234,12 @@ def lookup_tracking(result: PipelineResult, *, limit=None, headless=False,
     log("")
     log(f"[5/{STEPS}] 공급사에서 송장번호 조회")
 
-    # 한 건에 수십 초씩 걸려서, 몇 건째를 하고 있는지 안 보이면 멈춘 것처럼
-    # 보인다. 주문마다 (3/100) 처럼 진행 상황을 남긴다.
-    def on_progress(index, total, order_id, message):
-        log(f"  ({index}/{total}) {order_id}: {message}" if message
-            else f"  ({index}/{total}) {order_id}")
+    # 한 건에 수십 초씩 걸려서, 얼마나 했는지 안 보이면 멈춘 것처럼 보인다.
+    # 주문마다 (3/100) 처럼 진행 상황을 남긴다. 공급사를 동시에 돌리므로
+    # 이 숫자는 '엑셀 몇 번째 줄'이 아니라 '지금까지 끝낸 건수'다.
+    def on_progress(done, total, order_id, message):
+        log(f"  ({done}/{total}) {order_id}: {message}" if message
+            else f"  ({done}/{total}) {order_id}")
 
     def on_checkpoint(entries, rows):
         # 한 건 끝날 때마다 남긴다 - 다음 건에서 멈춰도 여기까지는 살아남는다.

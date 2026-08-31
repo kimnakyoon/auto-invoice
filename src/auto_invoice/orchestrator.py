@@ -3,11 +3,18 @@
 샵마인 '발송대상' 엑셀(입력) -> 공급사별 송장번호 조회 -> 샵마인
 '발송정보일괄등록(수정용)' 형식 엑셀(출력) 생성까지만 담당한다.
 생성된 엑셀을 실제로 업로드하는 것은 사람이 직접 한다.
+
+조회는 공급사별로 나눠 동시에 돈다. 사이트끼리는 서로 아무 상관이 없는데
+한 줄로 세워 돌리면 전체 시간이 '모든 사이트의 합'이 되고, 한 건에 수십
+초씩이라 그게 실행 시간의 거의 전부다. 같은 사이트 안에서는 예전처럼 한
+건씩 순서대로 본다 - 한 사이트에 요청을 몰아치면 봇으로 보인다.
 """
 
 from __future__ import annotations
 
+import threading
 from collections import Counter
+from concurrent.futures import ThreadPoolExecutor
 from typing import Callable, Iterable
 
 from playwright.sync_api import sync_playwright
@@ -27,6 +34,39 @@ ProgressCallback = Callable[[int, int, str, str], None]
 CheckpointCallback = Callable[[list, list], None]
 
 
+class _Shared:
+    """공급사 스레드들이 같이 쓰는 결과 모음.
+
+    RunReport에 남기는 것과 업로드 행 추가는 전부 이 락 안에서 한다. 진행
+    표시와 진행 상황 저장은 락 밖에서 부른다 - 파일 쓰기나 GUI 큐에 넣는
+    일이라, 락을 쥔 채로 하면 다른 공급사가 그동안 멈춘다.
+    """
+
+    def __init__(self, report: RunReport, upload_rows: list, total: int, done: int,
+                 on_progress: ProgressCallback | None,
+                 on_checkpoint: CheckpointCallback | None) -> None:
+        self.lock = threading.Lock()
+        self.report = report
+        self.upload_rows = upload_rows
+        self.total = total
+        self._done = done
+        self._on_progress = on_progress
+        self._on_checkpoint = on_checkpoint
+
+    def finished(self, order_id: str, message: str) -> None:
+        """주문 한 건을 끝냈다고 알린다 (성공/실패/스킵 어느 쪽이든)."""
+        with self.lock:
+            self._done += 1
+            done = self._done
+            entries = list(self.report.entries)
+            rows = list(self.upload_rows)
+        if self._on_progress is not None:
+            self._on_progress(done, self.total, order_id, message)
+        # 여기서 저장해두면 다음 주문을 조회하다 멈춰도 지금까지의 결과는 남는다.
+        if self._on_checkpoint is not None:
+            self._on_checkpoint(entries, rows)
+
+
 def run(
     input_path: str,
     output_path: str,
@@ -37,7 +77,10 @@ def run(
     done_rows: Iterable | None = None,
     on_checkpoint: CheckpointCallback | None = None,
 ) -> RunReport:
-    """on_progress(index, total, order_id, message) — GUI 등에서 진행 상황을 보여줄 때 사용.
+    """on_progress(끝낸 건수, 전체, order_id, message) — GUI 등에서 진행 상황을 보여줄 때 사용.
+
+    공급사를 동시에 돌리므로 '몇 번째 주문'이 아니라 '지금까지 끝낸 건수'를
+    넘긴다 - 엑셀 순서대로 끝나지 않는다.
 
     done_entries / done_rows: 지난 실행에서 이미 조회를 끝낸 결과. 여기 있는
     주문은 공급사에 다시 묻지 않고 그 결과를 그대로 쓴다 - 실행이 중간에
@@ -66,117 +109,165 @@ def run(
     remaining_done = Counter(e.order_id for e in report.entries)
     upload_rows: list[tuple[str, str, str | None]] = [tuple(r) for r in (done_rows or [])]
 
-    with sync_playwright() as p:
-        supplier_contexts: dict[str, tuple] = {}
-        # 로그인 자체가 막힌 사이트는 주문마다 몇 분씩 다시 로그인 대기를
-        # 반복하지 않도록, 한 번 막히면 이후 주문은 바로 스킵한다.
-        blocked_sites: dict[str, str] = {}
+    pending = []
+    for order in orders:
+        if remaining_done.get(order.order_id):
+            remaining_done[order.order_id] -= 1
+            continue
+        pending.append(order)
 
-        for i, order in enumerate(orders, start=1):
-            message = ""
-            if remaining_done.get(order.order_id):
-                remaining_done[order.order_id] -= 1
-                continue
-            try:
-                adapter = get_adapter(order.product_url)
-                if adapter is None:
-                    message = f"등록된 어댑터 없음: {order.product_url}"
-                    report.unsupported_site(order.order_id, order.product_url,
-                                            recipient_name=order.recipient_name)
-                    continue
+    shared = _Shared(report, upload_rows, total, total - len(pending),
+                     on_progress, on_checkpoint)
 
-                site_key = adapter.SITE_KEY
-                if site_key in blocked_sites:
-                    message = f"건너뜀: {blocked_sites[site_key]}"
-                    report.skip(order.order_id, message, product_url=order.product_url)
-                    continue
+    # 공급사별로 묶는다. 어댑터가 없는 주문은 브라우저를 열 필요가 없으니
+    # 여기서 끝낸다.
+    by_site: dict[str, list] = {}
+    for order in pending:
+        adapter = get_adapter(order.product_url)
+        if adapter is None:
+            with shared.lock:
+                report.unsupported_site(order.order_id, order.product_url,
+                                        recipient_name=order.recipient_name)
+            shared.finished(order.order_id, f"등록된 어댑터 없음: {order.product_url}")
+            continue
+        by_site.setdefault(adapter.SITE_KEY, []).append((order, adapter))
 
-                if site_key not in supplier_contexts:
-                    supplier_contexts[site_key] = browser_mod.get_context(p, site_key, headless=headless)
-                _, supplier_context = supplier_contexts[site_key]
+    if by_site:
+        workers = max(1, min(settings.workers, len(by_site)))
+        with ThreadPoolExecutor(max_workers=workers) as pool:
+            futures = [pool.submit(_lookup_site, site_key, jobs,
+                                   settings=settings, headless=headless, shared=shared)
+                       for site_key, jobs in by_site.items()]
+            for future in futures:
+                future.result()  # 스레드 안에서 터진 예외를 여기서 다시 올린다
 
-                # 옥션처럼 상품URL만으로 주문을 특정할 수 없는 공급사는 수령인
-                # 이름까지 봐야 어느 주문인지 확정할 수 있다. 그런 어댑터만
-                # WANTS_RECIPIENT_NAME으로 표시해두고, 나머지 어댑터의
-                # 시그니처는 그대로 둔다.
-                extra_kwargs = {}
-                if getattr(adapter, "WANTS_RECIPIENT_NAME", False):
-                    extra_kwargs["recipient_name"] = order.recipient_name
+    # 스레드가 끝난 순서대로 쌓였으므로, 사람이 보는 순서(엑셀 순서)로 되돌린다.
+    _restore_order(orders, report, upload_rows)
 
-                try:
-                    result = adapter.get_tracking(
-                        supplier_context,
-                        order.product_url,
-                        headless=headless,
-                        order_option=order.order_option,
-                        **extra_kwargs,
-                    )
-                except TrackingNotAvailableYet as e:
-                    message = "아직 송장번호 미발급 - 건너뜀"
-                    # 어댑터가 주문상세에서 읽어 예외에 실어준 주문일을 같이
-                    # 남긴다 - 미발급인 채로 며칠 지난 주문은 따로 모아야 한다.
-                    report.skip(order.order_id, "아직 송장번호 미발급",
-                                recipient_name=order.recipient_name,
-                                order_date=e.order_date,
-                                delivery_note=e.delivery_note,
-                                product_url=order.product_url)
-                    continue
-                except OrderCancelled as e:
-                    # 기다려도 송장이 안 나오는 주문이라 일반 스킵과 분리한다.
-                    message = f"취소/품절로 보임 - 건너뜀 ({e})"
-                    report.cancelled(order.order_id, str(e),
-                                     recipient_name=order.recipient_name,
-                                     order_date=e.order_date,
-                                     delivery_note=e.delivery_note,
-                                     product_url=order.product_url)
-                    continue
-                except BlockedError as e:
-                    blocked_sites[site_key] = str(e)
-                    raise
+    kept = _drop_split_orders(all_orders, upload_rows, report)
 
-                upload_rows.append((order.order_id, result.tracking_no, result.courier))
-                report.success(order.order_id, result.courier, result.tracking_no,
-                               order_date=result.order_date,
-                               delivery_note=result.delivery_note,
-                               product_url=order.product_url)
-                message = f"성공 ({result.courier} / {result.tracking_no})"
-
-            except AdapterError as e:
-                message = f"실패: {e}"
-                if order.recipient_name:
-                    message += f" (수령인: {order.recipient_name})"
-                report.fail(order.order_id, str(e), recipient_name=order.recipient_name,
-                            order_date=e.order_date, delivery_note=e.delivery_note,
-                            product_url=order.product_url)
-            except Exception as e:  # noqa: BLE001 - 배치 전체가 죽지 않도록 광범위하게 잡는다
-                reason = f"예상치 못한 오류: {e}"
-                message = reason
-                if order.recipient_name:
-                    message += f" (수령인: {order.recipient_name})"
-                # reason에는 수령인을 넣지 않는다 - recipient_name 필드가 따로
-                # 있어서 마지막 실패 목록에서 이름이 두 번 찍히게 된다.
-                report.fail(order.order_id, reason, recipient_name=order.recipient_name,
-                            product_url=order.product_url)
-            finally:
-                if on_progress is not None:
-                    on_progress(i, total, order.order_id, message)
-                # 여기서 저장해두면 다음 주문을 조회하다 멈춰도 지금까지의
-                # 결과는 남는다 (성공/실패/스킵 어느 쪽으로 끝났든).
-                if on_checkpoint is not None:
-                    on_checkpoint(list(report.entries), list(upload_rows))
-
-            rate_limit.humanized_delay(settings.delay_min, settings.delay_max)
-
-        for site_key, (b, c) in supplier_contexts.items():
-            browser_mod.save_state(c, site_key)
-            b.close()
-
-    upload_rows = _drop_split_orders(all_orders, upload_rows, report)
-
-    if upload_rows:
-        excel_io.write_upload_file(upload_rows, output_path)
+    if kept:
+        excel_io.write_upload_file(kept, output_path)
 
     return report
+
+
+def _lookup_site(site_key: str, jobs: list, *, settings, headless: bool,
+                 shared: _Shared) -> None:
+    """한 공급사의 주문들을 순서대로 조회한다 (스레드 하나가 이 함수를 맡는다).
+
+    Playwright sync API 객체는 만든 스레드 밖에서 쓸 수 없어서, 스레드마다
+    자기 Playwright를 연다.
+    """
+    with sync_playwright() as p:
+        browser, context = browser_mod.get_context(p, site_key, headless=headless)
+        # 로그인 자체가 막힌 사이트는 주문마다 몇 분씩 다시 로그인 대기를
+        # 반복하지 않도록, 한 번 막히면 이후 주문은 바로 스킵한다.
+        blocked_reason: str | None = None
+        try:
+            for order, adapter in jobs:
+                message = ""
+                try:
+                    if blocked_reason:
+                        message = f"건너뜀: {blocked_reason}"
+                        with shared.lock:
+                            shared.report.skip(order.order_id, message,
+                                               product_url=order.product_url)
+                        continue
+
+                    # 옥션처럼 상품URL만으로 주문을 특정할 수 없는 공급사는 수령인
+                    # 이름까지 봐야 어느 주문인지 확정할 수 있다. 그런 어댑터만
+                    # WANTS_RECIPIENT_NAME으로 표시해두고, 나머지 어댑터의
+                    # 시그니처는 그대로 둔다.
+                    extra_kwargs = {}
+                    if getattr(adapter, "WANTS_RECIPIENT_NAME", False):
+                        extra_kwargs["recipient_name"] = order.recipient_name
+
+                    try:
+                        result = adapter.get_tracking(
+                            context,
+                            order.product_url,
+                            headless=headless,
+                            order_option=order.order_option,
+                            **extra_kwargs,
+                        )
+                    except TrackingNotAvailableYet as e:
+                        message = "아직 송장번호 미발급 - 건너뜀"
+                        # 어댑터가 주문상세에서 읽어 예외에 실어준 주문일을 같이
+                        # 남긴다 - 미발급인 채로 며칠 지난 주문은 따로 모아야 한다.
+                        with shared.lock:
+                            shared.report.skip(order.order_id, "아직 송장번호 미발급",
+                                               recipient_name=order.recipient_name,
+                                               order_date=e.order_date,
+                                               delivery_note=e.delivery_note,
+                                               product_url=order.product_url)
+                        continue
+                    except OrderCancelled as e:
+                        # 기다려도 송장이 안 나오는 주문이라 일반 스킵과 분리한다.
+                        message = f"취소/품절로 보임 - 건너뜀 ({e})"
+                        with shared.lock:
+                            shared.report.cancelled(order.order_id, str(e),
+                                                    recipient_name=order.recipient_name,
+                                                    order_date=e.order_date,
+                                                    delivery_note=e.delivery_note,
+                                                    product_url=order.product_url)
+                        continue
+                    except BlockedError as e:
+                        blocked_reason = str(e)
+                        raise
+
+                    with shared.lock:
+                        shared.upload_rows.append(
+                            (order.order_id, result.tracking_no, result.courier))
+                        shared.report.success(order.order_id, result.courier, result.tracking_no,
+                                              order_date=result.order_date,
+                                              delivery_note=result.delivery_note,
+                                              product_url=order.product_url)
+                    message = f"성공 ({result.courier} / {result.tracking_no})"
+
+                except AdapterError as e:
+                    message = f"실패: {e}"
+                    if order.recipient_name:
+                        message += f" (수령인: {order.recipient_name})"
+                    with shared.lock:
+                        shared.report.fail(order.order_id, str(e),
+                                           recipient_name=order.recipient_name,
+                                           order_date=e.order_date,
+                                           delivery_note=e.delivery_note,
+                                           product_url=order.product_url)
+                except Exception as e:  # noqa: BLE001 - 배치 전체가 죽지 않도록 광범위하게 잡는다
+                    reason = f"예상치 못한 오류: {e}"
+                    message = reason
+                    if order.recipient_name:
+                        message += f" (수령인: {order.recipient_name})"
+                    # reason에는 수령인을 넣지 않는다 - recipient_name 필드가 따로
+                    # 있어서 마지막 실패 목록에서 이름이 두 번 찍히게 된다.
+                    with shared.lock:
+                        shared.report.fail(order.order_id, reason,
+                                           recipient_name=order.recipient_name,
+                                           product_url=order.product_url)
+                finally:
+                    shared.finished(order.order_id, message)
+
+                rate_limit.humanized_delay(settings.delay_min, settings.delay_max)
+        finally:
+            browser_mod.save_state(context, site_key)
+            browser.close()
+
+
+def _restore_order(orders, report: RunReport, upload_rows: list) -> None:
+    """결과를 엑셀에 있던 주문 순서로 되돌린다 (제자리 정렬).
+
+    공급사를 동시에 돌리면 끝나는 순서가 매번 달라진다. 그대로 두면 결과
+    엑셀과 로그의 줄 순서가 실행할 때마다 바뀌어서, 사람이 지난 실행과
+    비교하기 어렵다. 같은 주문번호끼리의 순서는 정렬이 안정적이라 유지된다.
+    """
+    rank: dict[str, int] = {}
+    for i, order in enumerate(orders):
+        rank.setdefault(order.order_id, i)
+    last = len(orders)
+    report.entries.sort(key=lambda e: rank.get(e.order_id, last))
+    upload_rows.sort(key=lambda row: rank.get(row[0], last))
 
 
 def _drop_split_orders(orders, upload_rows, report):
