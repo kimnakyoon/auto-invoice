@@ -12,6 +12,7 @@
 
 from __future__ import annotations
 
+import contextlib
 import threading
 from collections import Counter
 from concurrent.futures import ThreadPoolExecutor
@@ -165,6 +166,15 @@ def _lookup_site(site_key: str, jobs: list, *, settings, headless: bool,
         # 반복하지 않도록, 한 번 막히면 이후 주문은 바로 스킵한다.
         blocked_reason: str | None = None
         try:
+            # 주문목록 화면 한 번으로 '아직 안 나간 주문'을 미리 걸러낼 수 있는
+            # 어댑터는 여기서 그 기회를 준다 (롯데온 prepare_batch). 주문마다
+            # 상세를 여는 것보다 훨씬 싸다. 실패하면 어댑터가 아무것도 읽지 않은
+            # 것과 같아서, 모든 주문이 예전처럼 상세를 여는 경로로 간다.
+            prepare = getattr(jobs[0][1], "prepare_batch", None)
+            if prepare is not None:
+                with contextlib.suppress(Exception):
+                    prepare(context, [order for order, _ in jobs], headless=headless)
+
             for order, adapter in jobs:
                 message = ""
                 try:

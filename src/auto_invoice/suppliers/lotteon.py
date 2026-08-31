@@ -28,15 +28,19 @@ from __future__ import annotations
 
 import os
 import re
+from datetime import date, datetime
 from urllib.parse import parse_qs, urlparse
 
 from dotenv import load_dotenv
 from playwright.sync_api import BrowserContext
 
+from .. import eta as eta_mod
+from .. import order_date as order_date_mod
 from ..models import TrackingResult
 from . import common
 from .base import (
     BlockedError,
+    OrderCancelled,
     ParseError,
     TrackingNotAvailableYet,
     normalize_option,
@@ -65,6 +69,41 @@ COURIER_PATTERN = re.compile(r"택배사\n([^\n]{1,20})")
 TRACKING_NO_PATTERN = re.compile(r"(?:송장번호|운송장번호)\n([0-9][0-9\-]{5,})")
 NOT_YET_PATTERNS = ["상품준비중", "배송준비중", "결제완료"]
 
+# --------------------------------------------------------------------------
+# 주문내역 목록으로 먼저 걸러내기 (prepare_batch)
+# --------------------------------------------------------------------------
+# 이 도구가 매번 조회하는 주문의 절반 가까이가 롯데온이고(실측 182건 중 74건),
+# 그중 대부분은 '아직 안 나갔다'는 답을 듣자고 주문상세를 한 번씩 여는 것이다.
+# 마이롯데 > 주문 내역 목록은 한 화면에 15건씩 주문번호·주문상태·주문일을 같이
+# 보여주므로, 목록 몇 번이면 상세를 열 필요가 있는 주문만 골라낼 수 있다.
+# 2026-08-31 실측: 대기 주문 71건을 [더보기] 12번으로 전부 덮었다.
+#
+# 목록은 사람이 평소에 보는 화면이라 이 방식은 API 직접 호출과 다르다(위
+# docstring의 Imperva 건). 요청 수도 74번에서 13번으로 줄어든다.
+ORDER_LIST_URL = "https://www.lotteon.com/p/order/mylotte/orderDeliveryList"
+LIST_RENDER_WAIT_MS = 8000   # 목록이 그려질 때까지 (SPA라 goto만으로는 비어 있다)
+LIST_MORE_WAIT_MS = 2500     # [더보기] 누르고 다음 15건이 붙을 때까지
+LIST_MORE_MAX_CLICKS = 30    # 무한정 누르지 않는다 (15건씩 -> 최대 450건)
+# 목록을 훑는 값이 상세를 여는 것보다 싼 최소 건수. 몇 건 안 되면 그냥 상세를 연다.
+LIST_PREFETCH_MIN_ORDERS = 5
+
+# 이 상태로 적힌 주문은 송장번호가 아직 없다 - 상세를 열어도 '미발급'만 나온다.
+# 2026-08-31 실측으로 확인한 것만 넣었다(상품준비중 2/2, 출고지시 3/3이 상세에서
+# 미발급). 여기 없는 상태(예: "09/02 도착예정")는 예전처럼 상세를 열어 확인한다.
+LIST_NOT_YET_STATUSES = ("상품준비중", "배송준비중", "결제완료", "입금대기",
+                         "주문접수", "출고지시")
+
+_LIST_CARDS_JS = """() => [...document.querySelectorAll('.orderGroupWrap')].map(card => ({
+  odNo: ((card.querySelector('span.orderNumber') || {}).innerText || '').trim(),
+  date: ((card.querySelector('span.date') || {}).innerText || '').trim(),
+  statuses: [...card.querySelectorAll('span.status')].map(el => el.innerText.trim()),
+  etas: [...card.querySelectorAll('p.expectingDate')].map(el => el.innerText.trim()),
+}))"""
+
+# prepare_batch가 읽어둔 목록. 컨텍스트(=이번 실행의 브라우저)별로 담는다.
+# 한 공급사는 스레드 하나가 맡으므로 여기에 잠금은 필요 없다.
+_listed_orders: dict[int, dict[str, dict]] = {}
+
 
 def extract_od_no(product_url: str) -> str:
     parsed = urlparse(product_url)
@@ -73,6 +112,98 @@ def extract_od_no(product_url: str) -> str:
     if not values:
         raise ParseError(f"URL에서 odNo 파라미터를 찾을 수 없습니다: {product_url}")
     return values[0]
+
+
+def prepare_batch(context: BrowserContext, orders, headless: bool = True) -> None:
+    """이번에 조회할 주문들을 주문내역 목록에서 미리 훑어둔다.
+
+    오케스트레이터가 이 공급사의 첫 조회 전에 한 번 불러준다. 여기서 읽어둔
+    상태는 get_tracking이 상세를 열기 전에 본다 - '아직 안 나간 주문'이면
+    상세를 아예 열지 않는다.
+
+    실패하면 아무것도 읽지 않은 것과 같아서, 모든 주문이 예전처럼 상세를
+    여는 경로로 간다. 그래서 여기서는 어떤 예외도 밖으로 내보내지 않는다.
+    """
+    wanted = set()
+    for order in orders:
+        try:
+            wanted.add(extract_od_no(order.product_url))
+        except ParseError:
+            continue  # 이런 주문은 어차피 상세 경로에서 같은 이유로 실패한다
+    if len(wanted) < LIST_PREFETCH_MIN_ORDERS:
+        return
+
+    page = context.new_page()
+    try:
+        page.goto(ORDER_LIST_URL, wait_until="domcontentloaded")
+        page.wait_for_timeout(LIST_RENDER_WAIT_MS)
+        seen: dict[str, dict] = {}
+        for _ in range(LIST_MORE_MAX_CLICKS + 1):
+            for card in page.evaluate(_LIST_CARDS_JS):
+                if card["odNo"]:
+                    seen[card["odNo"]] = card
+            if not (wanted - seen.keys()):
+                break
+            more = page.locator(".myLotteWrap button.more").first
+            if more.count() == 0 or not more.is_visible():
+                break
+            more.click()
+            page.wait_for_timeout(LIST_MORE_WAIT_MS)
+
+        found = {od_no: card for od_no, card in seen.items() if od_no in wanted}
+        _listed_orders[id(context)] = found
+        common.safe_print(f"[lotteon] 주문내역 목록에서 {len(found)}/{len(wanted)}건을 미리 확인했습니다.")
+    except Exception as e:  # noqa: BLE001 - 목록을 못 읽으면 그냥 예전처럼 상세를 연다
+        common.safe_print(f"[lotteon] 주문내역 목록을 읽지 못해 주문마다 상세를 엽니다 ({e}).")
+    finally:
+        page.close()
+
+
+def _listed_order_date(text: str) -> date | None:
+    """목록의 '2026.08.31' 표기."""
+    try:
+        return datetime.strptime(text.strip(), "%Y.%m.%d").date()
+    except (ValueError, AttributeError):
+        return None
+
+
+def _raise_if_listed_settled(card: dict, od_no: str) -> None:
+    """목록에 적힌 상태만으로 결론이 나면 상세를 열지 않고 여기서 끝낸다.
+
+    결론이 안 나면(모르는 상태, 오래된 주문) 그냥 돌아가고, 호출한 쪽이
+    예전처럼 주문상세를 연다.
+    """
+    statuses = [s for s in card.get("statuses") or [] if s]
+    if not statuses:
+        return
+    order_date = _listed_order_date(card.get("date") or "")
+    note = eta_mod.from_text(" ".join(statuses + (card.get("etas") or [])))
+
+    # 취소/품절은 기다려도 송장이 안 나온다. 주문상태를 정확히 읽을 수 있는
+    # 공급사는 NOT_YET 판정보다 먼저 본다(base.raise_if_cancelled 규칙).
+    # 롯데온 주문상세에는 이 표시가 안 나와서, 목록을 봐야만 알 수 있다.
+    try:
+        for status in statuses:
+            raise_if_cancelled(status, od_no)
+    except OrderCancelled as e:
+        e.order_date, e.delivery_note = order_date, note
+        raise
+
+    if not all(any(k in s for k in LIST_NOT_YET_STATUSES) for s in statuses):
+        return  # 모르는 상태가 섞여 있으면 상세로 확인한다
+
+    # 주문한 지 오래된 건은 상세까지 열어 예정 문구를 읽는다 - 사람이 '왜 아직
+    # 안 나갔나'를 판단할 때 쓰는 값이라(report.stale_entries), 목록에 없는
+    # 문구까지 챙겨야 한다. 주문일을 못 읽었으면 오래된 건인지 알 수 없으므로
+    # 마찬가지로 상세를 연다.
+    if order_date is None or order_date_mod.is_stale(order_date):
+        return
+
+    error = TrackingNotAvailableYet(
+        f"아직 송장번호가 발급되지 않았습니다 (odNo={od_no}, 주문내역 '{statuses[0]}')."
+    )
+    error.order_date, error.delivery_note = order_date, note
+    raise error
 
 
 def _looks_like_login_page(page) -> bool:
@@ -228,6 +359,12 @@ def get_tracking(
     context: BrowserContext, product_url: str, headless: bool = True, order_option: str | None = None
 ) -> TrackingResult:
     od_no = extract_od_no(product_url)
+
+    # 주문내역 목록에서 이미 결론이 난 주문이면 상세를 열지 않는다 (prepare_batch).
+    listed = _listed_orders.get(id(context), {}).get(od_no)
+    if listed is not None:
+        _raise_if_listed_settled(listed, od_no)
+
     page = context.new_page()
     try:
         page.goto(product_url, wait_until="domcontentloaded")
