@@ -61,12 +61,12 @@ class Screen:
             winui.move_to(r.right - 60, r.bottom - 25)     # 상태표시줄 위 - 툴팁 없음
         if not _is_on_top(main_hwnd, r):
             winui.bring_to_front(main_hwnd)
-            time.sleep(0.4)
+            time.sleep(0.15)
             r = winui.rect(main_hwnd)
             if not _is_on_top(main_hwnd, r):
                 raise GridError(
                     "샵마인 창이 다른 창에 가려져 있어 목록을 읽을 수 없습니다.")
-        time.sleep(0.2)
+        time.sleep(0.1)
         self.base = (r.left, r.top)
         path = str(Path(tempfile.gettempdir()) / "_shopmine_grid.bmp")
         winui.shot((r.left, r.top, r.right, r.bottom), path)
@@ -267,7 +267,7 @@ def wait_ready(main_hwnd, timeout: float = 60.0, log=print) -> list[Row]:
                     f"{capacity}행이 들어갈 크기). 샵마인이 아직 화면을 그리는 중일 수 있습니다.")
             return rows
         previous = _signature(rows)
-        time.sleep(0.7)
+        time.sleep(0.4)
 
 
 def _click_checkbox(main_hwnd, cy, label=""):
@@ -291,7 +291,7 @@ def scroll_to_top(main_hwnd, log=print) -> None:
         if info is None or info[0] == 0:
             return
         winui.wheel(base.left + 700, base.top + 700, -SCROLL_NOTCHES)
-        time.sleep(0.4)
+        time.sleep(0.25)
     log("  경고: 목록을 맨 위로 올리지 못했습니다.")
 
 
@@ -309,7 +309,11 @@ def _pages(main_hwnd, log=print):
         if pos >= max_pos:
             return
         winui.wheel(base.left + 700, base.top + 700, SCROLL_NOTCHES)
-        time.sleep(0.8)
+        # 고정 0.8초를 세는 대신 스크롤 막대가 실제로 움직였는지 본다. 대개
+        # 0.1~0.2초면 움직이고, 끝까지 내려온 화면에서는 어차피 여기서 끝난다.
+        end = time.time() + 1.5
+        while winui.scroll_info(sb)[0] == pos and time.time() < end:
+            time.sleep(0.1)
         if winui.scroll_info(sb)[0] == pos:      # 더 안 내려가면 끝
             return
 
@@ -321,9 +325,9 @@ def _click_select_all(main_hwnd, btn) -> None:
     실제로 바뀌었는지 확인하므로, 눌렸는지 여부는 그쪽에서 판정된다.
     """
     winui.bring_to_front(main_hwnd)
-    time.sleep(0.3)
+    time.sleep(0.15)
     winui.press_button(btn)
-    time.sleep(1.2)
+    time.sleep(0.5)
 
 
 def check_all_filtered(main_hwnd, log=print) -> int:
@@ -403,7 +407,7 @@ def sort_filled_first(main_hwnd, log=print) -> bool:
             if not ok:
                 log(f"  경고: {msg} - 정렬 없이 진행합니다.")
                 return False
-            time.sleep(1.2)
+            time.sleep(0.5)
         rows = wait_ready(main_hwnd, log=log)
         if rows and rows[0].filled and filled_first(rows):
             log(f"  송장번호(수정용) 정렬 확인 - 채워진 행이 위로 올라왔습니다 "
@@ -433,12 +437,12 @@ def check_filled_rows(main_hwnd, log=print, stop_at_empty=False) -> int:
             continue
         for cy in targets:
             _click_checkbox(main_hwnd, cy, label="송장 채워진 행")
-            time.sleep(0.3)
+            time.sleep(0.15)
         after = {row.cy: row for row in wait_ready(main_hwnd, log=log)}
         missed = [cy for cy in targets if not (cy in after and after[cy].checked)]
         for cy in missed:
             _click_checkbox(main_hwnd, cy, label="송장 채워진 행(재시도)")
-            time.sleep(0.5)
+            time.sleep(0.3)
         if missed:
             after = {row.cy: row for row in wait_ready(main_hwnd, log=log)}
             still = [cy for cy in missed if not (cy in after and after[cy].checked)]

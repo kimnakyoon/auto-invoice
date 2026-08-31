@@ -123,7 +123,7 @@ def _wait_for_tab(mdi_hwnd, name, timeout: float) -> bool:
     while time.time() < end:
         if current_tab(mdi_hwnd) == name:
             return True
-        time.sleep(0.3)
+        time.sleep(0.15)
     return False
 
 
@@ -188,12 +188,12 @@ def _open_from_menu(main_hwnd, mdi_hwnd, name, timeout: float, log=print) -> boo
 
     if not winui.bring_to_front(main_hwnd):
         raise TabError("샵마인 창을 앞으로 가져오지 못했습니다.")
-    time.sleep(0.5)
+    time.sleep(0.25)
     winui.key(menu_key, alt=True)
 
     popup = None
-    for _ in range(10):
-        time.sleep(0.4)
+    for _ in range(20):
+        time.sleep(0.2)
         popup = _menu_popup(main_hwnd)
         if popup:
             break
@@ -206,10 +206,10 @@ def _open_from_menu(main_hwnd, mdi_hwnd, name, timeout: float, log=print) -> boo
             winui.key(VK_RETURN)
             break
         winui.key(VK_DOWN)
-        time.sleep(0.35)
+        time.sleep(0.25)
     else:
         winui.key(VK_ESCAPE)
-        time.sleep(0.3)
+        time.sleep(0.2)
         winui.key(VK_ESCAPE)
         raise TabError(f"메뉴에서 [{name}] 항목을 찾지 못했습니다.")
 

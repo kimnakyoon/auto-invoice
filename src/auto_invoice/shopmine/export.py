@@ -143,7 +143,7 @@ def ensure_template(export_hwnd, template: str = TEMPLATE_NAME, timeout: float =
     while time.time() < end:
         if _template_value(wv) == template:
             break
-        time.sleep(0.3)
+        time.sleep(0.15)
     now = _template_value(wv)
     if now != template:
         winui.key(VK_ESCAPE)
@@ -159,7 +159,7 @@ def ensure_template(export_hwnd, template: str = TEMPLATE_NAME, timeout: float =
         if not _list_is_open(export_hwnd, probe):
             break
         winui.key(VK_RETURN)
-        time.sleep(0.6)
+        time.sleep(0.4)
     if _list_is_open(export_hwnd, probe):
         winui.key(VK_ESCAPE)
         raise ExportError("엑셀 양식 목록이 닫히지 않았습니다.")
@@ -205,7 +205,7 @@ def _wait_for_default_filename(edit, timeout: float = 6.0) -> str:
         else:
             stable = 0
         last = current
-        time.sleep(0.25)
+        time.sleep(0.15)
     return last or ""
 
 
@@ -245,11 +245,11 @@ def _type_filename(save_hwnd, wanted: str) -> None:
     """대화상자를 앞으로 가져와 파일 이름 칸에 경로를 타이핑한다."""
     if not winui.bring_to_front(save_hwnd):
         raise ExportError("저장 대화상자를 앞으로 가져오지 못했습니다.")
-    time.sleep(0.4)
+    time.sleep(0.25)
     winui.ctrl_key(VK_A)            # 기본 파일명 전체 선택
-    time.sleep(0.2)
+    time.sleep(0.15)
     winui.type_text(wanted)
-    time.sleep(0.4)
+    time.sleep(0.3)
 
 
 def _commit_save_dialog(save_hwnd, wanted: str, log=print) -> None:
@@ -277,7 +277,7 @@ def _commit_save_dialog(save_hwnd, wanted: str, log=print) -> None:
     log("  [저장] 버튼을 찾지 못해 Enter로 저장합니다.")
     if not winui.bring_to_front(save_hwnd):
         raise ExportError("저장 대화상자를 앞으로 가져오지 못했습니다.")
-    time.sleep(0.3)
+    time.sleep(0.2)
     winui.key(VK_RETURN)
 
 
@@ -327,7 +327,7 @@ def _commit_save_dialog(save_hwnd, wanted: str, log=print) -> None:
     log("  [저장] 버튼을 찾지 못해 Enter로 저장합니다.")
     if not winui.bring_to_front(save_hwnd):
         raise ExportError("저장 대화상자를 앞으로 가져오지 못했습니다.")
-    time.sleep(0.3)
+    time.sleep(0.2)
     winui.key(VK_RETURN)
 
 

@@ -158,12 +158,12 @@ def open_window(log=print, timeout: float = 15.0):
     main = _main_window()
     if not winui.bring_to_front(main):
         raise ConnectError("샵마인 창을 앞으로 가져오지 못했습니다.")
-    time.sleep(0.5)
+    time.sleep(0.25)
 
     winui.key(VK_Y, alt=True)
     popup = None
-    for _ in range(10):
-        time.sleep(0.4)
+    for _ in range(20):
+        time.sleep(0.2)
         popup = _menu_popup(main)
         if popup:
             break
@@ -176,14 +176,14 @@ def open_window(log=print, timeout: float = 15.0):
             winui.key(VK_RETURN)
             break
         winui.key(VK_DOWN)
-        time.sleep(0.35)
+        time.sleep(0.25)
     else:
         winui.key(VK_ESCAPE)
         raise ConnectError("메뉴에서 [쇼핑몰연결창(W)...] 항목을 찾지 못했습니다.")
 
     end = time.time() + timeout
     while time.time() < end:
-        time.sleep(0.5)
+        time.sleep(0.25)
         hwnd = _conn_window()
         if hwnd:
             log("  [쇼핑몰 연결] 창을 열었습니다")
@@ -222,7 +222,7 @@ def close_window(log=print) -> None:
     if btn is None:
         raise ConnectError("[쇼핑몰 연결] 창의 [닫기] 버튼을 찾지 못했습니다.")
     winui.bring_to_front(hwnd)
-    time.sleep(0.3)
+    time.sleep(0.2)
     winui.press_button(btn)
     if winui.wait_for_window_gone(title_equals=CONN_WINDOW, timeout=10.0):
         log("  [쇼핑몰 연결] 창을 닫았습니다")
@@ -286,20 +286,20 @@ def set_state_filter(hwnd, value: str = STATE_FILTER_TARGET, log=print) -> None:
         return
 
     winui.bring_to_front(hwnd)
-    time.sleep(0.3)
+    time.sleep(0.2)
     r = winui.rect(combo)
     winui.move_click((r.left + r.right) // 2, (r.top + r.bottom) // 2, dwell=0.4)
-    time.sleep(0.6)
+    time.sleep(0.4)
     winui.key(VK_HOME)
-    time.sleep(0.3)
+    time.sleep(0.2)
 
     for _ in range(12):
         if winui.ctrl_text(combo).strip() == value:
             winui.key(VK_RETURN)
-            time.sleep(1.0)
+            time.sleep(0.6)
             break
         winui.key(VK_DOWN)
-        time.sleep(0.25)
+        time.sleep(0.15)
     else:
         winui.key(VK_ESCAPE)
         raise ConnectError(f"연결상태 필터에 '{value}' 항목이 없습니다.")
@@ -368,14 +368,15 @@ def retry_disconnected(hwnd, log=print, timeout: float = 300.0) -> str:
     result = winui.find_child(hwnd, "EDIT", lambda k: True)
 
     winui.bring_to_front(hwnd)
-    time.sleep(0.3)
+    time.sleep(0.2)
     log("  [연결안된 쇼핑몰 연결재시도] 실행")
     winui.press_button(btn)
 
     last, stable_since = None, time.time()
     end = time.time() + timeout
     while time.time() < end:
-        time.sleep(2.0)
+        # 안정 판정 기준(STABLE_FOR)은 그대로 두고 들여다보는 간격만 좁힌다.
+        time.sleep(1.0)
         now = _text_or_none(result) if result else ""
         busy = now is None or not winui.u.IsWindowEnabled(btn)
         if busy or now != last:

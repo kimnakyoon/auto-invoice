@@ -15,8 +15,10 @@
       --'송장번호(수정용)' 컬럼 헤더 두 번 클릭--> 채워진 행이 위로 정렬됨
       --위에서부터 채워진 행만 체크 --> [송장번호수정] 클릭
       --'선택한 N개의 주문을 [송장번호수정] 하시겠습니까?' --[예]-->
-          '송장번호수정 결과' 창: 문구가 채워질 때까지 기다렸다가 오류를 읽고
-          [확인]을 눌러 닫는다 ('오류없음.' 이면 성공)
+          '송장번호수정 결과' 창: 아래쪽 '총 N개의 주문중 M건의 주문이 처리
+          되었습니다. 오류건은 K건입니다.' 요약이 뜰 때까지 = 처리가 끝날
+          때까지 기다렸다가 오류를 읽고 [확인]을 눌러 닫는다
+          ('오류없음.' + 오류건 0건이면 성공)
       --오류가 없으면 [송장수정모드 끄기]
 
 안전장치의 핵심은 마지막 확인 대화상자다. 이 창이 '선택한 N개'라고 건수를
@@ -30,6 +32,7 @@
 
 from __future__ import annotations
 
+import contextlib
 import re
 import time
 from pathlib import Path
@@ -85,7 +88,7 @@ def wait_until_idle(timeout: float = 300.0, log=print) -> bool:
         if not waited:
             log("  쇼핑몰 연결 진행 중 - 끝날 때까지 대기")
             waited = True
-        time.sleep(2.0)
+        time.sleep(1.0)
     log(f"  경고: {timeout:.0f}초를 기다렸는데도 '{BUSY_WINDOW}'이 끝나지 않았습니다.")
     return False
 
@@ -116,7 +119,7 @@ def _click_control(hwnd, owner, label):
     필터 라벨이 바뀌는지)로 눌렸는지 확인하므로 클릭 자체를 검증하진 않는다.
     """
     winui.bring_to_front(owner)
-    time.sleep(0.35)
+    time.sleep(0.15)
     winui.press_button(hwnd)
 
 
@@ -143,7 +146,7 @@ def _toolbar_click(main_hwnd, rel, label, until, *, attempts=3, timeout=8.0,
             last = (f"[{label}] 샵마인 창을 앞으로 가져오지 못했습니다 - "
                     "다른 창(브라우저 등)이 앞을 막고 있습니다.")
         else:
-            time.sleep(0.5)
+            time.sleep(0.2)
             ok, msg = winui.safe_click(main_hwnd, rel, label=label)
             if ok:
                 end = time.time() + timeout
@@ -151,14 +154,14 @@ def _toolbar_click(main_hwnd, rel, label, until, *, attempts=3, timeout=8.0,
                     got = until()
                     if got:
                         return got, msg
-                    time.sleep(0.25)
+                    time.sleep(0.15)
                 last = (f"{msg} - 그런데 {timeout:.0f}초 동안 아무 반응이 없습니다 "
                         "(툴바가 클릭을 받지 않았습니다)")
             else:
                 last = msg
         if attempt < attempts:
             log(f"  {last} - 다시 누릅니다 ({attempt}/{attempts})")
-            time.sleep(1.0)
+            time.sleep(0.7)
     return None, last
 
 
@@ -170,8 +173,23 @@ CLOSE_CAPTIONS = ("닫기", "확인")
 # 채 다음 단계로 넘어갔다.
 APPLY_RESULT_CAPTIONS = ("확인", "닫기")
 
-# 결과 창 글자가 이만큼(초) 안 바뀌면 처리가 끝난 것으로 본다.
+# 요약 문구를 끝내 못 읽었을 때만 쓰는 보조 기준. 상태 라벨('오류없음.' 등)이
+# 이미 채워져 있고 창 글자가 이만큼(초) 안 바뀌면 끝난 것으로 본다.
 RESULT_STABLE_SECONDS = 15.0
+
+# '송장번호수정 결과' 창 맨 아래 요약 문구:
+#   "총 2개의 주문중 2건의 주문이 처리 되었습니다. 오류건은 0건입니다."
+# 이 문구는 샵마인이 쇼핑몰 접속을 **다 끝낸 뒤에야** 채워진다. 창이 뜬 것만
+# 으로는 아직 처리 중이다. 그래서 '다음 동작으로 넘어가도 되는가'와 '오류가
+# 있었는가'를 함께 알려주는, 이 창에서 가장 믿을 만한 신호다.
+RE_SUMMARY_TOTAL = re.compile(r"총\s*([\d,]+)\s*개")
+RE_SUMMARY_DONE = re.compile(r"([\d,]+)\s*건의\s*주문이\s*처리")
+RE_SUMMARY_ERRORS = re.compile(r"오류건은\s*([\d,]+)\s*건")
+
+# 결과 창에 늘 붙어 있는 안내/버튼 글자. 오류가 아니므로 결과 엑셀로 넘기지
+# 않는다 - 특히 '오류 발생건은 반드시 확인 바랍니다'는 오류가 0건이어도 늘
+# 빨간 글씨로 떠 있어서, 그대로 넘기면 없는 오류를 있는 것처럼 보이게 한다.
+RESULT_BOILERPLATE = ("오류 발생건은", "선택한 주문을", "엑셀파일생성", "도움말", "총 ")
 
 
 def _buttons(hwnd):
@@ -302,6 +320,26 @@ def filter_status(main_hwnd) -> str:
     return ""
 
 
+# 필터를 건 뒤 상태 라벨이 바뀌기를 기다리는 최대 시간. 예전에는 여기에
+# 고정 2.5초가 박혀 있었는데, 주문번호로 한 건씩 필터를 거는 7단계에서는 그게
+# 건당 2.5초씩 곱해졌다. 라벨은 보통 0.3초 안에 바뀌고, 그리드가 다 그려졌는지는
+# 뒤따르는 grid.wait_ready 가 화면을 보고 따로 확인한다 - 여기서 또 기다릴
+# 이유가 없다.
+FILTER_WAIT_SECONDS = 12.0
+
+
+def _wait_filter_status(main_hwnd, keyword: str,
+                        timeout: float = FILTER_WAIT_SECONDS) -> str:
+    """필터 상태 라벨에 keyword 가 나타날 때까지 기다렸다가 그 문구를 돌려준다."""
+    end = time.time() + timeout
+    status = ""
+    while True:
+        status = filter_status(main_hwnd)
+        if keyword in status or time.time() >= end:
+            return status
+        time.sleep(0.1)
+
+
 def set_filter(keyword, log=print) -> None:
     """수집 결과 필터로 목록을 좁힌다.
 
@@ -314,7 +352,7 @@ def set_filter(keyword, log=print) -> None:
     """
     main = main_window()
     winui.bring_to_front(main)
-    time.sleep(0.4)
+    time.sleep(0.2)
     edit = _search_edit(main)
     if edit is None:
         raise UploadError("수집 결과 필터 입력란을 찾지 못했습니다.")
@@ -322,13 +360,18 @@ def set_filter(keyword, log=print) -> None:
     if button is None:
         raise UploadError("[수집결과내 검색] 버튼을 찾지 못했습니다.")
 
+    before = filter_status(main)
     if not winui.set_ctrl_text(edit, keyword):
         raise UploadError(f"필터 입력란에 '{keyword}'가 들어가지 않았습니다.")
-    time.sleep(0.3)
+    time.sleep(0.2)
     _click_control(button, main, "수집결과내 검색")
-    time.sleep(2.5)
 
-    status = filter_status(main)
+    if keyword in before:
+        # 같은 키워드로 다시 거는 경우엔 라벨이 바뀌지 않아 기다릴 근거가 없다.
+        time.sleep(1.0)
+        status = filter_status(main)
+    else:
+        status = _wait_filter_status(main, keyword)
     if keyword not in status:
         raise UploadError(
             f"필터가 '{keyword}'로 걸리지 않았습니다 (화면 표시: {status or '(읽을 수 없음)'}). "
@@ -340,15 +383,20 @@ def reset_filter(log=print) -> None:
     """필터초기화(F8). 체크해둔 행은 그대로 남는다."""
     main = main_window()
     winui.bring_to_front(main)
-    time.sleep(0.4)
+    time.sleep(0.2)
     edit = _search_edit(main)
     if edit is not None:
         winui.set_ctrl_text(edit, "")
-        time.sleep(0.2)
+        time.sleep(0.15)
     winui.bring_to_front(main)
-    time.sleep(0.3)
+    time.sleep(0.15)
     winui.key(VK_F8)
-    time.sleep(2.5)
+    # F8 뒤에는 상태 라벨이 갱신되지 않아(filter_status 주석) 라벨로는 확인할 수
+    # 없다. 대신 목록이 다시 그려져 안정될 때까지 화면을 본다 - 고정 2.5초보다
+    # 정확하면서 대개 더 빠르다. 여기서 확인하지 못해도 다음 단계가 각자
+    # wait_ready 로 다시 확인하므로 진행은 막지 않는다.
+    with contextlib.suppress(grid.GridError):
+        grid.wait_ready(main, timeout=8.0, log=_quiet)
     log("  목록 필터 초기화 (F8)")
 
 
@@ -390,9 +438,9 @@ def _open_upload_window(main_hwnd):
         if not winui.bring_to_front(main_hwnd):
             last = ("샵마인 창을 앞으로 가져오지 못했습니다 - 다른 창(브라우저 등)이 "
                     "앞을 막고 있습니다.")
-            time.sleep(1.5)
+            time.sleep(1.0)
             continue
-        time.sleep(0.8)
+        time.sleep(0.5)
         winui.key(VK_U, alt=True)
         found = winui.wait_for_window(title_equals=UPLOAD_WINDOW, timeout=15.0)
         if found is not None:
@@ -425,7 +473,7 @@ def _pick_csv_file(upload_hwnd, csv_str, log=print) -> None:
     if browse is None:
         raise UploadError("[찾아보기] 버튼을 찾지 못했습니다.")
     winui.bring_to_front(upload_hwnd)
-    time.sleep(0.4)
+    time.sleep(0.2)
     winui.press_button(browse)
 
     dlg = winui.wait_for_window(title_equals=OPEN_DIALOG_TITLE, timeout=15.0)
@@ -433,11 +481,11 @@ def _pick_csv_file(upload_hwnd, csv_str, log=print) -> None:
         raise UploadError(f"[찾아보기] 후 '{OPEN_DIALOG_TITLE}' 대화상자가 뜨지 않았습니다.")
     if not winui.bring_to_front(dlg[0]):
         raise UploadError("파일 선택 대화상자를 앞으로 가져오지 못했습니다.")
-    time.sleep(0.5)
+    time.sleep(0.25)
     winui.ctrl_key(VK_A)
-    time.sleep(0.2)
+    time.sleep(0.15)
     winui.type_text(csv_str)
-    time.sleep(0.4)
+    time.sleep(0.3)
     winui.key(VK_RETURN)
 
     if not winui.wait_for_window_gone(title_equals=OPEN_DIALOG_TITLE, timeout=15.0):
@@ -591,63 +639,152 @@ def _result_texts(hwnd) -> list[str]:
     return out
 
 
-def _read_apply_result(hwnd, timeout: float, log=print) -> tuple[str, list[str]]:
-    """'송장번호수정 결과' 창의 처리가 끝날 때까지 기다렸다가 읽는다.
+def _status_label(texts: list[str]) -> str:
+    """'오류없음.' / '오류발생 N건' 같은 상태 라벨 (없으면 빈 문자열).
 
-    창은 쇼핑몰에 접속하는 동안 먼저 떠 있고, 다 끝나야 '오류없음.' 또는
-    '오류발생...' 같은 상태 문구가 채워진다. 예전에는 창이 뜬 뒤 2초만 세고
-    읽어서, 아직 비어 있는 화면을 '상태 문구 없음'으로 넘겨버렸다. 이제는
-    문구가 나올 때까지 기다린다.
-
-    반환: (상태 문구, 오류 상세 줄들). 상세 줄은 창에 적힌 나머지 글자
-    전부다 - 어느 주문에서 났는지까지 알려주는 경우가 있어서, 해석하지 않고
-    그대로 넘겨 결과 엑셀에 남긴다.
-
-    문구가 '오류'로 시작하지 않는 화면일 수도 있어서, 창 글자가 STABLE_SECONDS
-    동안 하나도 안 바뀌면 거기서 끝난 것으로 본다 - 그렇지 않으면 멀쩡히 끝난
-    실행에서 timeout 만큼 그냥 서 있게 된다.
+    빨간 안내 문구('오류 발생건은 반드시 확인 바랍니다...')와 아래쪽 요약
+    문구('... 오류건은 0건입니다.')는 오류가 없어도 늘 떠 있으므로 뺀다.
     """
-    end = time.time() + timeout
+    return next((t for t in texts
+                 if t.startswith("오류") and "발생건은" not in t
+                 and "오류건은" not in t), "")
+
+
+def _parse_summary(texts: list[str]) -> tuple[str, int | None, int | None, int | None]:
+    """아래쪽 요약 문구를 (원문, 총건수, 처리건수, 오류건수)로 읽는다.
+
+    요약 줄이 아직 없으면 ("", None, None, None) - 즉 아직 처리 중이다.
+    문구는 떴는데 숫자만 못 읽는 경우가 있어 값마다 따로 None 을 돌려주고,
+    읽어낸 것만 판정에 쓴다.
+    """
+    for t in texts:
+        if not (RE_SUMMARY_ERRORS.search(t) or "주문이 처리" in t):
+            continue
+
+        def num(rx):
+            m = rx.search(t)
+            return int(m.group(1).replace(",", "")) if m else None
+
+        return t, num(RE_SUMMARY_TOTAL), num(RE_SUMMARY_DONE), num(RE_SUMMARY_ERRORS)
+    return "", None, None, None
+
+
+def _wait_for_apply_result(hwnd, timeout: float, log=print) -> tuple[list[str], bool]:
+    """결과 창의 처리가 **끝날 때까지** 기다린다. 반환: (창 글자들, 끝났는가)
+
+    창은 쇼핑몰에 접속하는 동안 먼저 비어 있는 채로 떠 있다. 끝났다는 신호는
+    아래쪽 요약 문구('총 N개의 주문중 M건의 주문이 처리 되었습니다')다. 이게
+    뜨기 전에 다음 동작으로 넘어가면, 아직 반영되지도 않은 화면을 보고
+    성공/실패를 판정하게 된다.
+
+    처리 중에는 결과가 그리드로만 그려져 라벨 글자가 한참 그대로일 수 있다.
+    그래서 '글자가 안 바뀐다'만으로는 끝났다고 보지 않는다 - 상태 라벨까지
+    채워진 뒤에야 그 기준(RESULT_STABLE_SECONDS)을 보조로 쓴다.
+    """
+    started = time.time()
+    end = started + timeout
     texts: list[str] = []
-    status = ""
     previous: list[str] | None = None
-    stable_since = time.time()
+    stable_since = started
+    noted = 0.0
     while time.time() < end:
         texts = _result_texts(hwnd)
-        status = next((t for t in texts if t.startswith("오류") and "발생건은" not in t), "")
-        if status:
-            break
+        line = _parse_summary(texts)[0]
+        if line:
+            # 요약이 채워졌다. 상태 라벨은 한 박자 늦게 붙을 때가 있어 잠깐만 더 본다.
+            for _ in range(8):
+                if _status_label(texts):
+                    break
+                time.sleep(0.25)
+                texts = _result_texts(hwnd)
+            log(f"  결과 창 처리 완료 ({time.time() - started:.0f}초): {line}")
+            return texts, True
         if texts != previous:
             previous, stable_since = texts, time.time()
-        elif texts and time.time() - stable_since >= RESULT_STABLE_SECONDS:
-            log(f"  '오류...' 로 시작하는 문구가 없습니다 - 창 글자가 "
-                f"{RESULT_STABLE_SECONDS:.0f}초째 그대로라 여기서 끝난 것으로 봅니다: {texts}")
-            break
-        time.sleep(1.0)
-    if not status:
-        log(f"  경고: 결과 문구('오류없음.' 등)를 읽지 못했습니다 - "
-            "샵마인 화면에서 직접 확인해주세요.")
-    if result_is_clean(status):
+        elif (_status_label(texts)
+              and time.time() - stable_since >= RESULT_STABLE_SECONDS):
+            log("  요약 문구는 없지만 상태 문구가 있고 창 글자가 "
+                f"{RESULT_STABLE_SECONDS:.0f}초째 그대로입니다 - "
+                f"여기서 끝난 것으로 봅니다: {texts}")
+            return texts, True
+        if time.time() - started - noted >= 30.0:
+            noted = time.time() - started
+            log(f"  결과 창 처리 대기 중... ({noted:.0f}초)")
+        time.sleep(0.5)
+    return texts, False
+
+
+def _read_apply_result(hwnd, timeout: float, log=print,
+                       expected: int | None = None) -> tuple[str, list[str]]:
+    """처리가 끝나길 기다린 뒤, 오류가 있었는지 판정한다.
+
+    반환: (상태 문구, 오류 상세 줄들). 상태 문구가 '오류없음'으로 시작할
+    때만(result_is_clean) 파이프라인이 다음 단계로 넘어간다. 그래서 조금이라도
+    어긋나면 - 처리가 안 끝났거나, 오류건이 있거나, 처리 건수가 예상과
+    다르거나, 문구를 아예 못 읽었거나 - 상태 문구를 '오류발생'으로 만들어
+    거기서 멈추고 사람에게 넘어가게 한다.
+
+    상세 줄은 창에 적힌 나머지 글자들이다. 어느 주문에서 났는지까지 알려주는
+    경우가 있어서, 해석하지 않고 그대로 넘겨 결과 엑셀에 남긴다.
+    """
+    texts, finished = _wait_for_apply_result(hwnd, timeout, log=log)
+    line, total, done, errors = _parse_summary(texts)
+    status = _status_label(texts)
+
+    problems: list[str] = []
+    if not finished:
+        problems.append(f"{timeout:.0f}초를 기다렸는데도 결과 창의 처리가 끝나지 "
+                        "않았습니다 (요약 문구가 나오지 않음).")
+    if errors:
+        problems.append(f"쇼핑몰 반영 오류 {errors}건 - {line}")
+    if total is not None and done is not None and done != total:
+        problems.append(f"{total}건 중 {done}건만 처리됐습니다 - {line}")
+    if expected is not None and done is not None and done != expected:
+        problems.append(f"처리 건수가 예상과 다릅니다 (화면 {done}건 / 예상 {expected}건).")
+    if status and not result_is_clean(status):
+        problems.append(status)
+    if not status and not line:
+        problems.append("결과 문구('오류없음.' 등)를 읽지 못했습니다 - "
+                        "샵마인 화면에서 직접 확인해주세요.")
+    elif not status and not problems:
+        # 라벨은 못 읽었지만 요약이 건수를 다 말해주고 어긋나는 게 없다.
+        log(f"  상태 문구를 읽지 못해 요약으로 판정합니다: {line}")
+        status = "오류없음."
+
+    if not problems:
         # 오류가 없으면 창에 남은 다른 글자(제목/안내 문구)는 오류가 아니다.
         # 그걸 오류로 넘기면 결과 엑셀에 있지도 않은 오류 구역이 생긴다.
         return status, []
+
     details = [t for t in texts
                if t != status and t not in CLOSE_CAPTIONS
                and t not in (APPLY_RESULT_WINDOW, UPLOAD_RESULT_WINDOW)
+               and not any(t.startswith(prefix) for prefix in RESULT_BOILERPLATE)
                and len(t) >= 4]
-    return status, details
+    if not status or result_is_clean(status):
+        # 라벨은 '오류없음.'인데 건수가 어긋나는 경우까지 성공으로 흘려보내지 않는다.
+        status = f"오류발생. {problems[0]}"
+    out: list[str] = []
+    for t in problems + details:
+        if t not in out:
+            out.append(t)
+    return status, out
 
 
 def apply_tracking(expected_count: int, log=print, close_result: bool = True,
-                   result_timeout: float = 180.0) -> tuple[str, list[str]]:
+                   result_timeout: float | None = None) -> tuple[str, list[str]]:
     """체크해둔 행을 [송장번호수정]으로 쇼핑몰까지 반영한다.
 
     확인 대화상자가 알려주는 건수가 expected_count 와 다르면 [아니요]를 눌러
     아무것도 반영하지 않고 UploadError 를 낸다. 이것이 이 파이프라인 전체의
     마지막이자 가장 중요한 안전장치다.
 
-    반영이 끝나면 결과 창의 문구가 채워질 때까지 기다렸다가 오류를 읽고,
-    [확인]을 눌러 창을 닫는다. 반환: (상태 문구, 오류 상세 줄들).
+    [예]를 누른 뒤에는 '송장번호수정 결과' 창의 처리가 **끝날 때까지**
+    기다린다 (아래쪽 '총 N개의 주문중 M건의 주문이 처리 되었습니다. 오류건은
+    K건입니다.' 요약이 뜰 때까지). 그 다음에야 오류를 읽고 [확인]으로 창을
+    닫는다. 어긋나는 게 하나라도 있으면 상태 문구가 '오류없음'이 아니게 되어
+    다음 단계(체크 해제 / 송장수정모드 끄기)가 멈추고 화면이 그대로 남는다.
+    반환: (상태 문구, 오류 상세 줄들).
     """
     main = main_window()
 
@@ -694,7 +831,9 @@ def apply_tracking(expected_count: int, log=print, close_result: bool = True,
     if res is None:
         raise UploadError("'송장번호수정 결과' 창이 뜨지 않았습니다.")
 
-    status, details = _read_apply_result(res[0], result_timeout, log=log)
+    # 쇼핑몰 접속이 건당 수 초씩 걸리므로 기다리는 시간도 건수에 맞춘다.
+    timeout = result_timeout if result_timeout is not None else max(180.0, 20.0 * count)
+    status, details = _read_apply_result(res[0], timeout, log=log, expected=count)
     log(f"  반영 결과: {status or '(상태 문구 없음)'}")
     for line in details:
         log(f"    {line}")

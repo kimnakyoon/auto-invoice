@@ -199,7 +199,7 @@ def wheel(x, y, notches):
     휠은 '커서 아래 컨트롤'로 가므로 좌표를 반드시 그리드 안으로 줘야 한다.
     """
     move_to(x, y)
-    time.sleep(0.2)
+    time.sleep(0.15)
     inp = INPUT(type=INPUT_MOUSE)
     inp.u.mi = MOUSEINPUT(0, 0, (-WHEEL_DELTA * notches) & 0xFFFFFFFF,
                           MOUSEEVENTF_WHEEL, 0, None)
@@ -292,19 +292,33 @@ def is_descendant(child, ancestor):
     return False
 
 
-def bring_to_front(hwnd):
+def bring_to_front(hwnd, timeout: float = 0.8):
     """대상 창을 최상단으로. 성공 여부를 bool로 반환.
 
     주의: SW_RESTORE(9)를 무조건 호출하면 '최대화된 창'까지 창모드로
     되돌려버린다. 실제로 샵마인 메인 창을 창모드로 바꿔서 레이아웃 좌표가
     전부 어긋난 적이 있다. 최소화된 창만 복원한다.
+
+    예전에는 여기서 고정 0.35초를 자고 결과를 봤다. 정작 알아야 하는 것은
+    '이 창이 앞에 왔는가' 하나뿐이라 이제 그것만 지켜본다 - 이미 앞에 있으면
+    거의 즉시 끝나고(평소 실행이 대부분 이 경우다), 늦게 올라오면 예전보다
+    더 기다려준다. 이 함수는 클릭과 화면 캡처마다 불려서, 고정 대기가 그대로
+    전체 실행 시간에 곱해지던 자리였다.
     """
     if u.IsIconic(hwnd):
         u.ShowWindow(hwnd, 9)      # SW_RESTORE - 최소화된 경우에만
     u.SetForegroundWindow(hwnd)
-    time.sleep(0.35)
-    fg = u.GetForegroundWindow()
-    return fg == hwnd or is_descendant(fg, hwnd)
+    end = time.time() + timeout
+    while True:
+        fg = u.GetForegroundWindow()
+        if fg == hwnd or is_descendant(fg, hwnd):
+            # 창이 막 올라온 직후에는 WinForms 가 첫 입력을 '창 활성화'로
+            # 삼켜버리는 일이 있어서, 확인된 뒤에도 한 박자만 둔다.
+            time.sleep(0.08)
+            return True
+        if time.time() >= end:
+            return False
+        time.sleep(0.03)
 
 
 def safe_click(hwnd, rel, expect_color=None, tol=28, label=""):
@@ -367,7 +381,7 @@ def click_dlg_button(hwnd, ctrl_id, label=""):
     caption = _text(btn)
     if not bring_to_front(hwnd):
         return False, f"[{label}] 대화상자를 앞으로 가져오지 못함"
-    time.sleep(0.25)
+    time.sleep(0.15)
     try:
         move_click(*center)
     except RuntimeError as e:
@@ -405,7 +419,7 @@ def ctrl_key(vk):
     _send(c, d, du, cu)
 
 
-def wait_for_window(title_equals=None, title_startswith=None, timeout=20.0, poll=0.4):
+def wait_for_window(title_equals=None, title_startswith=None, timeout=20.0, poll=0.15):
     """조건에 맞는 창이 뜰 때까지 기다린다. (hwnd, title, rect) 또는 None."""
     end = time.time() + timeout
     while time.time() < end:
@@ -416,7 +430,7 @@ def wait_for_window(title_equals=None, title_startswith=None, timeout=20.0, poll
     return None
 
 
-def wait_for_window_gone(title_equals=None, timeout=20.0, poll=0.4):
+def wait_for_window_gone(title_equals=None, timeout=20.0, poll=0.15):
     """해당 창이 사라질 때까지 기다린다."""
     end = time.time() + timeout
     while time.time() < end:
@@ -520,7 +534,7 @@ def set_ctrl_text(hwnd, value):
     """컨트롤 텍스트를 WM_SETTEXT로 설정하고, 실제로 반영됐는지 확인한다."""
     buf = ctypes.create_unicode_buffer(value)
     u.SendMessageW(hwnd, WM_SETTEXT, 0, ctypes.cast(buf, ctypes.c_void_p))
-    time.sleep(0.2)
+    time.sleep(0.12)
     return ctrl_text(hwnd) == value
 
 
