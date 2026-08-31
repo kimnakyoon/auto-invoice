@@ -155,6 +155,13 @@ def looks_like_login_page(page, url_is_login: Callable[[str], bool], *,
 # 주문상세가 그려지기를 기다리는 최대 시간 (자바스크립트로 그리는 사이트용).
 RENDER_WAIT_TIMEOUT_MS = 8 * 1000
 
+# 주문상세에 '판단 재료'(배송조회 링크나 진행중 상태 문구)가 나타나기를 기다리는
+# 시간. 예전에 어댑터마다 박혀 있던 고정 1.5초를 대신하는 값이라 그보다는
+# 넉넉하게 두되, 둘 다 끝내 안 나오는 화면(취소 주문 등)에서 오래 붙들리지
+# 않도록 위의 8초보다는 짧게 잡는다. 실제로는 보통 이미 그려져 있어서 0.3초쯤에
+# 지나간다.
+ORDER_RENDER_WAIT_MS = 2000
+
 
 def wait_for_text(page, needles, timeout_ms: int = RENDER_WAIT_TIMEOUT_MS,
                   poll_ms: int = 100) -> bool:

@@ -224,7 +224,11 @@ def get_tracking(
             if _looks_like_login_page(page):
                 raise BlockedError("NS홈쇼핑 로그인 후에도 여전히 로그인 페이지입니다.")
 
-        page.wait_for_timeout(1500)
+        # 화면이 아직 덜 그려진 채로 읽으면 '아직 미발급'으로 잘못 넘길 수 있다
+        # (조용히 틀리는 쪽이라 특히 위험하다). 그 주문의 주문번호가 화면에
+        # 뜨면 다 그려진 것이다 - '배송조회' 같은 글자는 상단 메뉴에도 있어서
+        # 표식으로 쓰면 덜 그려진 화면을 다 그려진 것으로 볼 수 있다.
+        common.wait_for_text(page, order_no, common.ORDER_RENDER_WAIT_MS)
         # 주문상세 화면을 떠나기 전에 주문일부터 읽어둔다 (오래된 주문을 결과에 따로 모으는 데 쓴다).
         return with_order_date(page, lambda: _scrape_tracking_from_page(page, order_no, order_option))
     finally:

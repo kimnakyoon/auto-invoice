@@ -88,9 +88,6 @@ LOGIN_RESPONSE_TIMEOUT_MS = 15 * 1000  # 로그인 API 응답 대기
 TRACKING_LINK_TEXT = "배송조회"
 NOT_YET_PATTERNS = ["배송준비중", "결제완료", "입금대기", "주문확인중"]
 
-# 주문상세가 그려지기를 기다리는 최대 시간 (평소에는 기다리지 않고 지나간다).
-RENDER_WAIT_MS = 2000
-
 
 def extract_order_no(product_url: str) -> str:
     match = re.search(r"/order/detail/(\d+)", product_url)
@@ -323,7 +320,8 @@ def get_tracking(
         # (조용히 틀리는 쪽이라 특히 위험하다). [배송조회]든 진행중 상태 문구든
         # 판단에 쓸 것이 하나라도 보일 때까지만 기다린다 - 보통은 이미 있어서
         # 그냥 지나간다.
-        common.wait_for_text(page, [TRACKING_LINK_TEXT, *NOT_YET_PATTERNS], RENDER_WAIT_MS)
+        common.wait_for_text(page, [TRACKING_LINK_TEXT, *NOT_YET_PATTERNS],
+                             common.ORDER_RENDER_WAIT_MS)
         # 주문상세 화면을 떠나기 전에 주문일부터 읽어둔다 (오래된 주문을 결과에 따로 모으는 데 쓴다).
         return with_order_date(page, lambda: _scrape_tracking_from_page(context, page, order_no, order_option))
     finally:

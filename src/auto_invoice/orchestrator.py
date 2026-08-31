@@ -175,7 +175,11 @@ def _lookup_site(site_key: str, jobs: list, *, settings, headless: bool,
                 with contextlib.suppress(Exception):
                     prepare(context, [order for order, _ in jobs], headless=headless)
 
-            for order, adapter in jobs:
+            # 대기는 '다음 요청과 간격을 두려고' 넣는 것이라, 그 사이트의
+            # 마지막 주문 뒤에는 잘 이유가 없다 - 사이트마다 한 번씩
+            # 평균 2.75초를 그냥 버리고 있었다.
+            last_index = len(jobs) - 1
+            for index, (order, adapter) in enumerate(jobs):
                 message = ""
                 try:
                     if blocked_reason:
@@ -259,7 +263,8 @@ def _lookup_site(site_key: str, jobs: list, *, settings, headless: bool,
                 finally:
                     shared.finished(order.order_id, message)
 
-                rate_limit.humanized_delay(settings.delay_min, settings.delay_max)
+                if index < last_index:
+                    rate_limit.humanized_delay(settings.delay_min, settings.delay_max)
         finally:
             browser_mod.save_state(context, site_key)
             browser.close()

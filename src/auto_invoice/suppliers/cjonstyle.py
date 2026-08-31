@@ -145,6 +145,22 @@ def _looks_authenticated(page: Page) -> bool:
     return MYZONE_PATH_PREFIX in urlparse(page.url).path
 
 
+def _wait_until_order_detail(page: Page, order_no: str) -> bool:
+    """주문상세가 그려질 때까지만 기다리고, 로그인된 화면인지 알려준다.
+
+    이 사이트는 비로그인이면 로그인 폼이 아니라 홈으로 조용히 넘어간다. 그래서
+    예전에는 그 리다이렉트가 일어날 시간을 주려고 무조건 2.5초를 잤는데, 주문
+    하나마다 2.5초면 100건에 4분이 통째로 사라진다.
+
+    화면에 그 주문의 주문번호가 뜨면 '로그인돼 있다'와 '다 그려졌다'가 한 번에
+    확인된다 - 밀려나는 홈에는 그 번호가 없다. 끝내 안 보이면 예전처럼 주소로
+    판정한다(주문번호를 화면에 안 적는 화면이 있을 수 있어 폴백을 남긴다).
+    """
+    if common.wait_for_text(page, order_no, common.ORDER_RENDER_WAIT_MS):
+        return True
+    return _looks_authenticated(page)
+
+
 def _prefill_login_id(page: Page) -> None:
     """자동 로그인이 안 될 때(CJONSTYLE_PW 없음/캡차) 쓰는 폴백 - 아이디만 채운다.
 
@@ -319,8 +335,10 @@ def _click_tracking_link(page: Page, product_url: str, order_no: str, link) -> t
         raise ParseError("배송조회 클릭 후 결과 페이지로 이동하지 못했습니다.")
 
     result = _parse_tracking_page(_read_tracking_sheet(page), order_no)
+    # 다음 버튼을 누르려면 주문상세가 다시 그려져 있어야 한다 - 주문번호가
+    # 다시 보이면 그때가 다 그려진 때다(예전에는 여기서도 2.5초를 잤다).
     page.goto(product_url, wait_until="domcontentloaded")
-    page.wait_for_timeout(2500)
+    common.wait_for_text(page, order_no, common.ORDER_RENDER_WAIT_MS)
     return result
 
 
@@ -392,14 +410,12 @@ def get_tracking(
     page = context.new_page()
     try:
         page.goto(product_url, wait_until="domcontentloaded")
-        page.wait_for_timeout(2500)
 
-        if not _looks_authenticated(page):
+        if not _wait_until_order_detail(page, order_no):
             # 자동 로그인은 자체 크롬 창을 띄우므로 headless 실행 중에도 쓸 수 있다.
             if _auto_login(context):
                 page.goto(product_url, wait_until="domcontentloaded")
-                page.wait_for_timeout(2500)
-                if not _looks_authenticated(page):
+                if not _wait_until_order_detail(page, order_no):
                     raise BlockedError("자동 로그인 후에도 주문상세 페이지에 접근하지 못했습니다.")
             elif headless:
                 raise BlockedError(
@@ -416,8 +432,7 @@ def get_tracking(
                     if not _wait_for_manual_login(page):
                         raise BlockedError("로그인 대기 시간(5분)이 지났습니다. 로그인 후 다시 실행해주세요.")
                 page.goto(product_url, wait_until="domcontentloaded")
-                page.wait_for_timeout(2500)
-                if not _looks_authenticated(page):
+                if not _wait_until_order_detail(page, order_no):
                     raise BlockedError("로그인 후에도 주문상세 페이지에 접근하지 못했습니다.")
 
         # 주문상세 화면을 떠나기 전에 주문일부터 읽어둔다 (오래된 주문을 결과에 따로 모으는 데 쓴다).
