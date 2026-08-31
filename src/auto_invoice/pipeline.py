@@ -14,9 +14,12 @@ scripts/run_all.py(터미널)와 scripts/gui.pyw(바탕화면 아이콘)가 이 
        + 한 주문번호가 여러 행인 주문은 여기서 제외    (excel_io.py)
     6. CSV를 [발송정보일괄등록(수정용)]으로 [일괄등록]  (shopmine/upload.py)
        -> 그리드의 '송장번호(수정용)' 컬럼이 채워진다
-    7. 그 컬럼이 채워진 행만 체크하고 [송장번호수정]    (shopmine/grid.py)
-       -> 쇼핑몰까지 실제 반영
-    8. 결과에 오류가 없으면 송장수정모드를 끈다
+    7. '송장번호(수정용)' 헤더로 정렬해 채워진 행만 체크하고 [송장번호수정]
+       -> 건수가 예상과 다르면(사람이 직접 채워둔 행이 섞임) 우리가 올린
+          주문번호로 한 건씩 걸러 그 행만 다시 고른다  (shopmine/upload.py)
+       -> 쇼핑몰까지 실제 반영. 결과 창의 문구가 나올 때까지 기다렸다가
+          오류를 읽고 창을 닫는다                      (shopmine/grid.py)
+    8. 오류가 없으면 송장수정모드를 끈다 (오류가 있으면 켜둔 채로 마무리)
 
 왜 1단계에서 탭부터 맞추나: 3단계 이후의 조작은 전부 '지금 보고 있는 탭'으로
 간다. 사람이 신규주문 탭을 열어둔 채로 두면 [송장수정모드 켜기] 좌표도,
@@ -31,6 +34,11 @@ Alt+X / Alt+U 도 엉뚱한 화면으로 가버린다.
 비워두기 때문에, 이것이 대상 주문을 고르는 기준이자 6단계에서 '일괄등록이
 실제로 반영됐는지' 판별하는 근거가 된다.
 
+실행 중에 사람이 마우스를 움직이거나 다른 창을 앞으로 가져오면 샵마인 조작이
+중단된다(winui.py). 그때 처음부터 다시 돌리면 제일 오래 걸리는 5단계 조회를
+통째로 다시 하게 되므로, 주문 한 건을 조회할 때마다 진행 상황을 남겨두고
+resume=True 로 '멈춘 지점부터' 이어서 할 수 있게 해뒀다 (checkpoint.py).
+
 실제 주문 데이터를 바꾸므로, 확신이 없으면 진행하지 않고 멈춘다. 자세한
 안전장치는 shopmine/upload.py 와 README.md 참고.
 """
@@ -42,7 +50,7 @@ import traceback
 from datetime import datetime
 from pathlib import Path
 
-from . import result_excel
+from . import checkpoint, report as report_mod, result_excel
 from .orchestrator import run as run_orchestrator
 from .shopmine import connect, excel_io, export, grid, tabs, upload
 
@@ -70,6 +78,12 @@ class PipelineResult:
         self.result_excel_path: Path | None = None
         self.applied_count: int = 0     # [송장번호수정]으로 반영한 건수
         self.apply_status: str = ""     # '오류없음.' 등 결과 창 문구
+        # 반영 결과 창에 같이 떠 있던 오류 문구들 (있으면 결과 엑셀에 남긴다).
+        self.apply_errors: list[str] = []
+        # 지난 실행이 남긴 진행 상황에서 이어서 시작했는가.
+        self.resumed: bool = False
+        # 멈춘 실행을 이어서 할 수 있을 때 마지막 요약에 붙일 안내 한 줄.
+        self.resume_note: str = ""
         self.stopped_reason: str | None = None
         # 샵마인 화면을 건드리기 시작했는가 (3단계 또는 6단계 진입).
         # 되돌릴 게 있는지 판단하는 기준이다.
@@ -178,12 +192,45 @@ def select_and_export(result: PipelineResult, *, tab="배송중", log=print) -> 
         result.stopped_reason = str(e)
         log(f"중단: {e}")
         return False
+    # 새로 내보냈으니 지난 실행의 조회 결과는 더 이상 쓸 수 없다 (주문 목록이
+    # 달라졌다). 진행 상황을 이 파일 기준으로 새로 시작한다.
+    checkpoint.save(export_path=result.export_path, csv_path=result.csv_path,
+                    entries=[], rows=[])
+    return True
+
+
+def reuse_export(result: PipelineResult, state, *, log=print) -> bool:
+    """3~4단계를 건너뛰고 지난 실행이 내보낸 주문목록을 그대로 쓴다.
+
+    이어서 시작할 때만 부른다. 파일이 지워졌으면 거짓을 돌려주고, 부른 쪽이
+    처음부터(3단계부터) 다시 한다.
+
+    이렇게 해도 되는 이유: 3단계에서 걸어둔 체크는 4단계 내보내기에만 쓰이고,
+    6~8단계는 CSV의 주문번호와 그리드의 '송장번호(수정용)' 컬럼만 본다
+    (upload.select_registered_rows). 그래서 멈춘 뒤 화면이 되돌려졌더라도
+    (restore_shopmine) 내보낸 엑셀만 있으면 이어서 할 수 있다.
+    """
+    export_file = state.export_file()
+    if export_file is None:
+        log("  지난 실행이 내보낸 주문목록 파일이 없어 처음부터 진행합니다.")
+        return False
+    result.export_path = export_file
+    result.csv_path = (Path(state.csv_path) if state.csv_path
+                       else OUTPUT_DIR / f"송장업로드_{datetime.now():%Y%m%d_%H%M%S}.csv")
+    result.resumed = True
+    log("")
+    log(f"[3-4/{STEPS}] 지난 실행이 내보낸 주문목록을 그대로 씁니다: {export_file.name}")
+    log(f"  이미 조회를 끝낸 {state.looked_up}건은 다시 조회하지 않습니다.")
     return True
 
 
 def lookup_tracking(result: PipelineResult, *, limit=None, headless=False,
-                    log=print) -> None:
-    """5단계: 공급사에서 송장번호를 조회해 업로드용 CSV를 만든다."""
+                    log=print, state=None) -> None:
+    """5단계: 공급사에서 송장번호를 조회해 업로드용 CSV를 만든다.
+
+    state: 이어서 시작할 때 넘기는 지난 실행의 진행 상황(checkpoint.py).
+    거기 있는 주문은 공급사에 다시 묻지 않는다.
+    """
     log("")
     log(f"[5/{STEPS}] 공급사에서 송장번호 조회")
 
@@ -193,9 +240,17 @@ def lookup_tracking(result: PipelineResult, *, limit=None, headless=False,
         log(f"  ({index}/{total}) {order_id}: {message}" if message
             else f"  ({index}/{total}) {order_id}")
 
+    def on_checkpoint(entries, rows):
+        # 한 건 끝날 때마다 남긴다 - 다음 건에서 멈춰도 여기까지는 살아남는다.
+        checkpoint.save(export_path=result.export_path, csv_path=result.csv_path,
+                        entries=entries, rows=rows)
+
     report = run_orchestrator(str(result.export_path), str(result.csv_path),
                               limit=limit, headless=headless,
-                              on_progress=on_progress)
+                              on_progress=on_progress,
+                              done_entries=state.entries if state else None,
+                              done_rows=state.rows if state else None,
+                              on_checkpoint=on_checkpoint)
 
     result.lookup_counts = report.summary()
     result.lookup_entries = list(report.entries)
@@ -257,16 +312,18 @@ def apply_csv(csv_path, order_ids, *, max_apply=100, expected_filled=None,
     log("")
     log(f"[7/{STEPS}] 송장이 채워진 행만 체크하고 [송장번호수정]")
     try:
-        picked = upload.select_registered_rows(log=log)
+        picked = upload.select_registered_rows(order_ids=order_ids, expected=expected,
+                                               log=log)
         if picked > expected:
             raise upload.UploadError(
                 f"송장이 채워진 행이 {picked}건으로 예상({expected}건)보다 많습니다. "
-                "필터가 제대로 걸리지 않았거나, 한 주문번호가 그리드 여러 행으로 "
-                "나뉜 주문이 섞였을 수 있어 아무것도 반영하지 않았습니다.")
+                "우리가 올린 주문번호로만 골랐는데도 많다는 것은 필터가 제대로 걸리지 "
+                "않았거나 한 주문번호가 그리드 여러 행으로 나뉜 주문이 섞였다는 뜻이라, "
+                "아무것도 반영하지 않았습니다.")
         if picked < expected:
             log(f"  경고: {expected}건이 채워져야 하는데 화면에서 채워진 건 {picked}건입니다 "
                 "- 채워진 건만 반영합니다.")
-        result.apply_status = upload.apply_tracking(picked, log=log)
+        result.apply_status, result.apply_errors = upload.apply_tracking(picked, log=log)
         result.applied_count = picked
     except (upload.UploadError, grid.GridError) as e:
         result.stopped_reason = str(e)
@@ -277,7 +334,15 @@ def apply_csv(csv_path, order_ids, *, max_apply=100, expected_filled=None,
     log("")
     log(f"[8/{STEPS}] 마무리")
     if not result.apply_ok:
+        # 결과 창의 [확인]은 apply_tracking 이 이미 눌러 닫았다. 여기서는
+        # 송장수정모드를 그대로 켜둔 채 끝낸다 - 사람이 화면에서 무엇이
+        # 반영되고 무엇이 안 됐는지 바로 확인할 수 있어야 한다.
+        marked = report_mod.mark_apply_errors(result.lookup_entries, result.apply_errors)
         log(f"  결과에 오류가 있어 송장수정모드를 켜둔 채로 둡니다: {result.apply_status!r}")
+        if marked:
+            log(f"  오류 문구에서 주문 {len(marked)}건을 찾아 결과 엑셀에 '반영오류'로 표시합니다.")
+        elif result.apply_errors:
+            log("  오류 문구에서 주문번호를 찾지 못해 원문 그대로 결과 엑셀에 남깁니다.")
         log("  샵마인 화면에서 직접 확인해주세요.")
         return result
     try:
@@ -341,24 +406,36 @@ def restore_shopmine(result: PipelineResult, *, stop_before_apply=False,
 
 
 def run_full(*, limit=None, max_apply=100, tab="배송중", stop_before_apply=False,
-             headless=False, log=print) -> PipelineResult:
+             headless=False, resume=False, log=print) -> PipelineResult:
     """1~8단계 전체.
 
     어디서 어떻게 멈추든 결과를 들고 돌아온다. 반영 단계에서 멈추든 예상 못 한
-    오류로 죽든, 마지막에 두 가지는 반드시 한다.
+    오류로 죽든, 마지막에 세 가지는 반드시 한다.
 
       - 이미 끝낸 송장조회 결과를 넘겨준다 (바탕화면 결과 엑셀 + 마지막 요약)
       - 샵마인에 반영한 게 없으면 화면을 건드리기 전 상태로 되돌린다
+      - 이어서 할 수 있게 진행 상황을 남기거나, 다 끝냈으면 지운다
+
+    resume=True 면 지난 실행이 남긴 진행 상황부터 이어서 한다 - 이미 내보낸
+    주문목록을 그대로 쓰고, 이미 조회한 주문은 건너뛴다 (checkpoint.py).
     """
     result = PipelineResult()
+    state = checkpoint.load() if resume else None
+    if resume and state is None:
+        log("이어서 할 진행 상황이 없습니다 - 처음부터 실행합니다.")
+    elif state is not None:
+        log(f"이어서 시작합니다: {state.describe()}")
     try:
         if not ensure_shipping_tab(result, tab=tab, log=log):
             return result
         if not ensure_malls_connected(result, log=log):
             return result
-        if not select_and_export(result, tab=tab, log=log):
-            return result
-        lookup_tracking(result, limit=limit, headless=headless, log=log)
+        if state is None or not reuse_export(result, state, log=log):
+            # 주문목록을 새로 내보내면 지난 조회 결과는 쓸 수 없다.
+            state = None
+            if not select_and_export(result, tab=tab, log=log):
+                return result
+        lookup_tracking(result, limit=limit, headless=headless, log=log, state=state)
         _apply_after_lookup(result, max_apply=max_apply,
                             stop_before_apply=stop_before_apply, log=log)
     except Exception as e:  # noqa: BLE001 - 조회 결과를 잃지 않는 것이 우선
@@ -369,7 +446,29 @@ def run_full(*, limit=None, max_apply=100, tab="배송중", stop_before_apply=Fa
     finally:
         restore_shopmine(result, stop_before_apply=stop_before_apply, log=log)
         save_result_excel(result, log=log)
+        finish_checkpoint(result, log=log)
     return result
+
+
+def finish_checkpoint(result: PipelineResult, *, log=print) -> None:
+    """다 끝냈으면 진행 상황을 지우고, 중간에 멈췄으면 남겨둔다.
+
+    남겨두면 [다시 시작](GUI) 또는 --resume(터미널)으로 이 지점부터 이어서 할
+    수 있다. 반대로 끝난 실행의 진행 상황이 남아 있으면 [다시 시작]이 이미
+    끝난 작업을 가리키게 되므로 반드시 지운다.
+
+    '끝났다'로 보는 경우는 셋이다: 오류 없이 반영을 마쳤을 때, 멈춘 이유 없이
+    끝났을 때(--stop-before-apply 포함), 그리고 조회는 다 했는데 반영할 성공
+    건이 하나도 없을 때 - 마지막은 다시 해도 결과가 같다.
+    """
+    nothing_to_apply = (result.lookup_done
+                        and result.lookup_counts.get("success", 0) == 0)
+    if result.apply_ok or nothing_to_apply or not result.stopped_reason:
+        checkpoint.clear()
+        return
+    result.resume_note = ("멈춘 지점부터 다시 시작할 수 있습니다 "
+                          "([멈춘 지점부터 다시 시작] 버튼 / --resume).")
+    log(f"  {result.resume_note}")
 
 
 def _apply_after_lookup(result: PipelineResult, *, max_apply, stop_before_apply,
@@ -417,6 +516,7 @@ def run_from_csv(csv_path, *, max_apply=100, tab="배송중",
                          stop_before_apply=stop_before_apply, log=log, result=result)
     finally:
         restore_shopmine(result, stop_before_apply=stop_before_apply, log=log)
+        finish_checkpoint(result, log=log)
 
 
 def summarize(result: PipelineResult) -> str:
@@ -432,10 +532,13 @@ def summarize(result: PipelineResult) -> str:
 
 
 def _head_summary(result: PipelineResult) -> list[str]:
-    """맨 위 두 줄: 반영 결과와, 되돌렸다면 되돌린 결과."""
+    """맨 위: 반영 결과, 결과 창에 떴던 오류, 되돌렸다면 되돌린 결과."""
     lines = [_apply_summary(result)]
+    lines.extend(f"  {line}" for line in result.apply_errors)
     if result.restore_note:
         lines.append(result.restore_note)
+    if result.resume_note:
+        lines.append(result.resume_note)
     return lines
 
 
@@ -480,6 +583,7 @@ def save_result_excel(result: PipelineResult, *, log=print) -> None:
         paths=(("내보낸 주문목록", result.export_path),
                ("업로드용 CSV", result.csv_path),
                ("상세 로그", result.lookup_report_path)),
+        apply_errors=result.apply_errors,
         out_dir=OUTPUT_DIR, log=log)
 
 

@@ -2,6 +2,10 @@
 
 바탕화면의 최근 엑셀 파일을 자동으로 찾아 보여주고, [실행] 버튼 하나로
 샵마인 '발송정보일괄등록(수정용)' 업로드용 파일을 생성한다.
+
+실행 중에 마우스를 움직이거나 다른 창을 앞으로 가져오면 샵마인 조작이
+중단된다. 그때를 위해 [멈춘 지점부터 다시 시작] 버튼을 둔다 - 이미 끝낸
+송장조회는 다시 하지 않고 멈춘 자리부터 이어서 한다 (checkpoint.py).
 """
 
 import os
@@ -20,13 +24,13 @@ if sys.platform == "win32" and sys.stdout is not None:
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
 
-from auto_invoice import pipeline, result_excel  # noqa: E402
+from auto_invoice import checkpoint, pipeline, result_excel  # noqa: E402
 from auto_invoice.orchestrator import run as run_orchestrator  # noqa: E402
 
 DESKTOP = Path.home() / "Desktop"
 
 WINDOW_WIDTH = 600
-WINDOW_HEIGHT = 460
+WINDOW_HEIGHT = 520
 RIGHT_MARGIN = 40  # 화면 오른쪽 가장자리와의 여백(px)
 
 
@@ -53,7 +57,7 @@ class App:
         self.root = root
         root.title("송장 자동화")
         _place_right_center(root)
-        root.minsize(520, 400)
+        root.minsize(520, 460)
 
         self.selected_file: Path | None = find_latest_export()
         self._output_path: Path | None = None
@@ -87,6 +91,21 @@ class App:
         self.max_apply.insert(0, "100")
         self.max_apply.pack(side="left", padx=(6, 0))
         tk.Label(limit_frame, text="건을 넘으면 멈춤", fg="#5f6368").pack(side="left", padx=(6, 0))
+
+        # --- 멈춘 실행 이어서 하기 ---
+        # 실행 도중 마우스를 건드리면 샵마인 조작이 중단된다. 그때 처음부터
+        # 다시 돌리면 제일 오래 걸리는 송장조회를 통째로 다시 하게 되므로,
+        # 멈춘 자리부터 이어갈 수 있는 버튼을 따로 둔다.
+        self.resume_button = tk.Button(
+            root,
+            text="↻  멈춘 지점부터 다시 시작",
+            font=("맑은 고딕", 11),
+            command=self.start_resume,
+            state="disabled",
+        )
+        self.resume_button.pack(pady=(2, 0))
+        self.resume_label = tk.Label(root, text="", fg="#5f6368", anchor="center")
+        self.resume_label.pack(fill="x", padx=14, pady=(0, 4))
 
         tk.Frame(root, height=1, bg="#dadce0").pack(fill="x", padx=14, pady=6)
 
@@ -126,6 +145,7 @@ class App:
                                       command=self.open_result_excel, state="disabled")
         self.excel_button.pack(side="left", padx=4)
 
+        self._refresh_resume()
         self.root.after(200, self._poll_queue)
 
     def _file_display(self) -> str:
@@ -149,12 +169,17 @@ class App:
         self.log.see("end")
         self.log.config(state="disabled")
 
-    def start_full_auto(self) -> None:
-        """1~8단계 전부 자동. 실제 주문 데이터가 바뀌므로 한 번 확인받는다."""
+    def _read_max_apply(self) -> int | None:
         try:
-            max_apply = int(self.max_apply.get())
+            return int(self.max_apply.get())
         except ValueError:
             messagebox.showerror("입력 오류", "최대 반영 건수는 숫자로 입력해주세요.")
+            return None
+
+    def start_full_auto(self) -> None:
+        """1~8단계 전부 자동. 실제 주문 데이터가 바뀌므로 한 번 확인받는다."""
+        max_apply = self._read_max_apply()
+        if max_apply is None:
             return
 
         if not messagebox.askokcancel(
@@ -171,18 +196,59 @@ class App:
 
         self._set_busy(True, "처리 중...")
         self._log("전부 자동 처리를 시작합니다. 마우스를 건드리지 말아주세요.\n")
-        threading.Thread(target=self._full_auto_worker, args=(max_apply,), daemon=True).start()
+        threading.Thread(target=self._full_auto_worker, args=(max_apply, False),
+                         daemon=True).start()
 
-    def _full_auto_worker(self, max_apply: int) -> None:
+    def start_resume(self) -> None:
+        """멈춘 실행을 이어서. 이미 끝낸 송장조회는 다시 하지 않는다."""
+        max_apply = self._read_max_apply()
+        if max_apply is None:
+            return
+        state = checkpoint.load()
+        if state is None:
+            messagebox.showinfo("이어서 할 작업 없음",
+                                "이어서 할 진행 상황이 없습니다.\n"
+                                "[전부 자동으로 처리]로 처음부터 실행해주세요.")
+            self._refresh_resume()
+            return
+
+        if not messagebox.askokcancel(
+            "멈춘 지점부터 다시 시작",
+            f"지난 실행이 멈춘 지점부터 이어서 합니다.\n\n"
+            f"· {state.describe()}\n"
+            "· 이미 내보낸 주문목록을 그대로 쓰고, 이미 조회한 주문은 건너뜁니다\n"
+            "· 실행 중에는 마우스와 키보드를 건드리지 마세요\n\n"
+            "진행할까요?",
+        ):
+            return
+
+        self._set_busy(True, "이어서 처리 중...")
+        self._log(f"멈춘 지점부터 이어서 시작합니다 ({state.describe()}).\n")
+        threading.Thread(target=self._full_auto_worker, args=(max_apply, True),
+                         daemon=True).start()
+
+    def _full_auto_worker(self, max_apply: int, resume: bool) -> None:
         try:
             result = pipeline.run_full(
                 max_apply=max_apply,
+                resume=resume,
                 log=lambda msg: self._queue.put(("log", msg)),
             )
             self._output_path = result.csv_path
             self._queue.put(("auto_done", result))
         except Exception as e:  # noqa: BLE001
             self._queue.put(("error", str(e)))
+
+    def _refresh_resume(self) -> None:
+        """이어서 할 진행 상황이 있는지 보고 [다시 시작] 버튼을 켜고 끈다."""
+        state = checkpoint.load()
+        if state is None:
+            self.resume_button.config(state="disabled")
+            self.resume_label.config(text="(멈춘 실행 없음)")
+            return
+        self.resume_button.config(state="normal")
+        self.resume_label.config(text=f"멈춘 실행: {state.describe()}",
+                                 fg="#d93025")
 
     def _set_busy(self, busy: bool, text: str = "") -> None:
         state = "disabled" if busy else "normal"
@@ -191,11 +257,15 @@ class App:
         self.run_button.config(state=state,
                                text=text if busy else "▶  파일만 만들기")
         if busy:
+            self.resume_button.config(state="disabled")
             self.open_button.config(state="disabled")
             self.excel_button.config(state="disabled")
             self.log.config(state="normal")
             self.log.delete("1.0", "end")
             self.log.config(state="disabled")
+        else:
+            # 방금 끝난 실행이 멈췄으면 여기서 [다시 시작]이 다시 켜진다.
+            self._refresh_resume()
 
     def start_run(self) -> None:
         if self.selected_file is None or not self.selected_file.exists():

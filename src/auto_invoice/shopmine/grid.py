@@ -348,16 +348,88 @@ def check_all_filtered(main_hwnd, log=print) -> int:
     raise GridError("[전체선택]을 눌러도 행이 체크되지 않았습니다.")
 
 
-def check_filled_rows(main_hwnd, log=print) -> int:
+def header_center_y(main_hwnd) -> int:
+    """그리드 헤더 줄의 세로 가운데 (창 상대 y).
+
+    헤더 [전체선택] 체크박스가 헤더 줄 안에 있으므로 그 위치로 역산한다
+    (bounds()가 위쪽 경계를 잡는 방식과 같다).
+    """
+    base = winui.rect(main_hwnd)
+    header = winui.rect(select_all_checkbox(main_hwnd))
+    return (header.top + header.bottom) // 2 - base.top
+
+
+def filled_first(rows) -> bool:
+    """채워진 행이 전부 빈 행보다 위에 있는가 (정렬이 먹었는지 판정)."""
+    seen_empty = False
+    for row in rows:
+        if row.filled and seen_empty:
+            return False
+        seen_empty = seen_empty or not row.filled
+    return True
+
+
+def sort_filled_first(main_hwnd, log=print) -> bool:
+    """'송장번호(수정용)' 컬럼 헤더를 눌러 채워진 행을 위로 올린다.
+
+    왜 정렬부터 하나: 일괄등록으로 채워진 행은 목록 여기저기에 흩어져 있어서,
+    그냥 체크하려면 수십 행을 스크롤하며 전부 훑어야 한다. 헤더를 두 번 눌러
+    (한 번은 오름차순, 한 번은 내림차순) 채워진 행을 위로 모아두면 위에서부터
+    연속으로 체크하면 되고, 빈 행이 처음 나오는 순간 아래는 볼 필요가 없다.
+
+    누른 뒤 반드시 화면으로 확인한다 - 정렬이 안 먹었는데 '위쪽만 보면 된다'고
+    믿으면 채워진 행을 통째로 빠뜨린다. 확인되지 않으면 False를 돌려주고,
+    부른 쪽은 예전처럼 전체를 훑는다 (느릴 뿐 결과는 같다).
+    """
+    # 한 화면에 다 보이는데 채워진 행이 하나도 없으면 정렬할 것이 없다.
+    # (경동택배/직접 필터에 걸린 행이 몇 개뿐이고 이번 업로드에 해당 건이
+    # 없을 때가 그렇다 - 이때 헤더를 눌러봐야 소용없고 경고만 남는다.)
+    if _scrollbars(main_hwnd)[0] is None:
+        rows = wait_ready(main_hwnd, log=log)
+        if not any(r.filled for r in rows):
+            log(f"  이 필터에 송장이 채워진 행이 없습니다 ({len(rows)}행) - 정렬 건너뜀")
+            return False
+
+    cx, cy = sum(TRACK_EDIT_X) // 2, header_center_y(main_hwnd)
+    # 먼저 두 번(오름차순 -> 내림차순) 누른다. 빈 값이 오름차순에서 위로 가는
+    # 그리드라면 이걸로 채워진 행이 위에 온다. 아니면 한 번씩 더 눌러 반대
+    # 방향도 본다 - 클릭이 조용히 무시된 경우에도 이 재시도가 살려준다.
+    for clicks in (2, 1, 1):
+        for _ in range(clicks):
+            if not winui.bring_to_front(main_hwnd):
+                log("  경고: 샵마인 창을 앞으로 가져오지 못해 정렬을 건너뜁니다.")
+                return False
+            ok, msg = winui.safe_click(main_hwnd, (cx, cy), label="송장번호(수정용) 헤더")
+            if not ok:
+                log(f"  경고: {msg} - 정렬 없이 진행합니다.")
+                return False
+            time.sleep(1.2)
+        rows = wait_ready(main_hwnd, log=log)
+        if rows and rows[0].filled and filled_first(rows):
+            log(f"  송장번호(수정용) 정렬 확인 - 채워진 행이 위로 올라왔습니다 "
+                f"(첫 화면 {sum(1 for r in rows if r.filled)}/{len(rows)}행)")
+            return True
+    log("  경고: 헤더를 눌러도 채워진 행이 위로 오지 않았습니다 - 목록 전체를 훑습니다.")
+    return False
+
+
+def check_filled_rows(main_hwnd, log=print, stop_at_empty=False) -> int:
     """송장번호(수정용)가 채워진 행만 체크한다 (화면을 내려가며 전부).
 
     이미 체크된 행은 건드리지 않으므로 몇 번을 돌려도 결과가 같다. 그래서
     스크롤이 겹쳐도 안전하다.
+
+    stop_at_empty: sort_filled_first로 '채워진 행이 위'라는 걸 확인했을 때만
+    참으로 준다. 빈 행이 나오는 화면까지만 보고 멈춘다 - 그 아래는 전부 빈
+    행이다. 정렬을 확인하지 못했으면 거짓으로 두고 끝까지 훑는다.
     """
     total = 0
     for page in _pages(main_hwnd, log=log):
         targets = [row.cy for row in page if row.filled and not row.checked]
+        done_here = stop_at_empty and any(not row.filled for row in page)
         if not targets:
+            if done_here:
+                break
             continue
         for cy in targets:
             _click_checkbox(main_hwnd, cy, label="송장 채워진 행")
@@ -376,6 +448,9 @@ def check_filled_rows(main_hwnd, log=print) -> int:
                     "화면이 갱신 중이거나 목록이 움직였을 수 있습니다.")
         total += len(targets)
         log(f"  이 화면에서 {len(targets)}건 체크 (누적 {total}건)")
+        if done_here:
+            log("  빈 행이 나와 여기까지만 봅니다 (정렬돼 있어 아래는 전부 빈 행)")
+            break
     return total
 
 

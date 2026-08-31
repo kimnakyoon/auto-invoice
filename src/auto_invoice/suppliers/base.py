@@ -12,6 +12,7 @@ from typing import Callable, Protocol
 
 from playwright.sync_api import BrowserContext
 
+from .. import eta as eta_mod
 from .. import order_date as order_date_mod
 from ..models import TrackingResult
 
@@ -34,9 +35,14 @@ class AdapterError(Exception):
     order_date: 주문상세에서 읽은 주문일. 송장이 안 나온 주문(미발급/취소)
     일수록 '주문한 지 며칠 됐는지'가 중요해서, 성공했을 때만이 아니라 예외로
     끝났을 때도 결과 정리까지 값을 실어 보낸다. 못 읽었으면 None이다.
+
+    delivery_note: 같은 화면에서 읽은 '출고예정 2026-09-02' 같은 안내 문구
+    (eta.py). 주문일이 오래됐는데 아직 송장이 없는 건을 사람이 볼 때, 공급사가
+    이미 예정일을 알려주고 있는지가 판단의 절반이라 같이 실어 보낸다.
     """
 
     order_date: date | None = None
+    delivery_note: str | None = None
 
 
 class OrderNotFound(AdapterError):
@@ -99,23 +105,41 @@ def raise_if_cancelled(text: str | None, order_no: str) -> None:
 
 
 def with_order_date(page, fetch: Callable[[], TrackingResult], *, data=None) -> TrackingResult:
-    """주문상세 화면에서 주문일을 읽어 조회 결과(또는 예외)에 실어준다.
+    """주문상세 화면에서 주문일과 출고/도착 예정 문구를 읽어 결과에 실어준다.
 
     각 어댑터의 get_tracking에서 '주문상세 화면에 도착한 직후' 이 함수로
     실제 조회를 감싸기만 하면 된다 - 화면을 떠나기 전에 날짜부터 읽어두고,
     조회가 예외로 끝나도(아직 미발급/취소 등) 그 예외에 날짜를 붙여준다.
 
+    화면 텍스트는 한 번만 읽어 주문일(order_date.py)과 예정 문구(eta.py)에
+    같이 쓴다 - 둘 다 같은 화면 같은 자리에서 나오는 값이라 두 번 읽을 이유가
+    없다.
+
     data: 주문 정보 JSON(화면에 심어둔 entry-data 등)이 있으면 화면 텍스트
     보다 먼저 본다 - 라벨을 찾아 헤매지 않아도 되니 더 정확하다.
     """
+    text = _page_text(page)
     found = order_date_mod.from_json(data) if data is not None else None
-    return attach_order_date(found or order_date_mod.from_page(page), fetch)
+    return attach_order_date(found or order_date_mod.from_text(text), fetch,
+                             delivery_note=eta_mod.from_text(text))
 
 
-def attach_order_date(found: date | None, fetch: Callable[[], TrackingResult]) -> TrackingResult:
-    """이미 읽어둔 주문일을 조회 결과(또는 예외)에 붙인다.
+def _page_text(page) -> str:
+    """주문상세 화면의 본문 텍스트. 못 읽어도 조회 자체를 깨지 않는다."""
+    try:
+        return page.inner_text("body")
+    except Exception:  # noqa: BLE001 - 부가 정보 때문에 조회가 깨지면 안 된다
+        return ""
 
-    화면이 아니라 API 응답에서 주문일을 얻는 어댑터(무신사/GSSHOP 등)용.
+
+def attach_order_date(found: date | None, fetch: Callable[[], TrackingResult],
+                      *, delivery_note: str | None = None) -> TrackingResult:
+    """이미 읽어둔 주문일(과 예정 문구)을 조회 결과(또는 예외)에 붙인다.
+
+    화면이 아니라 API 응답에서 주문일을 얻는 어댑터(무신사/옥션)용. 그쪽은
+    주문상세 화면을 아예 열지 않아서 예정 문구가 없고, 그러면 결과 엑셀의
+    '출고/도착예정' 칸이 빈칸으로 남는다 - 없는 값을 지어내지는 않는다.
+
     어댑터가 스스로 채워 넣은 값이 있으면 그쪽을 존중한다.
     """
     try:
@@ -123,9 +147,13 @@ def attach_order_date(found: date | None, fetch: Callable[[], TrackingResult]) -
     except AdapterError as e:
         if e.order_date is None:
             e.order_date = found
+        if e.delivery_note is None:
+            e.delivery_note = delivery_note
         raise
     if result.order_date is None:
         result.order_date = found
+    if result.delivery_note is None:
+        result.delivery_note = delivery_note
     return result
 
 

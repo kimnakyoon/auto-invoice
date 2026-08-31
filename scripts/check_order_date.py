@@ -28,6 +28,7 @@ from playwright.sync_api import sync_playwright  # noqa: E402
 
 from auto_invoice import browser as browser_mod  # noqa: E402
 from auto_invoice import order_date as order_date_mod  # noqa: E402
+from auto_invoice.suppliers import base as supplier_base  # noqa: E402
 from auto_invoice.suppliers import registry  # noqa: E402
 
 # 각 사이트의 실제 주문상세 URL (scripts/test_*_adapter.py에서 쓰던 것과 같은 주문).
@@ -123,19 +124,21 @@ def main() -> None:
         raise SystemExit(f"'{site_key}'의 기본 주문 URL이 없습니다. URL을 직접 넣어주세요.")
 
     adapter = _adapter_of(site_key)
-    real_from_page = order_date_mod.from_page
+    # 어댑터는 with_order_date -> _page_text 로 주문상세 텍스트를 한 번 읽는다.
+    # 그 자리가 '주문상세 화면에 도착한 순간'이라 여기에 끼어든다.
+    real_page_text = supplier_base._page_text
 
     def patched(page):
-        """어댑터가 주문상세에 도착해 주문일을 읽는 그 순간에 끼어든다."""
+        """어댑터가 주문상세 화면을 읽는 그 순간에 끼어든다."""
         _inspect(page, site_key)
         print(f"\n창을 열어둡니다 (최대 {WAIT_SECONDS}초). 다 보셨으면 창을 닫으세요.")
         for _ in range(WAIT_SECONDS):
             if page.is_closed():
                 break
             page.wait_for_timeout(1000)
-        return real_from_page(page)
+        return real_page_text(page)
 
-    order_date_mod.from_page = patched
+    supplier_base._page_text = patched
 
     with sync_playwright() as p:
         browser, context = browser_mod.get_context(p, site_key, headless=False)

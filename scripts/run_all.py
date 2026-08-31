@@ -7,6 +7,7 @@
     python scripts/run_all.py                             # 기본 상한 100건
     python scripts/run_all.py --limit 5 --max-apply 5      # 소량 테스트
     python scripts/run_all.py --stop-before-apply          # 일괄등록까지만
+    python scripts/run_all.py --resume                    # 멈춘 지점부터 이어서
     python scripts/run_all.py --csv "~/Desktop/송장업로드_....csv"  # 6~8단계만
 """
 
@@ -40,6 +41,9 @@ def main() -> int:
                    help="일괄등록까지만 하고 [송장번호수정]은 사람이 직접 누른다")
     p.add_argument("--headless", action="store_true",
                    help="공급사 조회를 브라우저 창 없이 (최초 로그인 이후에만)")
+    p.add_argument("--resume", action="store_true",
+                   help="지난 실행이 중간에 멈춘 지점부터 이어서 실행한다 "
+                        "(이미 내보낸 주문목록을 그대로 쓰고, 이미 조회한 주문은 건너뛴다)")
     p.add_argument("--csv", default=None,
                    help="이미 만들어둔 업로드용 CSV로 6~8단계만 실행 "
                         "(상한 초과로 멈춘 뒤 확인하고 재실행할 때)")
@@ -48,6 +52,8 @@ def main() -> int:
     log("=" * 60)
     if args.csv:
         log(f"기존 CSV로 6~8단계 실행  ({datetime.now():%Y-%m-%d %H:%M:%S})")
+    elif args.resume:
+        log(f"멈춘 지점부터 이어서 실행  ({datetime.now():%Y-%m-%d %H:%M:%S})")
     else:
         log(f"송장 자동화 전체 실행  ({datetime.now():%Y-%m-%d %H:%M:%S})")
     log("=" * 60)
@@ -60,7 +66,7 @@ def main() -> int:
         result = pipeline.run_full(
             limit=args.limit, max_apply=args.max_apply, tab=args.tab,
             stop_before_apply=args.stop_before_apply, headless=args.headless,
-            log=log)
+            resume=args.resume, log=log)
 
     log("")
     log("=" * 60)

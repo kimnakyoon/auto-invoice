@@ -12,9 +12,11 @@
       --Alt+U--> '발송정보일괄등록' 창 (순수 WinForms, 컨트롤 전부 HWND 있음)
       --경로 EDIT 에 CSV 경로 설정 + [일괄등록(&S)]-->
           '발송정보일괄등록 결과' 창 ... 그리드의 '송장번호(수정용)' 컬럼이 채워짐
-      --송장번호(수정용)가 채워진 행만 체크 --> [송장번호수정] 클릭
+      --'송장번호(수정용)' 컬럼 헤더 두 번 클릭--> 채워진 행이 위로 정렬됨
+      --위에서부터 채워진 행만 체크 --> [송장번호수정] 클릭
       --'선택한 N개의 주문을 [송장번호수정] 하시겠습니까?' --[예]-->
-          '송장번호수정 결과' 창 ('오류없음.' 이면 성공)
+          '송장번호수정 결과' 창: 문구가 채워질 때까지 기다렸다가 오류를 읽고
+          [확인]을 눌러 닫는다 ('오류없음.' 이면 성공)
       --오류가 없으면 [송장수정모드 끄기]
 
 안전장치의 핵심은 마지막 확인 대화상자다. 이 창이 '선택한 N개'라고 건수를
@@ -160,15 +162,47 @@ def _toolbar_click(main_hwnd, rel, label, until, *, attempts=3, timeout=8.0,
     return None, last
 
 
-def _close_window(title, log=print):
+# 창을 닫는 버튼 이름. 창마다 [닫기] 또는 [확인]으로 다르고, 어느 쪽이든
+# 누르지 않으면 창이 남아 다음 조작을 가린다. 앞에 있는 것부터 찾는다.
+CLOSE_CAPTIONS = ("닫기", "확인")
+# '송장번호수정 결과' 창만 [확인]을 먼저 찾는다 - 이 창의 버튼이 [확인]인데
+# [닫기]만 찾던 예전 코드가 아무것도 못 눌러서, 결과를 확인하지도 닫지도 못한
+# 채 다음 단계로 넘어갔다.
+APPLY_RESULT_CAPTIONS = ("확인", "닫기")
+
+# 결과 창 글자가 이만큼(초) 안 바뀌면 처리가 끝난 것으로 본다.
+RESULT_STABLE_SECONDS = 15.0
+
+
+def _buttons(hwnd):
+    """창에 보이는 버튼들 - (핸들, 글자) 목록."""
+    return [(k, winui.ctrl_text(k)) for k in winui.children(hwnd)
+            if winui.class_of(k) == "BUTTON" and winui.u.IsWindowVisible(k)]
+
+
+def _close_window(title, log=print, captions=CLOSE_CAPTIONS):
     for h, _t, _r in winui.find_windows(title_equals=title):
-        btn = winui.find_child(h, "BUTTON",
-                               lambda k: winui.ctrl_text(k).startswith("닫기"))
+        buttons = _buttons(h)
+        btn = caption = None
+        for want in captions:
+            btn = next((k for k, tx in buttons if tx.startswith(want)), None)
+            if btn is not None:
+                caption = want
+                break
+        if btn is None and len(buttons) == 1:
+            # 이름이 예상과 다른 경우. 결과 창에 버튼이 하나뿐이면 그게 닫는
+            # 버튼이다 - 창을 못 닫으면 다음 조작이 전부 가려지므로, 이름을
+            # 남기고 그 하나를 누른다 (다음에 이름을 CLOSE_CAPTIONS에 넣으면 된다).
+            btn, caption = buttons[0][0], buttons[0][1]
+            log(f"  '{title}' 창의 버튼 이름이 {caption!r} 입니다 - 이걸 누릅니다.")
         if btn is None:
+            names = ", ".join(repr(tx) for _k, tx in buttons) or "(버튼 없음)"
+            log(f"  경고: '{title}' 창에서 [{'/'.join(captions)}] 버튼을 찾지 못했습니다 "
+                f"(그 창의 버튼: {names}).")
             continue
-        _click_control(btn, h, f"{title} 닫기")
+        _click_control(btn, h, f"{title} {caption}")
         if winui.wait_for_window_gone(title_equals=title, timeout=8.0):
-            log(f"  '{title}' 닫음")
+            log(f"  '{title}' [{caption}] 눌러 닫음")
         else:
             log(f"  경고: '{title}' 창이 닫히지 않았습니다.")
 
@@ -453,30 +487,91 @@ def bulk_register(csv_path, log=print) -> None:
 
 # --- 6단계: 쇼핑몰까지 반영 -----------------------------------------
 
-def select_registered_rows(log=print) -> int:
+def _quiet(_msg=""):
+    pass
+
+
+def select_registered_rows(order_ids=None, expected=None, log=print) -> int:
     """일괄등록으로 송장번호(수정용)가 채워진 행만 체크한다.
 
     송장수정모드에서 이 컬럼은 원래 값으로 미리 채워져 있고 경동택배·직접전달
     행만 비어 있다. 그 두 필터 안에서 '채워짐'은 곧 '이번 일괄등록이 반영됨'을
     뜻한다 - 조회에 실패해 CSV에 없던 건은 여전히 비어 있다.
+
+    다만 **사람이 직접 채워 넣은 행**은 이 규칙에서 벗어난다. 미지원 사이트
+    주문처럼 도구가 넘긴 건을 사람이 직접 조회해 이 칸에 적어두면, 화면만
+    봐서는 우리가 올린 값과 구분이 안 된다 (2026-08-31 실제로 이 때문에
+    '채워진 행 2건 / 예상 1건'으로 멈췄다. 수집결과내 검색은 원본 데이터만
+    찾아서 우리가 올린 송장번호로는 그 행을 집어낼 수도 없다).
+
+    그래서 두 단계로 고른다.
+
+      1) 빠른 길 - 경동택배/직접 필터에서 헤더 정렬 후 채워진 행을 체크한다.
+         건수가 예상과 맞으면 그대로 끝낸다 (평소엔 여기서 끝난다).
+      2) 건수가 어긋나면 - 우리가 올린 **주문번호로 한 건씩 필터를 걸어**
+         그 주문의 채워진 행만 다시 고른다. 마켓 주문번호는 원본 데이터라
+         필터에 걸리므로, 사람이 채워둔 행은 애초에 화면에 들어오지 않는다.
+         건당 3~4초 더 걸리는 대신 남의 행을 건드리지 않는다.
+
+    order_ids/expected 를 주지 않으면 1)만 하고 그 결과를 돌려준다.
     """
     main = main_window()
     if not edit_mode_on(main):
         raise UploadError(
             "송장수정모드가 꺼져 있습니다. 그 상태에서는 '송장번호(수정용)' 컬럼이 "
             "화면에 없어 어떤 행이 반영됐는지 알 수 없습니다.")
-    grid.clear_all_checks(main, log=log)
-    total = 0
-    for keyword in TARGET_COURIERS:
-        set_filter(keyword, log=log)
-        n = grid.check_filled_rows(main, log=log)
-        log(f"  '{keyword}' 에서 송장이 채워진 {n}건 체크")
-        total += n
-    reset_filter(log=log)
+
+    total = _select_by_courier(main, log=log)
+    if expected is not None and total != expected and order_ids:
+        log(f"  채워진 행이 {total}건으로 예상({expected}건)과 다릅니다 - "
+            "사람이 직접 채워둔 행이 섞였을 수 있어, 우리가 올린 주문번호로 다시 고릅니다.")
+        total = _select_by_order_id(main, order_ids, log=log)
+
     if total == 0:
         raise UploadError(
             "송장번호(수정용)가 채워진 행을 하나도 찾지 못했습니다. "
             "일괄등록이 실제로 반영되지 않았을 수 있어 중단합니다.")
+    return total
+
+
+def _select_by_courier(main_hwnd, log=print) -> int:
+    """빠른 길: 경동택배/직접 필터에서 정렬 후 채워진 행을 전부 체크한다."""
+    grid.clear_all_checks(main_hwnd, log=log)
+    total = 0
+    for keyword in TARGET_COURIERS:
+        set_filter(keyword, log=log)
+        # 필터를 건 다음 '송장번호(수정용)' 헤더를 두 번 눌러 채워진 행을 위로
+        # 모은다. 정렬이 확인되면 빈 행이 나오는 순간 멈춘다 (grid.py 참고).
+        sorted_ok = grid.sort_filled_first(main_hwnd, log=log)
+        n = grid.check_filled_rows(main_hwnd, log=log, stop_at_empty=sorted_ok)
+        log(f"  '{keyword}' 에서 송장이 채워진 {n}건 체크")
+        total += n
+    reset_filter(log=log)
+    return total
+
+
+def _select_by_order_id(main_hwnd, order_ids, log=print) -> int:
+    """정확한 길: 주문번호로 한 건씩 필터를 걸어 그 주문의 채워진 행만 체크한다.
+
+    앞 단계에서 걸어둔 체크를 먼저 전부 푼다 - 거기엔 남의 행이 섞여 있을 수
+    있어서, 더하는 게 아니라 처음부터 다시 고르는 것이다.
+    """
+    grid.clear_all_checks(main_hwnd, log=log)
+    unique = list(dict.fromkeys(order_ids))
+    log(f"  주문번호 {len(unique)}건을 하나씩 확인합니다 (건당 3~4초)")
+    total = 0
+    missing = []
+    for i, order_id in enumerate(unique, start=1):
+        set_filter(order_id, log=_quiet)
+        n = grid.check_filled_rows(main_hwnd, log=_quiet)
+        total += n
+        if n == 0:
+            missing.append(order_id)
+        log(f"    ({i}/{len(unique)}) {order_id}: {n}건 체크 (누적 {total}건)")
+    reset_filter(log=log)
+    if missing:
+        log(f"  경고: 송장번호(수정용)가 비어 있어 넘긴 주문 {len(missing)}건 - "
+            f"{', '.join(missing[:5])}{' 외' if len(missing) > 5 else ''}")
     return total
 
 
@@ -486,12 +581,73 @@ def _confirm_dialog():
     return found[0] if found else None
 
 
-def apply_tracking(expected_count: int, log=print, close_result: bool = True) -> str:
+def _result_texts(hwnd) -> list[str]:
+    """결과 창에 지금 보이는 글자들 (중복 없이, 나온 순서대로)."""
+    out: list[str] = []
+    for k in winui.children(hwnd):
+        tx = winui.ctrl_text(k).strip()
+        if tx and tx not in out:
+            out.append(tx)
+    return out
+
+
+def _read_apply_result(hwnd, timeout: float, log=print) -> tuple[str, list[str]]:
+    """'송장번호수정 결과' 창의 처리가 끝날 때까지 기다렸다가 읽는다.
+
+    창은 쇼핑몰에 접속하는 동안 먼저 떠 있고, 다 끝나야 '오류없음.' 또는
+    '오류발생...' 같은 상태 문구가 채워진다. 예전에는 창이 뜬 뒤 2초만 세고
+    읽어서, 아직 비어 있는 화면을 '상태 문구 없음'으로 넘겨버렸다. 이제는
+    문구가 나올 때까지 기다린다.
+
+    반환: (상태 문구, 오류 상세 줄들). 상세 줄은 창에 적힌 나머지 글자
+    전부다 - 어느 주문에서 났는지까지 알려주는 경우가 있어서, 해석하지 않고
+    그대로 넘겨 결과 엑셀에 남긴다.
+
+    문구가 '오류'로 시작하지 않는 화면일 수도 있어서, 창 글자가 STABLE_SECONDS
+    동안 하나도 안 바뀌면 거기서 끝난 것으로 본다 - 그렇지 않으면 멀쩡히 끝난
+    실행에서 timeout 만큼 그냥 서 있게 된다.
+    """
+    end = time.time() + timeout
+    texts: list[str] = []
+    status = ""
+    previous: list[str] | None = None
+    stable_since = time.time()
+    while time.time() < end:
+        texts = _result_texts(hwnd)
+        status = next((t for t in texts if t.startswith("오류") and "발생건은" not in t), "")
+        if status:
+            break
+        if texts != previous:
+            previous, stable_since = texts, time.time()
+        elif texts and time.time() - stable_since >= RESULT_STABLE_SECONDS:
+            log(f"  '오류...' 로 시작하는 문구가 없습니다 - 창 글자가 "
+                f"{RESULT_STABLE_SECONDS:.0f}초째 그대로라 여기서 끝난 것으로 봅니다: {texts}")
+            break
+        time.sleep(1.0)
+    if not status:
+        log(f"  경고: 결과 문구('오류없음.' 등)를 읽지 못했습니다 - "
+            "샵마인 화면에서 직접 확인해주세요.")
+    if result_is_clean(status):
+        # 오류가 없으면 창에 남은 다른 글자(제목/안내 문구)는 오류가 아니다.
+        # 그걸 오류로 넘기면 결과 엑셀에 있지도 않은 오류 구역이 생긴다.
+        return status, []
+    details = [t for t in texts
+               if t != status and t not in CLOSE_CAPTIONS
+               and t not in (APPLY_RESULT_WINDOW, UPLOAD_RESULT_WINDOW)
+               and len(t) >= 4]
+    return status, details
+
+
+def apply_tracking(expected_count: int, log=print, close_result: bool = True,
+                   result_timeout: float = 180.0) -> tuple[str, list[str]]:
     """체크해둔 행을 [송장번호수정]으로 쇼핑몰까지 반영한다.
 
     확인 대화상자가 알려주는 건수가 expected_count 와 다르면 [아니요]를 눌러
     아무것도 반영하지 않고 UploadError 를 낸다. 이것이 이 파이프라인 전체의
     마지막이자 가장 중요한 안전장치다.
+
+    반영이 끝나면 결과 창의 문구가 채워질 때까지 기다렸다가 오류를 읽고,
+    [확인]을 눌러 창을 닫는다. 반환: (상태 문구, 오류 상세 줄들).
     """
     main = main_window()
 
@@ -537,19 +693,17 @@ def apply_tracking(expected_count: int, log=print, close_result: bool = True) ->
                                 timeout=max(300.0, 20.0 * count))
     if res is None:
         raise UploadError("'송장번호수정 결과' 창이 뜨지 않았습니다.")
-    time.sleep(2.0)
 
-    status = ""
-    for k in winui.children(res[0]):
-        tx = winui.ctrl_text(k).strip()
-        if tx.startswith("오류") and "발생건은" not in tx:
-            status = tx
-            break
+    status, details = _read_apply_result(res[0], result_timeout, log=log)
     log(f"  반영 결과: {status or '(상태 문구 없음)'}")
+    for line in details:
+        log(f"    {line}")
 
+    # 오류가 있든 없든 [확인]을 눌러 창을 닫는다. 이 창이 떠 있으면 다음
+    # 조작(체크 해제 / 송장수정모드 끄기)이 전부 가려져 조용히 무시된다.
     if close_result:
-        _close_window(APPLY_RESULT_WINDOW, log)
-    return status
+        _close_window(APPLY_RESULT_WINDOW, log, captions=APPLY_RESULT_CAPTIONS)
+    return status, details
 
 
 def result_is_clean(status: str) -> bool:
@@ -572,6 +726,7 @@ def cleanup_stray_dialogs():
     def quiet(_msg):
         pass
 
-    for title in (APPLY_RESULT_WINDOW, UPLOAD_RESULT_WINDOW, UPLOAD_WINDOW):
+    _close_window(APPLY_RESULT_WINDOW, log=quiet, captions=APPLY_RESULT_CAPTIONS)
+    for title in (UPLOAD_RESULT_WINDOW, UPLOAD_WINDOW):
         _close_window(title, log=quiet)
 

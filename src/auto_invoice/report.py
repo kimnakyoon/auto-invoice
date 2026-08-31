@@ -7,12 +7,16 @@ from pathlib import Path
 from . import order_date as order_date_mod
 from .models import AttentionCategory, ReportEntry
 
-LOG_DIR = Path("logs")
+# 프로젝트 폴더 아래 고정. 실행한 위치(현재 작업 폴더)를 기준으로 잡으면
+# 바탕화면 아이콘(gui.pyw)으로 켤 때와 터미널에서 켤 때 로그가 서로 다른 곳에
+# 쌓이고, 멈춘 실행을 이어서 할 진행 상황(checkpoint.py)도 못 찾는다.
+LOG_DIR = Path(__file__).resolve().parent.parent.parent / "logs"
 
 # 실행이 끝난 뒤 사람이 따로 챙겨야 하는 주문들. 일반 실패 목록과 섞이면
 # 묻혀서, 마지막 결과 정리에 이 분류별로 따로 묶어 보여준다.
 ATTENTION_TITLES: dict[AttentionCategory, str] = {
     "cancelled": "취소/품절로 보이는 주문 (직접 확인해주세요)",
+    "apply_error": "샵마인 [송장번호수정]에서 오류가 난 주문 (직접 확인해주세요)",
     "unsupported_site": "아직 지원하지 않는 사이트 (직접 조회해주세요)",
 }
 
@@ -26,7 +30,8 @@ STALE_TITLE = (f"주문일이 {order_date_mod.STALE_DAYS}일 이상 지난 주�
 # 그냥 '스킵'과 구분해서 보여준다 - 기다리면 되는 건과 손을 대야 하는 건이
 # 다르다. 결과 엑셀(result_excel.py)도 같은 이름을 쓴다.
 STATUS_LABELS = {"success": "성공", "fail": "실패", "skip": "스킵"}
-CATEGORY_LABELS = {"unsupported_site": "미지원 사이트", "cancelled": "취소/품절"}
+CATEGORY_LABELS = {"unsupported_site": "미지원 사이트", "cancelled": "취소/품절",
+                   "apply_error": "반영오류"}
 
 
 def result_label(entry: ReportEntry) -> str:
@@ -72,17 +77,21 @@ class RunReport:
         self.entries: list[ReportEntry] = []
 
     def success(self, order_id: str, courier: str | None, tracking_no: str,
-                order_date: date | None = None) -> None:
+                order_date: date | None = None, delivery_note: str | None = None,
+                product_url: str | None = None) -> None:
         self.entries.append(
             ReportEntry(order_id=order_id, status="success", courier=courier,
-                        tracking_no=tracking_no, order_date=order_date)
+                        tracking_no=tracking_no, order_date=order_date,
+                        delivery_note=delivery_note, product_url=product_url)
         )
 
     def fail(self, order_id: str, reason: str, recipient_name: str | None = None,
-             order_date: date | None = None) -> None:
+             order_date: date | None = None, delivery_note: str | None = None,
+             product_url: str | None = None) -> None:
         self.entries.append(
             ReportEntry(order_id=order_id, status="fail", reason=reason,
-                        recipient_name=recipient_name or None, order_date=order_date)
+                        recipient_name=recipient_name or None, order_date=order_date,
+                        delivery_note=delivery_note, product_url=product_url)
         )
 
     def exclude(self, order_id: str, reason: str, recipient_name: str | None = None) -> None:
@@ -97,11 +106,15 @@ class RunReport:
         ]
         self.entries = [e for e in self.entries if e not in removed]
         order_date = next((e.order_date for e in removed if e.order_date), None)
-        self.fail(order_id, reason, recipient_name=recipient_name, order_date=order_date)
+        note = next((e.delivery_note for e in removed if e.delivery_note), None)
+        url = next((e.product_url for e in removed if e.product_url), None)
+        self.fail(order_id, reason, recipient_name=recipient_name, order_date=order_date,
+                  delivery_note=note, product_url=url)
 
     def skip(self, order_id: str, reason: str, recipient_name: str | None = None,
              category: AttentionCategory | None = None,
-             order_date: date | None = None) -> None:
+             order_date: date | None = None, delivery_note: str | None = None,
+             product_url: str | None = None) -> None:
         self.entries.append(
             ReportEntry(
                 order_id=order_id,
@@ -111,6 +124,8 @@ class RunReport:
                                 else _name_if_needed(recipient_name, order_date),
                 category=category,
                 order_date=order_date,
+                delivery_note=delivery_note,
+                product_url=product_url,
             )
         )
 
@@ -124,18 +139,20 @@ class RunReport:
         """
         self.skip(order_id, f"등록된 어댑터 없음: {product_url}",
                   recipient_name=recipient_name, category="unsupported_site",
-                  order_date=order_date)
+                  order_date=order_date, product_url=product_url)
 
     def cancelled(self, order_id: str, reason: str,
                   recipient_name: str | None = None,
-                  order_date: date | None = None) -> None:
+                  order_date: date | None = None, delivery_note: str | None = None,
+                  product_url: str | None = None) -> None:
         """공급사 화면에 취소/품절 표시가 있어 송장이 나올 수 없는 주문.
 
         '아직 미발급' 스킵과 달리 기다려도 해결되지 않아서(suppliers/base.py의
         OrderCancelled 참고) 따로 모아 사람에게 넘긴다.
         """
         self.skip(order_id, reason, recipient_name=recipient_name, category="cancelled",
-                  order_date=order_date)
+                  order_date=order_date, delivery_note=delivery_note,
+                  product_url=product_url)
 
     def failures(self) -> list[ReportEntry]:
         return [entry for entry in self.entries if entry.status == "fail"]
@@ -164,14 +181,15 @@ class RunReport:
         정리에 이어 붙이기만 하면 된다. 해당 건이 없는 분류는 아예 뺀다.
 
         순서는 결과 엑셀의 목록 순서(result_excel._SORT_ORDER)와 맞춰뒀다 -
-        취소/품절 -> 주문일지연 -> 미지원 사이트. 그 앞의 '실패'는 이
-        함수가 아니라 실패 목록이 따로 보여준다.
+        취소/품절 -> 반영오류 -> 주문일지연 -> 미지원 사이트. 그 앞의 '실패'는
+        이 함수가 아니라 실패 목록이 따로 보여준다.
 
         '주문일이 오래된 주문'은 그냥 넘긴 스킵만 모으므로(is_stale_entry)
         세 목록에 같은 주문이 두 번 나오는 일은 없다.
         """
         blocks = [
             (ATTENTION_TITLES["cancelled"], self._attention_lines("cancelled")),
+            (ATTENTION_TITLES["apply_error"], self._attention_lines("apply_error")),
             (STALE_TITLE, self.stale_lines()),
             (ATTENTION_TITLES["unsupported_site"],
              self._attention_lines("unsupported_site")),
@@ -217,11 +235,48 @@ def _entry_line(entry: ReportEntry) -> str:
 
 
 def _stale_line(entry: ReportEntry) -> str:
-    """'  - 주문번호 (수령인: 이름): 주문일 2026-08-26 (2일 지남) - 조회결과 성공'.
+    """'  - 주문번호 (수령인: 이름): 주문일 2026-08-26 (2일 지남) - 조회결과 스킵'.
 
     조회 결과까지 같이 보여준다 - 같은 '오래된 주문'이라도 송장을 받은 건과
-    아직 못 받은 건은 사람이 할 일이 다르다.
+    아직 못 받은 건은 사람이 할 일이 다르다. 공급사 화면에 출고/도착 예정이
+    적혀 있었으면 그 문구와 상품URL도 붙인다 - 그 둘만 있으면 사이트를 다시
+    열지 않고도 '기다리면 되는 건지'를 판단할 수 있다.
     """
     who = f" (수령인: {entry.recipient_name})" if entry.recipient_name else ""
+    eta = f" - {entry.delivery_note}" if entry.delivery_note else ""
+    url = f"\n      {entry.product_url}" if entry.product_url else ""
     return (f"  - {entry.order_id}{who}: 주문일 {order_date_mod.describe(entry.order_date)}"
-            f" - 조회결과 {result_label(entry)}")
+            f" - 조회결과 {result_label(entry)}{eta}{url}")
+
+
+def mark_apply_errors(entries: list[ReportEntry],
+                      detail_lines: list[str]) -> list[ReportEntry]:
+    """샵마인 [송장번호수정] 결과 창의 오류 문구에 이름이 오른 주문을 표시한다.
+
+    결과 창은 오류가 어느 주문에서 났는지까지 알려준다. 그 문구에 마켓
+    주문번호가 그대로 들어 있으면 그 주문을 찾아 category='apply_error'로
+    바꿔둔다 - 그러면 결과 엑셀에서 '반영오류'로 취소/품절 바로 다음에 올라와
+    사람이 놓치지 않는다.
+
+    status는 'success' 그대로 둔다. 조회 자체는 성공했고 업로드용 CSV에도
+    들어간 건이라, 여기서 실패로 바꾸면 이미 저장해둔 logs/run_*.json 의
+    건수와 어긋난다. 사람에게 보이는 이름만 바꾸는 것이 목적이다.
+
+    문구에서 주문번호를 못 찾을 수도 있다(오류 목록이 그리드로만 그려지는
+    경우). 그때는 한 건도 표시되지 않으므로, 부른 쪽이 오류 원문 자체를 결과
+    엑셀에 따로 남긴다.
+    """
+    text = "\n".join(detail_lines)
+    marked = []
+    for entry in entries:
+        if entry.category is not None or not entry.order_id or entry.order_id not in text:
+            continue
+        entry.category = "apply_error"
+        entry.reason = _error_line_for(entry.order_id, detail_lines) or entry.reason
+        marked.append(entry)
+    return marked
+
+
+def _error_line_for(order_id: str, detail_lines: list[str]) -> str:
+    """그 주문번호가 나오는 오류 줄만 골라 사유로 쓴다."""
+    return " / ".join(line.strip() for line in detail_lines if order_id in line)

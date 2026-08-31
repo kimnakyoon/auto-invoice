@@ -7,7 +7,8 @@
 중간에 멈춘 실행이든 조회를 한 번이라도 했으면 항상 만든다.
 
 정렬은 파일 순서가 아니라 '사람 손이 먼저 가야 하는 순서'로 한다
-(실패 -> 취소/품절 -> 주문일지연 -> 미지원 사이트 -> 스킵 -> 성공). 성공
+(실패 -> 취소/품절 -> 반영오류 -> 주문일지연 -> 미지원 사이트 -> 스킵 -> 성공).
+성공
 건은 이미 업로드용 CSV로 처리되므로 맨 뒤여도 되고, 확인이 필요한 건이 위로
 올라온다.
 
@@ -19,6 +20,11 @@
 (report.is_stale_entry)은 '주문일' 칸을 빨갛게 표시하고, 그런 건만 모은
 시트를 따로 하나 더 만든다 - 아직 안 나갔는데 주문한 지 며칠 됐다는
 뜻이라 목록으로 한 번에 봐야 해서다.
+
+주문일이 오늘과 이틀 이상 벌어진 건에는 '상품URL'을 같이 적는다. 그 건들은
+사람이 공급사 화면을 직접 열어 확인하게 되는데, 주문번호만으로 그 화면을 다시
+찾아가는 게 번거로워서다. 나머지 건은 빈칸으로 둔다 - 모든 줄에 URL이 있으면
+정작 봐야 할 줄이 묻힌다. '출고/도착예정'(eta.py)은 읽힌 건이면 어디든 적는다.
 """
 
 from __future__ import annotations
@@ -42,26 +48,33 @@ SUMMARY_SHEET_NAME = "요약"
 # 주문일이 오래된 건만 모아 보여주는 시트 (해당 건이 있을 때만 만든다).
 STALE_SHEET_NAME = "주문일지연"
 
-HEADERS = ["결과", "마켓 주문번호", "수령인", "주문일", "택배사", "송장번호",
-           "샵마인 반영", "사유"]
-COLUMN_WIDTHS = [16, 22, 10, 22, 12, 22, 16, 62]
+HEADERS = ["결과", "마켓 주문번호", "수령인", "주문일", "출고/도착예정", "택배사",
+           "송장번호", "샵마인 반영", "사유", "상품URL"]
+COLUMN_WIDTHS = [16, 22, 10, 22, 24, 12, 22, 16, 62, 46]
 
 # 칸 위치를 숫자로 세지 않고 헤더 이름으로 잡는다 (컬럼을 넣고 빼도 안 깨진다).
 COL_RESULT = HEADERS.index("결과")
 COL_ORDER_ID = HEADERS.index("마켓 주문번호")
 COL_ORDER_DATE = HEADERS.index("주문일")
+COL_ETA = HEADERS.index("출고/도착예정")
 COL_TRACKING = HEADERS.index("송장번호")
 COL_APPLIED = HEADERS.index("샵마인 반영")
 COL_REASON = HEADERS.index("사유")
+COL_URL = HEADERS.index("상품URL")
 
-STALE_HEADERS = ["마켓 주문번호", "수령인", "주문일", "지난 일수", "조회 결과", "사유"]
-STALE_WIDTHS = [22, 10, 14, 10, 16, 62]
+STALE_HEADERS = ["마켓 주문번호", "수령인", "주문일", "지난 일수", "출고/도착예정",
+                 "조회 결과", "사유", "상품URL"]
+STALE_WIDTHS = [22, 10, 14, 10, 24, 16, 62, 46]
+STALE_COL_DAYS = STALE_HEADERS.index("지난 일수")
+STALE_COL_RESULT = STALE_HEADERS.index("조회 결과")
+STALE_COL_REASON = STALE_HEADERS.index("사유")
 
 # 위에 올라올수록 사람이 먼저 봐야 하는 결과. '주문일지연'은 결과 이름이
 # 아니라 주문일로 판정하는 값이라(성공/스킵 건에도 걸린다) 세는 데는 쓰이지
 # 않고, 정렬할 때 그 건들을 끌어올릴 자리로만 쓴다.
 _STALE_SORT_LABEL = STALE_SHEET_NAME
-_SORT_ORDER = ["실패", "취소/품절", _STALE_SORT_LABEL, "미지원 사이트", "스킵", "성공"]
+_SORT_ORDER = ["실패", "취소/품절", "반영오류", _STALE_SORT_LABEL, "미지원 사이트",
+               "스킵", "성공"]
 
 # 결과별 색: (배지 바탕, 배지 글씨, 줄 바탕). 배지는 진하게, 줄은 옅게 해서
 # 스크롤할 때 색 덩어리만 보고도 어디까지가 같은 결과인지 알 수 있게 한다.
@@ -69,6 +82,7 @@ _COLORS = {
     "실패": ("D93025", "FFFFFF", "FCE8E6"),
     "미지원 사이트": ("E8710A", "FFFFFF", "FEF0E0"),
     "취소/품절": ("9334E6", "FFFFFF", "F3E8FD"),
+    "반영오류": ("B31412", "FFFFFF", "FAD2CF"),
     "스킵": ("5F6368", "FFFFFF", "F1F3F4"),
     "성공": ("188038", "FFFFFF", "E6F4EA"),
 }
@@ -82,6 +96,7 @@ _ACTIONS = {
     "실패": "직접 확인 필요",
     "미지원 사이트": "공급사 사이트에서 직접 조회 (어댑터 없음)",
     "취소/품절": "취소/품절 주문인지 확인",
+    "반영오류": "샵마인 [송장번호수정] 결과 창에 오류로 뜬 주문 - 샵마인에서 직접 확인",
     "스킵": "그냥 두면 되는 건 (송장 미발급 등)",
     "성공": "송장 확보 - 업로드용 CSV로 반영",
 }
@@ -100,9 +115,9 @@ _HEADER_ROW = 3
 
 
 def _sort_key(entry: ReportEntry) -> tuple[int, int]:
-    """실패 -> 취소/품절 -> 주문일지연 -> 미지원 사이트 -> 스킵 -> 성공.
+    """실패 -> 취소/품절 -> 반영오류 -> 주문일지연 -> 미지원 사이트 -> 스킵 -> 성공.
 
-    주문일이 오래된 건은 결과가 무엇이든 세 번째 자리까지 끌어올린다. 이미
+    주문일이 오래된 건은 결과가 무엇이든 주문일지연 자리까지 끌어올린다. 이미
     그보다 위에 있는 결과(실패/취소·품절)는 제자리를 지킨다 - 더 급한 쪽이
     위여야 하니까. 같은 자리 안에서는 결과끼리 다시 모이도록 두 번째 값으로
     결과 순서를 쓴다(예: 주문일지연 칸의 스킵 건과 성공 건이 섞이지 않게).
@@ -132,6 +147,7 @@ def write_result_excel(
     applied_label: str = "",
     summary: list[tuple[str, str]] | None = None,
     title: str = "송장조회 결과",
+    apply_errors: list[str] | None = None,
 ) -> Path:
     """조회 결과 목록을 엑셀로 저장하고 저장한 경로를 돌려준다.
 
@@ -139,11 +155,15 @@ def write_result_excel(
     주문 단위로 알 수 없고(샵마인 결과 창은 건수만 준다) 실행 단위로만 알 수
     있어서, 실행 결과를 그대로 성공 건에 붙인다.
     summary: 요약 시트의 '실행 정보'에 넣을 (항목, 값) 줄들.
+    apply_errors: 샵마인 [송장번호수정] 결과 창에 떴던 오류 문구 원문. 어느
+    주문인지까지 알아낸 건은 목록에서 '반영오류'로 표시되지만, 문구에서
+    주문번호를 못 찾는 경우가 있어 원문 자체도 요약 시트에 그대로 남긴다.
     """
     path = Path(path)
     wb = Workbook()
     _write_entries_sheet(wb.active, entries, applied_label, title)
-    _write_summary_sheet(wb.create_sheet(SUMMARY_SHEET_NAME), entries, summary or [])
+    _write_summary_sheet(wb.create_sheet(SUMMARY_SHEET_NAME), entries, summary or [],
+                         apply_errors or [])
     stale = stale_entries(entries)
     if stale:
         _write_stale_sheet(wb.create_sheet(STALE_SHEET_NAME), stale)
@@ -175,10 +195,12 @@ def _write_entries_sheet(ws, entries: list[ReportEntry], applied_label: str,
             entry.order_id,
             entry.recipient_name or "",
             order_date_mod.describe(entry.order_date),
+            entry.delivery_note or "",
             entry.courier or "",
             entry.tracking_no or "",
-            applied_label if entry.status == "success" else "",
+            _applied_cell(entry, applied_label),
             entry.reason or "",
+            (entry.product_url or "") if _order_is_old(entry) else "",
         ])
         # 덩어리가 바뀌는 자리(그룹 끝)에는 굵은 선을 그어 나눈다. 결과
         # 이름이 아니라 정렬 자리로 비교해야 '주문일지연으로 끌어올린 성공
@@ -192,6 +214,23 @@ def _write_entries_sheet(ws, entries: list[ReportEntry], applied_label: str,
     ws.freeze_panes = f"A{_HEADER_ROW + 1}"
     ws.auto_filter.ref = (f"A{_HEADER_ROW}:{get_column_letter(last_col)}"
                           f"{max(ws.max_row, _HEADER_ROW)}")
+
+
+def _order_is_old(entry: ReportEntry) -> bool:
+    """주문일이 오늘과 STALE_DAYS 이상 벌어졌는가 (결과가 무엇이든).
+
+    '주문일지연' 시트에 들어가는 기준(report.is_stale_entry)보다 넓다. 그쪽은
+    아직 송장이 안 나온 스킵 건만 모으지만, 상품URL은 실패 건처럼 사람이
+    화면을 열어봐야 하는 오래된 주문이면 어느 결과든 필요해서다.
+    """
+    return order_date_mod.is_stale(entry.order_date)
+
+
+def _applied_cell(entry: ReportEntry, applied_label: str) -> str:
+    """'샵마인 반영' 칸 문구. 반영 오류가 난 주문만 따로 표시한다."""
+    if entry.category == "apply_error":
+        return "반영오류"
+    return applied_label if entry.status == "success" else ""
 
 
 def _write_title(ws, title: str, rows: list[ReportEntry], last_col: int) -> None:
@@ -236,6 +275,7 @@ def _style_row(row, label: str, *, group_end: bool, stale: bool = False) -> None
         cell.number_format = _TEXT_FORMAT
     row[COL_APPLIED].alignment = Alignment(horizontal="center", vertical="center")
     row[COL_REASON].alignment = Alignment(wrap_text=True, vertical="center")
+    row[COL_URL].alignment = Alignment(vertical="center")
     if stale:
         row[COL_ORDER_DATE].font = _STALE_FONT
 
@@ -246,6 +286,10 @@ def _write_stale_sheet(ws, stale: list[ReportEntry]) -> None:
     첫 시트에도 같은 건이 들어 있다. 그래도 따로 두는 이유는, 사람이 봐야
     하는 건 '어느 주문이 며칠째 안 나가고 있나'인데 그건 다른 결과들 사이에
     흩어놓으면 한눈에 안 들어와서다.
+
+    공급사 화면에서 읽은 출고/도착 예정 문구와 상품URL을 같이 낸다 - 그 둘만
+    있으면 사이트를 다시 찾아 들어가지 않고도 '기다리면 되는 건지'를 판단할
+    수 있다.
     """
     _write_summary_band(ws, 1, f"주문일이 {order_date_mod.STALE_DAYS}일 이상 지난 주문 "
                                f"{len(stale)}건 (발송이 늦어지는지 확인해주세요)",
@@ -266,8 +310,10 @@ def _write_stale_sheet(ws, stale: list[ReportEntry]) -> None:
             entry.recipient_name or "",
             f"{entry.order_date:%Y-%m-%d}",
             f"{order_date_mod.days_since(entry.order_date)}일",
+            entry.delivery_note or "",
             label,
             entry.reason or "",
+            entry.product_url or "",
         ])
         row = ws[ws.max_row]
         badge_fill, badge_font, row_fill = _COLORS.get(label, _DEFAULT_COLOR)
@@ -277,12 +323,12 @@ def _write_stale_sheet(ws, stale: list[ReportEntry]) -> None:
             cell.alignment = Alignment(vertical="center")
         row[0].number_format = _TEXT_FORMAT  # 마켓 주문번호
         # 며칠 지났는지가 이 시트의 핵심이라 제일 눈에 띄게 둔다.
-        row[3].font = _STALE_FONT
-        row[3].alignment = Alignment(horizontal="center", vertical="center")
-        row[4].fill = PatternFill("solid", fgColor=badge_fill)
-        row[4].font = Font(bold=True, color=badge_font)
-        row[4].alignment = Alignment(horizontal="center", vertical="center")
-        row[5].alignment = Alignment(wrap_text=True, vertical="center")
+        row[STALE_COL_DAYS].font = _STALE_FONT
+        row[STALE_COL_DAYS].alignment = Alignment(horizontal="center", vertical="center")
+        row[STALE_COL_RESULT].fill = PatternFill("solid", fgColor=badge_fill)
+        row[STALE_COL_RESULT].font = Font(bold=True, color=badge_font)
+        row[STALE_COL_RESULT].alignment = Alignment(horizontal="center", vertical="center")
+        row[STALE_COL_REASON].alignment = Alignment(wrap_text=True, vertical="center")
 
     for i, width in enumerate(STALE_WIDTHS, start=1):
         ws.column_dimensions[get_column_letter(i)].width = width
@@ -290,7 +336,8 @@ def _write_stale_sheet(ws, stale: list[ReportEntry]) -> None:
 
 
 def _write_summary_sheet(ws, entries: list[ReportEntry],
-                         summary: list[tuple[str, str]]) -> None:
+                         summary: list[tuple[str, str]],
+                         apply_errors: list[str] | None = None) -> None:
     """요약 시트: 결과별 건수와 할 일을 먼저, 실행 정보/파일 경로를 그 아래에."""
     _write_summary_band(ws, 1, "결과별 건수")
     for col, name in enumerate(("결과", "건수", "해야 할 일"), start=1):
@@ -326,6 +373,14 @@ def _write_summary_sheet(ws, entries: list[ReportEntry],
         for cell in row[:3]:
             cell.border = _CELL_BORDER
 
+    if apply_errors:
+        _write_summary_band(ws, ws.max_row + 2, "샵마인 [송장번호수정] 결과 창의 오류")
+        for line in apply_errors:
+            ws.append(["", "", line])
+            cell = ws.cell(row=ws.max_row, column=3)
+            cell.alignment = Alignment(wrap_text=True, vertical="center")
+            cell.font = Font(color="B31412")
+
     if summary:
         _write_summary_band(ws, ws.max_row + 2, "실행 정보")
         for name, value in summary:
@@ -352,7 +407,8 @@ def _write_summary_band(ws, row: int, text: str, *, last_col: int = 3) -> None:
 
 
 def save_run_result(entries, counts: dict, *, applied_label: str, apply_note: str = "",
-                    paths=(), out_dir: Path | None = None, log=print) -> Path | None:
+                    paths=(), apply_errors=(), out_dir: Path | None = None,
+                    log=print) -> Path | None:
     """한 번의 실행 결과를 '송장조회결과_시각.xlsx'로 저장한다.
 
     paths: 요약 시트에 남길 (이름, 경로) 목록. 값이 없는 항목은 뺀다.
@@ -375,7 +431,7 @@ def save_run_result(entries, counts: dict, *, applied_label: str, apply_note: st
     summary.extend((name, str(value)) for name, value in paths if value)
     try:
         saved = write_result_excel(entries, path, applied_label=applied_label,
-                                   summary=summary,
+                                   summary=summary, apply_errors=list(apply_errors),
                                    title=f"송장조회 결과  {now:%Y-%m-%d %H:%M}")
     except Exception as e:  # noqa: BLE001 - 결과 저장 실패가 실행 결과를 덮으면 안 된다
         log(f"경고: 결과 엑셀을 저장하지 못했습니다 - {e}")

@@ -7,7 +7,8 @@
 
 from __future__ import annotations
 
-from typing import Callable
+from collections import Counter
+from typing import Callable, Iterable
 
 from playwright.sync_api import sync_playwright
 
@@ -20,6 +21,10 @@ from .suppliers.base import AdapterError, BlockedError, OrderCancelled, Tracking
 from .suppliers.registry import get_adapter
 
 ProgressCallback = Callable[[int, int, str, str], None]
+# 주문 한 건이 끝날 때마다 (지금까지의 결과, 지금까지의 업로드 행)을 넘긴다.
+# 실행이 중간에 멈춰도 그 지점부터 다시 시작할 수 있게 하는 데 쓴다
+# (checkpoint.py / pipeline.py).
+CheckpointCallback = Callable[[list, list], None]
 
 
 def run(
@@ -28,10 +33,22 @@ def run(
     limit: int | None = None,
     headless: bool = True,
     on_progress: ProgressCallback | None = None,
+    done_entries: Iterable | None = None,
+    done_rows: Iterable | None = None,
+    on_checkpoint: CheckpointCallback | None = None,
 ) -> RunReport:
-    """on_progress(index, total, order_id, message) — GUI 등에서 진행 상황을 보여줄 때 사용."""
+    """on_progress(index, total, order_id, message) — GUI 등에서 진행 상황을 보여줄 때 사용.
+
+    done_entries / done_rows: 지난 실행에서 이미 조회를 끝낸 결과. 여기 있는
+    주문은 공급사에 다시 묻지 않고 그 결과를 그대로 쓴다 - 실행이 중간에
+    멈췄을 때 '멈춘 지점부터' 이어서 하기 위한 것이다. 한 건에 수십 초씩
+    걸리므로 이미 끝낸 건을 다시 조회하는 것이 가장 큰 낭비다.
+
+    on_checkpoint: 주문 한 건이 끝날 때마다 부른다 (진행 상황 저장용).
+    """
     settings = load_settings()
     report = RunReport()
+    report.entries.extend(done_entries or [])
 
     all_orders = excel_io.read_pending_orders(input_path)
     orders = all_orders[:limit] if limit is not None else all_orders
@@ -39,7 +56,15 @@ def run(
     # 해야 한다 - 잘린 쪽 행도 샵마인 그리드에는 그대로 남아 있다.
     total = len(orders)
 
-    upload_rows: list[tuple[str, str, str | None]] = []
+    # 이미 결과가 있는 주문은 건너뛴다. 판단 기준을 '업로드 행'이 아니라
+    # '결과가 있는가'로 두는 이유는, 조회에 실패하거나 스킵한 건도 다시
+    # 물어볼 필요가 없기 때문이다 (실패 사유는 대개 다시 해도 같다).
+    #
+    # 개수로 세는 이유: 한 주문번호가 엑셀에 여러 행으로 있는 주문(상품별 행)이
+    # 있어서, 주문번호 집합으로 판단하면 첫 행만 끝냈는데 나머지 행까지
+    # '이미 했다'고 건너뛰게 된다.
+    remaining_done = Counter(e.order_id for e in report.entries)
+    upload_rows: list[tuple[str, str, str | None]] = [tuple(r) for r in (done_rows or [])]
 
     with sync_playwright() as p:
         supplier_contexts: dict[str, tuple] = {}
@@ -49,6 +74,9 @@ def run(
 
         for i, order in enumerate(orders, start=1):
             message = ""
+            if remaining_done.get(order.order_id):
+                remaining_done[order.order_id] -= 1
+                continue
             try:
                 adapter = get_adapter(order.product_url)
                 if adapter is None:
@@ -60,7 +88,7 @@ def run(
                 site_key = adapter.SITE_KEY
                 if site_key in blocked_sites:
                     message = f"건너뜀: {blocked_sites[site_key]}"
-                    report.skip(order.order_id, message)
+                    report.skip(order.order_id, message, product_url=order.product_url)
                     continue
 
                 if site_key not in supplier_contexts:
@@ -89,14 +117,18 @@ def run(
                     # 남긴다 - 미발급인 채로 며칠 지난 주문은 따로 모아야 한다.
                     report.skip(order.order_id, "아직 송장번호 미발급",
                                 recipient_name=order.recipient_name,
-                                order_date=e.order_date)
+                                order_date=e.order_date,
+                                delivery_note=e.delivery_note,
+                                product_url=order.product_url)
                     continue
                 except OrderCancelled as e:
                     # 기다려도 송장이 안 나오는 주문이라 일반 스킵과 분리한다.
                     message = f"취소/품절로 보임 - 건너뜀 ({e})"
                     report.cancelled(order.order_id, str(e),
                                      recipient_name=order.recipient_name,
-                                     order_date=e.order_date)
+                                     order_date=e.order_date,
+                                     delivery_note=e.delivery_note,
+                                     product_url=order.product_url)
                     continue
                 except BlockedError as e:
                     blocked_sites[site_key] = str(e)
@@ -104,7 +136,9 @@ def run(
 
                 upload_rows.append((order.order_id, result.tracking_no, result.courier))
                 report.success(order.order_id, result.courier, result.tracking_no,
-                               order_date=result.order_date)
+                               order_date=result.order_date,
+                               delivery_note=result.delivery_note,
+                               product_url=order.product_url)
                 message = f"성공 ({result.courier} / {result.tracking_no})"
 
             except AdapterError as e:
@@ -112,7 +146,8 @@ def run(
                 if order.recipient_name:
                     message += f" (수령인: {order.recipient_name})"
                 report.fail(order.order_id, str(e), recipient_name=order.recipient_name,
-                            order_date=e.order_date)
+                            order_date=e.order_date, delivery_note=e.delivery_note,
+                            product_url=order.product_url)
             except Exception as e:  # noqa: BLE001 - 배치 전체가 죽지 않도록 광범위하게 잡는다
                 reason = f"예상치 못한 오류: {e}"
                 message = reason
@@ -120,10 +155,15 @@ def run(
                     message += f" (수령인: {order.recipient_name})"
                 # reason에는 수령인을 넣지 않는다 - recipient_name 필드가 따로
                 # 있어서 마지막 실패 목록에서 이름이 두 번 찍히게 된다.
-                report.fail(order.order_id, reason, recipient_name=order.recipient_name)
+                report.fail(order.order_id, reason, recipient_name=order.recipient_name,
+                            product_url=order.product_url)
             finally:
                 if on_progress is not None:
                     on_progress(i, total, order.order_id, message)
+                # 여기서 저장해두면 다음 주문을 조회하다 멈춰도 지금까지의
+                # 결과는 남는다 (성공/실패/스킵 어느 쪽으로 끝났든).
+                if on_checkpoint is not None:
+                    on_checkpoint(list(report.entries), list(upload_rows))
 
             rate_limit.humanized_delay(settings.delay_min, settings.delay_max)
 
