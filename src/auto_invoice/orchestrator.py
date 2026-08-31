@@ -206,7 +206,10 @@ def _lookup_site(site_key: str, jobs: list, *, settings, headless: bool,
                             **extra_kwargs,
                         )
                     except TrackingNotAvailableYet as e:
-                        message = "아직 송장번호 미발급 - 건너뜀"
+                        # 사유까지 로그에 남긴다 - '취소' 표시가 있는데 '준비'가
+                        # 함께 있어 취소 대신 미발급으로 넘긴 건이 여기 섞인다.
+                        detail = f" ({e})" if str(e) else ""
+                        message = f"아직 송장번호 미발급 - 건너뜀{detail}"
                         # 어댑터가 주문상세에서 읽어 예외에 실어준 주문일을 같이
                         # 남긴다 - 미발급인 채로 며칠 지난 주문은 따로 모아야 한다.
                         with shared.lock:

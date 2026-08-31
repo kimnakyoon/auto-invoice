@@ -64,7 +64,7 @@ from .base import (
     ParseError,
     TrackingNotAvailableYet,
     normalize_option,
-    raise_if_cancelled,
+    raise_if_cancelled_any,
     with_order_date,
 )
 
@@ -284,8 +284,9 @@ def _raise_not_shipped(rows: list[dict], order_no: str) -> None:
     (base.py 주석의 '주문상태를 정확히 읽을 수 있는 공급사' 규칙).
     """
     statuses = [row.get("status", "").strip() for row in rows if row.get("status", "").strip()]
-    for status in statuses:
-        raise_if_cancelled(status, order_no)
+    # 줄마다 상태가 다를 수 있다. '취소' 줄과 '준비중' 줄이 같이 있으면
+    # 준비 쪽이 이긴다 (base.raise_if_cancelled_any).
+    raise_if_cancelled_any(statuses, order_no)
     normalized = [normalize_option(s) for s in statuses]
     if any(normalize_option(p) in n for p in NOT_YET_STATUSES for n in normalized):
         raise TrackingNotAvailableYet(f"아직 송장번호가 발급되지 않았습니다 (주문번호={order_no}).")

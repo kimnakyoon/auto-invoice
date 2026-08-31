@@ -8,7 +8,7 @@ from __future__ import annotations
 
 import re
 from datetime import date
-from typing import Callable, Protocol
+from typing import Callable, Iterable, Protocol
 
 from playwright.sync_api import BrowserContext
 
@@ -75,6 +75,14 @@ class OrderCancelled(AdapterError):
 # 있으면 취소/품절 주문으로 본다.
 CANCELLED_KEYWORDS = ("취소", "품절", "불가")
 
+# 단, 이 단어가 같이 있으면 그쪽을 **먼저** 본다. "배송준비중" / "상품 준비중"
+# 처럼 아직 진행 중이라는 표시가 함께 있는 화면에서 눈에 띄는 '취소'는 대개
+# [주문취소] 버튼이나 '취소 불가' 안내 같은 화면 부속이지 이 주문의 상태가
+# 아니다. 그런 주문은 기다리면 송장이 나오므로 취소/품절이 아니라 '아직
+# 미발급'으로 넘긴다 - 취소로 잘못 분류하면 사람이 직접 처리해야 할 목록에
+# 올라가는 데다, 정작 다음 실행에서 다시 조회되지도 않는다.
+PREPARING_KEYWORD = "준비"
+
 
 def find_cancelled_keyword(text: str | None) -> str | None:
     for keyword in CANCELLED_KEYWORDS:
@@ -83,8 +91,17 @@ def find_cancelled_keyword(text: str | None) -> str | None:
     return None
 
 
+def find_preparing_keyword(text: str | None) -> str | None:
+    """'준비' 표시 (없으면 None). '상품 준비중'처럼 띄어 쓴 것도 잡는다."""
+    squashed = re.sub(r"\s+", "", text or "")
+    return PREPARING_KEYWORD if PREPARING_KEYWORD in squashed else None
+
+
 def raise_if_cancelled(text: str | None, order_no: str) -> None:
     """취소/품절 표시가 있으면 OrderCancelled를 던진다.
+
+    '준비'가 함께 있으면 그쪽이 이긴다 - 취소가 아니라 TrackingNotAvailableYet
+    ('아직 미발급')으로 넘어가서, 다음 실행에서 다시 조회된다.
 
     주의: 주문상태 필드가 아니라 **화면 전체 텍스트**를 넘기면 "주문취소"
     버튼 이름 같은 것에도 걸린다. 그래서 호출 규칙을 둘로 정해뒀다:
@@ -95,13 +112,41 @@ def raise_if_cancelled(text: str | None, order_no: str) -> None:
         못 찾고 진행중 상태 문구도 없는 실패 경로에서만 부른다. 여기까지 온
         주문은 어차피 사람이 봐야 하는 건이라, 사유가 "파싱 실패" 대신
         "취소/품절 의심"으로 조금 넓게 잡혀도 손해가 없다.
+
+    한 주문이 여러 줄(옵션별)로 나뉜 화면은 raise_if_cancelled_any 를 쓴다.
     """
     keyword = find_cancelled_keyword(text)
-    if keyword:
-        raise OrderCancelled(
-            f"주문 화면에 '{keyword}' 표시가 있습니다 (주문번호={order_no}) - "
-            "취소/품절 주문인지 확인해주세요."
+    if not keyword:
+        return
+    if find_preparing_keyword(text):
+        raise TrackingNotAvailableYet(
+            f"'{keyword}' 표시가 있지만 '{PREPARING_KEYWORD}' 표시가 함께 있어 "
+            f"아직 준비 중인 주문으로 봅니다 (주문번호={order_no})."
         )
+    raise OrderCancelled(
+        f"주문 화면에 '{keyword}' 표시가 있습니다 (주문번호={order_no}) - "
+        "취소/품절 주문인지 확인해주세요."
+    )
+
+
+def raise_if_cancelled_any(texts: Iterable[str | None], order_no: str) -> None:
+    """상태값이 여러 줄인 화면용. 한 줄이라도 '준비'면 그쪽이 이긴다.
+
+    한 주문이 옵션별로 여러 줄로 나뉘면 줄마다 상태가 다를 수 있다. 줄 하나씩
+    raise_if_cancelled 에 넘기면 '취소' 줄을 먼저 만나는 순간 거기서 끝나버려
+    뒤에 있는 '배송준비중' 줄을 못 본다. 그래서 준비 여부는 줄을 다 모아서
+    먼저 본다.
+    """
+    values = [t for t in texts if t]
+    joined = " / ".join(values)
+    keyword = find_cancelled_keyword(joined)
+    if keyword and find_preparing_keyword(joined):
+        raise TrackingNotAvailableYet(
+            f"'{keyword}' 줄이 있지만 '{PREPARING_KEYWORD}' 줄이 함께 있어 "
+            f"아직 준비 중인 주문으로 봅니다 (주문번호={order_no}, 상태={joined})."
+        )
+    for value in values:
+        raise_if_cancelled(value, order_no)
 
 
 def with_order_date(page, fetch: Callable[[], TrackingResult], *, data=None) -> TrackingResult:

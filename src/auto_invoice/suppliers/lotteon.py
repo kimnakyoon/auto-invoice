@@ -45,6 +45,7 @@ from .base import (
     TrackingNotAvailableYet,
     normalize_option,
     raise_if_cancelled,
+    raise_if_cancelled_any,
     with_order_date,
 )
 
@@ -182,10 +183,11 @@ def _raise_if_listed_settled(card: dict, od_no: str) -> None:
     # 취소/품절은 기다려도 송장이 안 나온다. 주문상태를 정확히 읽을 수 있는
     # 공급사는 NOT_YET 판정보다 먼저 본다(base.raise_if_cancelled 규칙).
     # 롯데온 주문상세에는 이 표시가 안 나와서, 목록을 봐야만 알 수 있다.
+    # 목록의 한 주문이 여러 줄로 뜨기도 한다. '취소' 줄과 '준비중' 줄이 같이
+    # 있으면 준비 쪽이 이겨 미발급으로 넘어간다 (base.raise_if_cancelled_any).
     try:
-        for status in statuses:
-            raise_if_cancelled(status, od_no)
-    except OrderCancelled as e:
+        raise_if_cancelled_any(statuses, od_no)
+    except (OrderCancelled, TrackingNotAvailableYet) as e:
         e.order_date, e.delivery_note = order_date, note
         raise
 
