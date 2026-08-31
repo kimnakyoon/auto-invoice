@@ -194,3 +194,47 @@ def wait_for_text(page, needles, timeout_ms: int = RENDER_WAIT_TIMEOUT_MS,
         page.wait_for_timeout(poll_ms)
         waited_ms += poll_ms
     return False
+
+
+# 배송조회 버튼을 누른 뒤 모달/팝업/iframe이 그려지기를 기다리는 상한.
+# 이 값은 '얼마나 기다려야 하나'가 아니라 '최악의 경우 얼마까지만 기다리나'다 -
+# 예전에 어댑터에 박혀 있던 고정 대기와 같은 값으로 두었기 때문에, 끝내 아무것도
+# 안 나오는 화면에서도 예전보다 느려지지 않는다. 실측(롯데온 실주문 3건)으로는
+# 누른 뒤 0.06~0.17초면 송장번호가 떠서, 보통은 여기 근처도 가지 않는다.
+MODAL_RENDER_WAIT_MS = 1500
+
+
+def wait_for_match(page, read_text, pattern, timeout_ms: int = MODAL_RENDER_WAIT_MS,
+                   poll_ms: int = 50) -> str:
+    """이 정규식이 걸릴 때까지만 기다리고, 마지막으로 읽은 텍스트를 돌려준다.
+
+    배송조회 버튼을 누른 뒤 '송장번호가 화면에 뜰 때까지'를 기다리는 데 쓴다.
+    wait_for_text와 같은 생각(시계가 아니라 화면을 보고 정한다)인데, 두 가지가
+    다르다.
+
+      - 찾는 것이 정해진 낱말이 아니라 **송장번호 패턴**이다. 어댑터마다
+        이미 그 정규식을 갖고 있으므로 그것을 그대로 넘겨 쓴다.
+      - 읽을 곳이 페이지 본문만이 아니다. 지마켓은 모달이 별도 iframe이고
+        롯데아이몰은 팝업 창이라, '어디서 읽을지'를 호출한 쪽이 함수로 넘긴다.
+        page는 '기다리는 데'만 쓴다(아래 참고).
+
+    쉬는 것은 반드시 page.wait_for_timeout으로 한다 - time.sleep으로 쉬면
+    Playwright 동기 API의 진행 자체가 멈춰서, 기다리는 동안 화면이 그려지지
+    않는다(실측: 같은 주문이 time.sleep 쪽에서는 4/4 '미발급'으로 나왔다).
+
+    끝내 안 나와도 예외를 내지 않는다 - 마지막으로 읽은 텍스트를 그대로 주고,
+    '아직 미발급인지 취소인지'는 예전처럼 호출한 쪽이 그 텍스트로 판단한다.
+    """
+    text = ""
+    waited_ms = 0
+    while True:
+        try:
+            text = read_text() or ""
+            if pattern.search(text):
+                return text
+        except Exception:  # noqa: BLE001 - 그리는 중에는 읽기가 실패할 수 있다
+            pass
+        if waited_ms >= timeout_ms:
+            return text
+        page.wait_for_timeout(poll_ms)
+        waited_ms += poll_ms

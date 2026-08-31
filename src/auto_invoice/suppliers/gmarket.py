@@ -75,6 +75,10 @@ TRACKING_BUTTON_TEXTS = ["배송조회"]
 
 # 모달(iframe) 안, 주소/배송요청사항 뒤에 "택배사명 송장번호"가 붙어서 나온다.
 TRACKING_LINE_PATTERN = re.compile(r"([가-힣A-Za-z]{2,20})\s*([0-9][0-9\-]{7,})\s*$")
+# 같은 규칙을 여러 줄짜리 텍스트 전체에 걸 때 쓴다(모달이 다 그려졌는지 볼 때).
+# 위 규칙은 줄 끝($)에 걸려 있어서, 줄 단위로 쪼개지 않고 그대로 search하면
+# 맨 마지막 줄만 보게 된다.
+TRACKING_LINE_ANY_PATTERN = re.compile(TRACKING_LINE_PATTERN.pattern, re.MULTILINE)
 NOT_YET_PATTERNS = ["배송준비중", "상품준비중", "결제확인중", "주문확인중"]
 BOT_CHECK_PATTERNS = ["사람인지 확인", "봇(Bot)이란"]
 
@@ -197,7 +201,6 @@ def _click_tracking_button(page) -> bool:
             continue
         try:
             loc.first.click(timeout=3000)
-            page.wait_for_timeout(1500)  # 모달/iframe 렌더링 대기
             return True
         except Exception:
             continue
@@ -247,7 +250,10 @@ def _scrape_tracking_from_page(page, order_id: str, order_option: str | None = N
         raise_if_cancelled(body_text, order_id)
         raise ParseError(f"배송조회 버튼을 찾지 못했습니다 (orderId={order_id}).")
 
-    frame_text = _read_tracking_frame_text(page)
+    # 모달(iframe)이 그려질 때까지만 기다린다 - 예전에는 버튼을 누르고 무조건
+    # 1.5초를 잤다. 끝내 송장번호 줄이 안 보이면 예전과 같은 1.5초를 채운다.
+    frame_text = common.wait_for_match(
+        page, lambda: _read_tracking_frame_text(page), TRACKING_LINE_ANY_PATTERN)
     if not frame_text:
         raise ParseError(f"배송조회 모달(iframe)에서 내용을 읽지 못했습니다 (orderId={order_id}).")
 

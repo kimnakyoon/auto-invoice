@@ -208,8 +208,10 @@ def _wait_for_manual_login(page) -> bool:
 
 def _scrape_popup(popup) -> tuple[str, str]:
     popup.wait_for_load_state("domcontentloaded")
-    popup.wait_for_timeout(1000)
-    body_text = popup.inner_text("body")
+    # 팝업에 송장번호가 뜰 때까지만 기다린다 - 예전에는 무조건 1초를 잤다.
+    # 끝내 안 뜨면 예전과 같은 1초를 채우고 아래에서 ParseError로 넘어간다.
+    body_text = common.wait_for_match(
+        popup, lambda: popup.inner_text("body"), TRACKING_PATTERN, timeout_ms=1000)
 
     tracking_match = TRACKING_PATTERN.search(body_text)
     if not tracking_match:

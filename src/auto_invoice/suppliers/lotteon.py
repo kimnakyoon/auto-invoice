@@ -82,9 +82,15 @@ NOT_YET_PATTERNS = ["상품준비중", "배송준비중", "결제완료"]
 # 목록은 사람이 평소에 보는 화면이라 이 방식은 API 직접 호출과 다르다(위
 # docstring의 Imperva 건). 요청 수도 74번에서 13번으로 줄어든다.
 ORDER_LIST_URL = "https://www.lotteon.com/p/order/mylotte/orderDeliveryList"
+# 아래 두 값은 '얼마나 기다리나'가 아니라 '최악의 경우 얼마까지만'이다 - 카드가
+# 실제로 늘어나는 순간 바로 끝낸다. 예전에는 이만큼을 무조건 잤고, 그게 이
+# 사이트에서 가장 큰 낭비였다(실측: 목록 훑기 39.9초 중 첫 렌더 8초 중 6.5초,
+# [더보기] 14번 35초 중 22.6초가 그냥 자는 시간이었다).
 LIST_RENDER_WAIT_MS = 8000   # 목록이 그려질 때까지 (SPA라 goto만으로는 비어 있다)
 LIST_MORE_WAIT_MS = 2500     # [더보기] 누르고 다음 15건이 붙을 때까지
 LIST_MORE_MAX_CLICKS = 30    # 무한정 누르지 않는다 (15건씩 -> 최대 450건)
+# 목록 카드 하나가 주문 하나다. 몇 장 그려졌는지로 렌더가 끝났는지를 판단한다.
+_CARD_COUNT_JS = "() => document.querySelectorAll('.orderGroupWrap').length"
 # 목록을 훑는 값이 상세를 여는 것보다 싼 최소 건수. 몇 건 안 되면 그냥 상세를 연다.
 LIST_PREFETCH_MIN_ORDERS = 5
 
@@ -115,6 +121,21 @@ def extract_od_no(product_url: str) -> str:
     return values[0]
 
 
+def _wait_for_more_cards(page, more_than: int, timeout_ms: int) -> bool:
+    """목록 카드가 more_than장보다 많아질 때까지만 기다린다 (안 늘면 False).
+
+    첫 렌더(more_than=0)와 [더보기] 뒤를 같은 함수로 본다 - 둘 다 '카드가
+    늘어났는가'가 판단 기준이라, 시계를 보고 자던 것을 이걸로 대신한다.
+    """
+    try:
+        page.wait_for_function(
+            "n => document.querySelectorAll('.orderGroupWrap').length > n",
+            arg=more_than, timeout=timeout_ms)
+        return True
+    except Exception:  # noqa: BLE001 - 끝내 안 늘면 판단은 호출한 쪽이 한다
+        return False
+
+
 def prepare_batch(context: BrowserContext, orders, headless: bool = True) -> None:
     """이번에 조회할 주문들을 주문내역 목록에서 미리 훑어둔다.
 
@@ -137,7 +158,7 @@ def prepare_batch(context: BrowserContext, orders, headless: bool = True) -> Non
     page = context.new_page()
     try:
         page.goto(ORDER_LIST_URL, wait_until="domcontentloaded")
-        page.wait_for_timeout(LIST_RENDER_WAIT_MS)
+        _wait_for_more_cards(page, 0, LIST_RENDER_WAIT_MS)
         seen: dict[str, dict] = {}
         for _ in range(LIST_MORE_MAX_CLICKS + 1):
             for card in page.evaluate(_LIST_CARDS_JS):
@@ -148,8 +169,10 @@ def prepare_batch(context: BrowserContext, orders, headless: bool = True) -> Non
             more = page.locator(".myLotteWrap button.more").first
             if more.count() == 0 or not more.is_visible():
                 break
+            before = page.evaluate(_CARD_COUNT_JS)
             more.click()
-            page.wait_for_timeout(LIST_MORE_WAIT_MS)
+            if not _wait_for_more_cards(page, before, LIST_MORE_WAIT_MS):
+                break  # 눌러도 더 안 붙으면 목록의 끝이다
 
         found = {od_no: card for od_no, card in seen.items() if od_no in wanted}
         _listed_orders[id(context)] = found
@@ -284,19 +307,24 @@ def _wait_for_manual_login(page) -> bool:
         page, lambda: _looks_like_login_page(page), LOGIN_WAIT_TIMEOUT_MS)
 
 
-def _click_tracking_button(page) -> None:
+def _click_tracking_button(page) -> bool:
+    """배송상세조회 버튼을 누른다. 실제로 눌렀으면 True.
+
+    버튼을 못 찾아도 예외로 바로 끊지 않는다 - 일부 주문은 버튼 없이
+    페이지에 바로 송장번호가 보이는 경우가 있어, 호출한 쪽의 텍스트 스캔에
+    맡긴다. 그래서 '눌렀는지'를 돌려준다 - 누르지도 않았는데 모달이 그려질
+    때까지 기다리면 그만큼 그냥 버리는 시간이다.
+    """
     for text in TRACKING_BUTTON_TEXTS:
         loc = page.get_by_text(text, exact=False)
         if loc.count() == 0:
             continue
         try:
             loc.first.click(timeout=3000)
-            page.wait_for_timeout(1500)  # 모달/패널 렌더링 대기
-            return
+            return True
         except Exception:
             continue
-    # 버튼을 못 찾아도 예외로 바로 끊지 않는다 - 일부 주문은 버튼 없이
-    # 페이지에 바로 송장번호가 보이는 경우가 있어, 아래 텍스트 스캔에 맡긴다.
+    return False
 
 
 def _select_by_order_option(body_text: str, matches: list, order_option: str | None):
@@ -322,9 +350,14 @@ def _select_by_order_option(body_text: str, matches: list, order_option: str | N
 
 
 def _scrape_tracking_from_page(page, od_no: str, order_option: str | None = None) -> TrackingResult:
-    _click_tracking_button(page)
-
-    body_text = page.inner_text("body")
+    # 버튼을 눌렀으면 송장번호가 화면에 뜰 때까지만 기다린다 - 예전에는 여기서
+    # 무조건 1.5초를 잤는데, 실측(실주문 3건) 0.06~0.17초면 떠서 그 차이가
+    # 그대로 낭비였다. 끝내 안 뜨면 예전과 같은 1.5초를 채우고 넘어간다.
+    if _click_tracking_button(page):
+        body_text = common.wait_for_match(
+            page, lambda: page.inner_text("body"), TRACKING_NO_PATTERN)
+    else:
+        body_text = page.inner_text("body")
 
     tracking_matches = list(TRACKING_NO_PATTERN.finditer(body_text))
     if not tracking_matches:
