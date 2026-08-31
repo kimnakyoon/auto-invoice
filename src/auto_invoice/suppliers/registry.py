@@ -25,6 +25,7 @@ from . import (
     musinsa,
     naver,
     nsmall,
+    posty,
     ssfshop,
     ssg,
     thehyundai,
@@ -56,6 +57,7 @@ register(akplaza)
 register(cjonstyle)
 register(ssfshop)
 register(wconcept)
+register(posty)
 # 새 공급사 추가 예시:
 # from . import newsupplier
 # register(newsupplier)
