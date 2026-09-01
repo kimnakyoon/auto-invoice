@@ -245,6 +245,9 @@ def _lookup_site(site_key: str, jobs: list, *, settings, headless: bool,
                                 order_option=order.order_option,
                                 **extra_kwargs,
                             )
+                            # 성공도 미리 읽어둔 목록으로 답했을 수 있다
+                            # (29CM prepare_batch) - 그 경우 간격을 두지 않는다.
+                            sent_request = result.sent_request
                         except AdapterError as e:
                             sent_request = e.sent_request
                             raise

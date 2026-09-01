@@ -28,6 +28,11 @@ class TrackingResult(BaseModel):
     # 주문상세에 적혀 있던 '출고예정 2026-09-02' 같은 안내 문구 (eta.py).
     # 주문일이 오래된 건을 사람이 판단할 때 쓰라고 같이 실어 보낸다.
     delivery_note: Optional[str] = None
+    # 이 결과를 내기까지 공급사 사이트에 요청을 보냈는가. 미리 읽어둔
+    # 주문목록만으로 답한 경우(29CM prepare_batch)만 False다 - 예외 쪽의
+    # AdapterError.sent_request와 같은 뜻이고, 오케스트레이터가 요청 간격을
+    # 지킬지 판단하는 데 쓴다 (요청을 안 보냈으면 간격을 둘 이유도 없다).
+    sent_request: bool = True
 
 
 # 실행이 끝난 뒤 사람이 따로 챙겨야 하는 주문의 종류. 마지막 결과 정리에서
