@@ -282,6 +282,14 @@ def _auto_login(context: BrowserContext) -> None:
         page = login_context.new_page()
         for attempt in range(1, LOGIN_RETRY_COUNT + 1):
             body = _submit_login(page, login_id, login_pw)
+            if body is None:
+                # 30초 안에 응답도 이동도 없었다 - 서버가 느렸을 수 있으니
+                # 화면부터 다시 열어 한 번 더 해본다 (비밀번호 오류와 무관한
+                # 실패라 계정이 잠길 걱정은 없다).
+                if attempt < LOGIN_RETRY_COUNT:
+                    common.safe_print("[posty] 로그인 응답이 없어 다시 시도합니다.")
+                    continue
+                raise BlockedError("포스티 자동 로그인 결과를 30초 안에 확인하지 못했습니다.")
             if (((body.get("data") or {}).get("login")) or {}).get("success"):
                 # 로그인 응답의 Set-Cookie가 컨텍스트에 반영될 틈을 준다.
                 page.wait_for_timeout(1000)
@@ -300,8 +308,12 @@ def _auto_login(context: BrowserContext) -> None:
             pass
 
 
-def _submit_login(page, login_id: str, login_pw: str) -> dict:
-    """로그인 화면을 처음부터 열어 제출하고, 사이트가 준 응답을 돌려준다."""
+def _submit_login(page, login_id: str, login_pw: str) -> dict | None:
+    """로그인 화면을 처음부터 열어 제출하고, 사이트가 준 응답을 돌려준다.
+
+    응답을 못 받았지만 로그인 페이지를 벗어났으면 성공으로 간주한 본문을,
+    30초 동안 아무 일도 없었으면 None을 돌려준다(호출한 쪽이 재시도).
+    """
     page.goto(LOGIN_URL, wait_until="domcontentloaded")
     # 화면에 충분히 머문 뒤에 제출해야 한다 (LOGIN_PAGE_SETTLE_MS 주석 참고).
     page.wait_for_timeout(LOGIN_PAGE_SETTLE_MS)
@@ -338,7 +350,13 @@ def _submit_login(page, login_id: str, login_pw: str) -> dict:
             elapsed_ms += 500
             if answer.get("body") is not None:
                 return answer["body"]
-        raise BlockedError("포스티 자동 로그인 결과를 30초 안에 확인하지 못했습니다.")
+            # 응답 본문을 놓쳐도(클릭 직후 홈으로 이동하면서 캡처를 못 하는
+            # 경우가 있었다 - 2026-09-01 실전에서 4건 전부 30초 타임아웃)
+            # 로그인 페이지를 벗어났다면 성공이다. 실패하면 포스티는 이동
+            # 없이 로그인 화면에 에러만 띄운다.
+            if "/auth/" not in page.url:
+                return {"data": {"login": {"success": True}}}
+        return None  # 시간초과 - 호출한 쪽이 화면부터 다시 열어 한 번 더 해본다
     finally:
         page.remove_listener("response", _remember)
 

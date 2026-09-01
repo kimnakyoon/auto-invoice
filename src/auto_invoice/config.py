@@ -25,7 +25,11 @@ def load_settings() -> Settings:
         # 동시에 조회할 공급사 수. 사이트끼리는 서로 상관이 없어 같이 돌려도
         # 되지만, 그만큼 브라우저를 동시에 띄우므로 무한정 늘리지는 않는다.
         # 1로 두면 예전처럼 한 사이트씩 순서대로 돈다.
-        workers=max(1, int(os.environ.get("AUTO_INVOICE_WORKERS", "4"))),
+        # 기본 8: 4일 때는 작은 사이트들이 큐에 밀려 가장 큰 사이트(롯데온)가
+        # 끝난 '뒤에' 시작했고, 그만큼 전체가 늘어졌다(2026-09-01 실측: 99건
+        # 89초, 마지막 24초는 롯데온이 아니라 뒤늦게 시작한 CJ온스타일).
+        # 8이면 나머지 사이트가 롯데온이 끝나기 전에 다 끝난다.
+        workers=max(1, int(os.environ.get("AUTO_INVOICE_WORKERS", "8"))),
         lotteon_id=os.environ.get("LOTTEON_ID"),
         gmarket_id=os.environ.get("GMARKET_ID"),
         ssg_id=os.environ.get("SSG_ID"),

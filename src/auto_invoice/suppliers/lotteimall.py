@@ -24,8 +24,15 @@
   - 로그인 실패는 화면 문구가 아니라 alert()으로 알려준다(롯데온과 같다).
     Playwright는 핸들러가 없으면 alert을 조용히 닫아버려서 실패를 감지하지
     못하므로, dialog 핸들러로 그 문구를 받아 실패 사유째로 올린다.
-  - headless 브라우저로는 로그인 페이지 자체가 HTTP 403으로 막힌다(2026-08-28
-    확인). 그래서 자동 로그인은 headless가 아닐 때만 시도한다.
+  - "headless로는 로그인 페이지가 HTTP 403"(2026-08-28)의 정체는 headless가
+    아니라 **기본 UA(HeadlessChrome)** 였다 - 2026-09-01 실측: 같은 headless
+    브라우저라도 일반 크롬 UA를 주면 로그인 페이지가 열리고, 로그인된 쿠키로도
+    주문상세가 UA에 따라 열리거나(일반 UA) 메인으로 튕긴다(HeadlessChrome UA).
+    그래서 조회 컨텍스트 자체에 일반 UA를 주고(CONTEXT_KWARGS), 세션이
+    만료되면 같은 브라우저의 별도 컨텍스트에서 로그인 화면을 직접 열어
+    로그인하고 쿠키를 옮긴다(포스티와 같은 구조, 창은 뜨지 않는다). 성공
+    판정은 주소가 아니라 LOGIN_TKN 쿠키다 - 성공해도 SSO 처리 페이지
+    (LCSSOLogin_proc)가 빈 화면인 채 주소가 안 바뀌는 경우가 있다.
   LOTTEIMALL_PW를 비워두면 예전처럼 아이디만 자동 입력하고 사람이 직접 로그인한다.
 - 주문상세 페이지에 있는 "배송추적" 링크(onclick="fn_DeliveryTrace(ord_no, ord_dtl_sn, hsm)")를
   클릭하면 새 팝업 탭(DeliveryTrace.lotte)이 뜨고, 거기에 "송장 번호\t<번호>\t택배사\t<택배사명> (대표번호)"
@@ -48,6 +55,7 @@ from urllib.parse import parse_qs, urlparse
 from dotenv import load_dotenv
 from playwright.sync_api import BrowserContext
 
+from .. import browser as browser_mod
 from ..models import TrackingResult
 from . import common
 from .base import (
@@ -66,6 +74,20 @@ load_dotenv()
 LOGIN_PATH_MARKER = "/member/login"
 LOGGED_OUT_MARKER = "/member/goLogout"
 MAIN_PAGE_MARKER = "/main/viewMain"
+
+# 로그인 화면 직행 주소 - 세션이 만료되면 별도 컨텍스트에서 이 주소를 직접
+# 연다 (리다이렉트로는 메인 화면으로 튕겨서 로그인 폼에 갈 수 없다).
+LOGIN_URL = "https://www.lotteimall.com/member/login/forward.LCLoginMem.lotte"
+
+# 기본 UA(HeadlessChrome)면 로그인 페이지가 403이고, 로그인된 쿠키로도
+# 주문상세가 메인으로 튕긴다(모듈 docstring). 조회/로그인 컨텍스트 모두
+# 일반 크롬 UA를 쓴다. 오케스트레이터가 CONTEXT_KWARGS를 조회 컨텍스트에
+# 그대로 넘겨준다 (browser.get_context).
+NORMAL_USER_AGENT = (
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+    "(KHTML, like Gecko) Chrome/140.0.0.0 Safari/537.36"
+)
+CONTEXT_KWARGS = {"user_agent": NORMAL_USER_AGENT}
 
 LOGIN_ID_SELECTOR = "#login_id"
 LOGIN_PW_SELECTOR = "#password"
@@ -139,66 +161,81 @@ def _captcha_visible(page) -> bool:
         return False
 
 
-def _auto_login(page) -> bool:
+def _auto_login(context: BrowserContext) -> bool:
     """LOTTEIMALL_ID/LOTTEIMALL_PW로 완전 자동 로그인한다 (사용자 명시 요청).
 
-    비밀번호가 설정되어 있지 않으면 False를 돌려주고, 호출자가 기존의 수동
-    로그인 방식으로 넘어간다 (비밀번호를 저장하고 싶지 않은 경우를 위해 수동
-    로그인 경로를 그대로 남겨뒀다).
+    같은 브라우저의 **별도 컨텍스트**에서 로그인 화면(LOGIN_URL)을 직접 열어
+    로그인하고, 쿠키를 원래 컨텍스트로 옮긴다(포스티와 같은 구조). 세션이
+    만료되면 주문상세가 로그인 폼이 아니라 메인 화면으로 튕기기 때문에, 지금
+    보고 있는 페이지에서는 로그인할 수 없다.
 
-    롯데온 어댑터와 같은 패턴이다 - 이 사이트도 로그인 실패를 화면 문구가
-    아니라 alert()으로 알려주기 때문에 dialog 핸들러로 그 문구를 받아 실패
-    사유째로 올린다. 핸들러가 없으면 Playwright가 alert을 조용히 닫아버려서
-    원인도 모른 채 대기 시간만 다 쓰고 실패한다.
+    비밀번호가 설정되어 있지 않으면 False를 돌려주고, 호출자가 안내(headless)
+    또는 수동 로그인(창 모드)으로 넘어간다.
+
+    롯데온 어댑터와 같은 패턴으로, 로그인 실패는 화면 문구가 아니라 alert()으로
+    오기 때문에 dialog 핸들러로 그 문구를 받아 실패 사유째로 올린다. 성공
+    판정은 주소가 아니라 LOGIN_TKN 쿠키다(모듈 docstring - SSO 처리 페이지가
+    빈 화면으로 남는 경우가 있다).
     """
     login_id = os.environ.get("LOTTEIMALL_ID")
     login_pw = os.environ.get("LOTTEIMALL_PW")
     if not login_id or not login_pw:
         return False
 
-    if _captcha_visible(page):
-        raise BlockedError(
-            "롯데아이몰이 보안문자(캡차)를 요구하고 있어 자동 로그인을 할 수 없습니다 "
-            "- 뜬 브라우저 창에서 직접 로그인해주세요."
-        )
+    browser = context.browser
+    if browser is None:
+        raise BlockedError("롯데아이몰 로그인용 브라우저를 찾지 못했습니다.")
 
-    alerts: list[str] = []
-
-    def _on_dialog(dialog) -> None:
-        alerts.append(dialog.message)
-        dialog.dismiss()
-
-    page.on("dialog", _on_dialog)
+    login_context = browser.new_context(
+        user_agent=NORMAL_USER_AGENT, viewport=browser_mod.DESKTOP_VIEWPORT,
+        locale="ko-KR", timezone_id="Asia/Seoul")
     try:
-        page.fill(LOGIN_ID_SELECTOR, login_id)
-        page.fill(LOGIN_PW_SELECTOR, login_pw)
-        page.locator(LOGIN_BUTTON_SELECTOR).first.click()
-
-        elapsed_ms = 0
-        while elapsed_ms < AUTO_LOGIN_WAIT_TIMEOUT_MS:
-            # 로그인이 끝나기를 기다리는 쉼 - 예전에는 _looks_like_login_page가
-            # 매번 자면서 이 역할까지 겸했다(common.looks_like_login_page 주석).
-            page.wait_for_timeout(1500)
-            # 로그인 페이지를 벗어났으면 성공이다. alert이 떴더라도 로그인 자체는
-            # 된 경우(비밀번호 변경 안내 등)가 있어, 페이지 상태를 alert보다
-            # 먼저 본다 (롯데온과 같은 이유).
-            if not _looks_like_login_page(page):
-                return True
-            if alerts:
-                raise BlockedError(f"롯데아이몰 자동 로그인이 거부됐습니다: {alerts[0].strip()}")
-            elapsed_ms += 1500
-
+        page = login_context.new_page()
+        page.goto(LOGIN_URL, wait_until="domcontentloaded")
+        if page.locator(LOGIN_ID_SELECTOR).count() == 0:
+            raise BlockedError(f"롯데아이몰 로그인 화면이 열리지 않았습니다 (주소={page.url}).")
         if _captcha_visible(page):
             raise BlockedError(
-                "롯데아이몰이 로그인 도중 보안문자(캡차)를 요구했습니다 "
-                "- 뜬 브라우저 창에서 직접 로그인해주세요."
+                "롯데아이몰이 보안문자(캡차)를 요구하고 있어 자동 로그인을 할 수 없습니다 "
+                "- --headless 없이 실행해 직접 로그인해주세요."
             )
-        raise BlockedError(
-            "롯데아이몰 자동 로그인 후에도 로그인 페이지에서 벗어나지 못했습니다 "
-            "(추가 본인인증을 요구받았을 수 있습니다 - 브라우저 창을 확인해주세요)."
-        )
+
+        alerts: list[str] = []
+
+        def _on_dialog(dialog) -> None:
+            alerts.append(dialog.message)
+            dialog.dismiss()
+
+        page.on("dialog", _on_dialog)
+        try:
+            page.fill(LOGIN_ID_SELECTOR, login_id)
+            page.fill(LOGIN_PW_SELECTOR, login_pw)
+            page.locator(LOGIN_BUTTON_SELECTOR).first.click()
+
+            elapsed_ms = 0
+            while elapsed_ms < AUTO_LOGIN_WAIT_TIMEOUT_MS:
+                page.wait_for_timeout(1500)
+                elapsed_ms += 1500
+                cookies = login_context.cookies()
+                if any(c.get("name") == "LOGIN_TKN" for c in cookies):
+                    context.add_cookies(cookies)
+                    return True
+                if alerts:
+                    raise BlockedError(f"롯데아이몰 자동 로그인이 거부됐습니다: {alerts[0].strip()}")
+
+            if _captcha_visible(page):
+                raise BlockedError(
+                    "롯데아이몰이 로그인 도중 보안문자(캡차)를 요구했습니다 "
+                    "- --headless 없이 실행해 직접 로그인해주세요."
+                )
+            raise BlockedError("롯데아이몰 자동 로그인 후에도 로그인이 확인되지 않습니다.")
+        finally:
+            page.remove_listener("dialog", _on_dialog)
     finally:
-        page.remove_listener("dialog", _on_dialog)
+        try:
+            login_context.close()
+        except Exception:  # noqa: BLE001 - 컨텍스트를 못 닫아도 결과에 영향은 없다
+            pass
 
 
 def _wait_for_manual_login(page) -> bool:
@@ -297,15 +334,18 @@ def get_tracking(
         page.goto(product_url, wait_until="domcontentloaded")
 
         if _looks_like_login_page(page):
-            # headless로는 로그인 페이지 자체가 403으로 막혀서 자동 로그인도 못 한다.
-            if headless:
-                raise BlockedError(
-                    "롯데아이몰 로그인이 필요합니다. 이 사이트는 headless 브라우저의 로그인 페이지 접근을 "
-                    "막기 때문에, --headless 없이 실행해주세요 (.env에 LOTTEIMALL_PW가 있으면 자동 로그인합니다)."
-                )
-            if _auto_login(page):
+            # 세션이 만료되면 로그인 폼이 아니라 메인 화면으로 튕기므로, 이
+            # 페이지에서는 로그인할 수 없다 - 별도 컨텍스트에서 로그인 화면을
+            # 직접 열어 로그인하고 쿠키만 받아온다 (_auto_login).
+            if _auto_login(context):
                 common.safe_print("[lotteimall] 로그인 세션이 없어 자동 로그인했습니다.")
+            elif headless:
+                raise BlockedError(
+                    "롯데아이몰 로그인이 필요하지만 LOTTEIMALL_ID/LOTTEIMALL_PW가 없습니다. "
+                    ".env에 추가하거나 --headless 없이 실행해 직접 로그인해주세요."
+                )
             else:
+                page.goto(LOGIN_URL, wait_until="domcontentloaded")
                 _prefill_login_id(page)
                 common.safe_print("[lotteimall] 아이디는 자동으로 입력했습니다. 뜬 브라우저 창에서 비밀번호를 입력하고 로그인해주세요.")
                 common.safe_print("[lotteimall] 로그인이 완료되면 자동으로 이어서 진행합니다 (최대 5분 대기).")

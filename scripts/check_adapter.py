@@ -101,11 +101,13 @@ def main() -> None:
             # 인스턴스를 기억시켜둔다 - get_context()를 안 거치기 때문이다.
             browser_mod.remember_playwright(p)
             browser = p.chromium.launch(headless=headless)
-            context = browser.new_context()
+            context = browser.new_context(**getattr(adapter, "CONTEXT_KWARGS", {}))
             browser_mod.block_heavy_resources(context)
             stack.callback(browser.close)
         else:
-            browser, context = browser_mod.get_context(p, adapter.SITE_KEY, headless=headless)
+            browser, context = browser_mod.get_context(
+                p, adapter.SITE_KEY, headless=headless,
+                context_kwargs=getattr(adapter, "CONTEXT_KWARGS", None))
             stack.callback(browser.close)
 
         for url in args.urls:

@@ -46,14 +46,18 @@ def remember_playwright(playwright: Playwright) -> None:
     _local.playwright = playwright
 
 
-def get_context(playwright: Playwright, site_key: str, headless: bool = True) -> tuple[Browser, BrowserContext]:
+def get_context(playwright: Playwright, site_key: str, headless: bool = True,
+                context_kwargs: dict | None = None) -> tuple[Browser, BrowserContext]:
+    """context_kwargs: 어댑터가 조회 컨텍스트에 요구하는 추가 설정
+    (어댑터의 CONTEXT_KWARGS - 예: 롯데아이몰은 기본 UA(HeadlessChrome)로는
+    사이트가 튕겨내서 user_agent를 일반 크롬으로 준다)."""
     remember_playwright(playwright)
     browser = playwright.chromium.launch(headless=headless)
     sp = state_path(site_key)
+    kwargs = dict(context_kwargs or {})
     if sp.exists():
-        context = browser.new_context(storage_state=str(sp))
-    else:
-        context = browser.new_context()
+        kwargs["storage_state"] = str(sp)
+    context = browser.new_context(**kwargs)
     block_heavy_resources(context)
     return browser, context
 

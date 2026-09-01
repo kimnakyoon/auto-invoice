@@ -177,7 +177,9 @@ def _lookup_site(site_key: str, jobs: list, *, settings, headless: bool,
             context = stack.enter_context(
                 browser_mod.real_chrome_cdp_context(site_key, p))
         else:
-            browser, context = browser_mod.get_context(p, site_key, headless=headless)
+            browser, context = browser_mod.get_context(
+                p, site_key, headless=headless,
+                context_kwargs=getattr(jobs[0][1], "CONTEXT_KWARGS", None))
             stack.callback(browser.close)
         # 로그인 자체가 막힌 사이트는 주문마다 몇 분씩 다시 로그인 대기를
         # 반복하지 않도록, 한 번 막히면 이후 주문은 바로 스킵한다.
