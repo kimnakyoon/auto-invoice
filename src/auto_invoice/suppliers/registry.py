@@ -15,6 +15,7 @@ from . import (
     akplaza,
     auction,
     cjonstyle,
+    cm29,
     elevenst,
     fashionplus,
     gmarket,
@@ -58,6 +59,7 @@ register(cjonstyle)
 register(ssfshop)
 register(wconcept)
 register(posty)
+register(cm29)
 # 새 공급사 추가 예시:
 # from . import newsupplier
 # register(newsupplier)
