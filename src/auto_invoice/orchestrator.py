@@ -167,8 +167,18 @@ def _lookup_site(site_key: str, jobs: list, *, settings, headless: bool,
     Playwright sync API 객체는 만든 스레드 밖에서 쓸 수 없어서, 스레드마다
     자기 Playwright를 연다.
     """
-    with sync_playwright() as p:
-        browser, context = browser_mod.get_context(p, site_key, headless=headless)
+    with sync_playwright() as p, contextlib.ExitStack() as stack:
+        if getattr(jobs[0][1], "WANTS_CDP_CHROME", False):
+            # 번들 크로미엄이라는 것 자체로 봇 확인에 걸리는 사이트(옥션)는
+            # 우리가 직접 실행한 진짜 크롬(CDP)에서 조회한다 - 창이 하나 뜬다.
+            # (어댑터의 WANTS_CDP_CHROME 주석 참고. 프로필이 남아 로그인도
+            # 유지되므로 headless 설정과 무관하게 이 경로를 쓴다.)
+            browser_mod.remember_playwright(p)
+            context = stack.enter_context(
+                browser_mod.real_chrome_cdp_context(site_key, p))
+        else:
+            browser, context = browser_mod.get_context(p, site_key, headless=headless)
+            stack.callback(browser.close)
         # 로그인 자체가 막힌 사이트는 주문마다 몇 분씩 다시 로그인 대기를
         # 반복하지 않도록, 한 번 막히면 이후 주문은 바로 스킵한다.
         blocked_reason: str | None = None
@@ -197,9 +207,15 @@ def _lookup_site(site_key: str, jobs: list, *, settings, headless: bool,
                 message = ""
                 try:
                     if blocked_reason:
-                        message = f"건너뜀: {blocked_reason}"
+                        # 봇 확인/로그인 차단으로 조회 자체를 못 한 주문은 스킵이
+                        # 아니라 **실패**로 남긴다 - 마지막 결과의 실패 목록에
+                        # 사유(봇 확인 등)와 함께 보여서 사람이 직접 처리하게
+                        # (2026-09-01 사용자 요청). '미발급 스킵'과 섞이면
+                        # 기다리면 되는 주문처럼 보여 놓치게 된다.
+                        message = f"실패: {blocked_reason}"
                         with shared.lock:
-                            shared.report.skip(order.order_id, message,
+                            shared.report.fail(order.order_id, blocked_reason,
+                                               recipient_name=order.recipient_name,
                                                product_url=order.product_url)
                         continue
 
@@ -302,8 +318,11 @@ def _lookup_site(site_key: str, jobs: list, *, settings, headless: bool,
                 finally:
                     shared.finished(order.order_id, message)
         finally:
-            browser_mod.save_state(context, site_key)
-            browser.close()
+            # CDP 크롬은 프로필 자체가 남아 세션 저장이 필수는 아니고,
+            # 실패해도 조회 결과를 잃으면 안 되므로 조용히 넘어간다.
+            # (브라우저 정리는 ExitStack이 한다.)
+            with contextlib.suppress(Exception):
+                browser_mod.save_state(context, site_key)
 
 
 def _restore_order(orders, report: RunReport, upload_rows: list) -> None:

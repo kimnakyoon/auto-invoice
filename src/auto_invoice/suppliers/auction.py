@@ -175,6 +175,15 @@ BOT_CHECK_PATTERNS = ["사람인지 확인", "봇(Bot)이란", "로봇이 아닙
 # 간격이 '요청 시작 시각' 기준이라, 조회가 몇 초 걸려도 그 사이에 몇 초는 쉬도록
 # 여유 있게 잡는다.
 REQUEST_GAP = (6.0, 12.0)
+
+# 조회 자체를 우리가 직접 실행한 진짜 크롬(CDP)에서 한다는 표시 (orchestrator.py).
+# 옥션은 간격 문제가 아니라 **번들 크로미엄이라는 것 자체**로 봇 확인에 걸린다 -
+# 2026-09-01 실측: 배송조회 첫 요청부터 봇 확인이 떴고, 창을 띄워도(headless=False)
+# 20초를 기다려도 안 풀렸다. 같은 주소를 browser.real_chrome_cdp_context()로 열면
+# 봇 확인 없이 2초 만에 열린다 (CJ온스타일/네이버 로그인과 같은 원리 - 그쪽 어댑터
+# 주석 참고). 그 전까지는 봇 확인 화면이 __NEXT_DATA__ 없는 페이지로 읽혀
+# '아직 미발급'(스킵)으로 잘못 기록되고 있었다.
+WANTS_CDP_CHROME = True
 # 목록의 주문상태가 이 값이면 아직 발송 전이라 송장번호가 없는 게 정상이다.
 NOT_YET_STATUSES = ["입금확인중", "결제완료", "배송준비중", "상품준비중", "주문확인중"]
 
@@ -312,10 +321,34 @@ def _auto_login(page: Page) -> bool:
     elapsed_ms = 0
     while elapsed_ms < LOGIN_WAIT_TIMEOUT_MS:
         if not _looks_like_login_page(page):
+            # 로그인 직후에는 SSO 리다이렉트 체인(memberssl -> escrow ...)이
+            # 아직 도는 중이다. 여기서 바로 goto하면 "다른 이동에
+            # 인터럽트됐다"는 예외가 나므로(2026-09-01 실측) 잠깐 가라앉힌다.
+            page.wait_for_timeout(1500)
             return True
         page.wait_for_timeout(500)
         elapsed_ms += 500
     return False
+
+
+def _goto_settled(page: Page, url: str) -> None:
+    """url로 이동하되, 진행 중인 리다이렉트 체인에 인터럽트되면 쉬었다 다시 간다.
+
+    로그인/SSO 직후에는 사이트가 여러 단계 리다이렉트를 도는 중이라, 그때
+    goto하면 Playwright가 "is interrupted by another navigation"으로 예외를
+    낸다 (2026-09-01 실측: LoginThrough.aspx가 끼어들었다).
+    """
+    last_error: Exception | None = None
+    for _ in range(3):
+        try:
+            page.goto(url, wait_until="domcontentloaded")
+            return
+        except Exception as e:  # noqa: BLE001 - 인터럽트만 다시 시도한다
+            if "is interrupted by another navigation" not in str(e):
+                raise
+            last_error = e
+            page.wait_for_timeout(1500)
+    raise last_error  # type: ignore[misc]
 
 
 def _goto_logged_in(page: Page, url: str, expect_selector: str | None = None) -> None:
@@ -326,7 +359,7 @@ def _goto_logged_in(page: Page, url: str, expect_selector: str | None = None) ->
     자바스크립트로 뒤늦게 튕기는 경우까지 놓치지 않도록 기대한 내용이 없을
     때만 잠깐 기다렸다 다시 확인한다 (정상 경로에서는 기다리지 않는다).
     """
-    page.goto(url, wait_until="domcontentloaded")
+    _goto_settled(page, url)
     if not _looks_like_login_page(page):
         if expect_selector is None or page.locator(expect_selector).count() > 0:
             return
@@ -337,7 +370,7 @@ def _goto_logged_in(page: Page, url: str, expect_selector: str | None = None) ->
     common.safe_print("[auction] 로그인 세션이 없어 자동 로그인을 시도합니다.")
     if not _auto_login(page):
         raise BlockedError("옥션 자동 로그인 후에도 로그인 페이지에서 벗어나지 못했습니다.")
-    page.goto(url, wait_until="domcontentloaded")
+    _goto_settled(page, url)
     if _looks_like_login_page(page):
         raise BlockedError("옥션 로그인 후에도 여전히 로그인 페이지입니다.")
 
@@ -565,19 +598,66 @@ def _parse_delivery_text(page: Page) -> tuple[str, str] | None:
     return match.group(2).replace("-", ""), match.group(1).strip()
 
 
-def _fetch_tracking(context: BrowserContext, order_no: str) -> TrackingResult:
-    page = _open_logged_in(
-        context, TRACE_URL.format(order_no=order_no), expect_selector=NEXT_DATA_SELECTOR
-    )
+def _order_status_from_detail(page: Page) -> str:
+    """주문상세 레이어의 주문상태 셀("배송준비중" 등). 못 읽으면 ""."""
     try:
-        info = _read_shipping_info(page)
-        if info is None:
-            # 봇 확인 화면이면 __NEXT_DATA__도 대체 경로도 없다 - 그대로 두면
-            # '아직 미발급'(스킵)으로 잘못 기록되므로 먼저 가려낸다.
+        cells = page.locator("td.status")
+        if cells.count():
+            return (cells.first.inner_text() or "").strip()
+    except Exception:  # noqa: BLE001 - 상태를 못 읽으면 배송조회 경로로 넘어간다
+        pass
+    return ""
+
+
+def _fetch_tracking(context: BrowserContext, order_no: str,
+                    *, check_status: bool = True) -> TrackingResult:
+    """주문번호로 송장을 읽는다. 상태 확인 -> 배송조회 순서다.
+
+    배송조회(tracking.auction.co.kr)는 **아직 발송 전인 주문에서 HTTP 500 오류
+    페이지로 떨어진다**(2026-09-01 실측: 배송준비중 주문 3건 모두, 로그인된
+    진짜 크롬에서도 동일). 그 500 페이지를 예전에는 '아직 미발급'(스킵)으로
+    잘못 읽었다. 그래서 escrow의 주문상세 레이어에서 주문상태부터 읽고,
+    발송된 주문만 배송조회를 연다. 주문내역 목록에서 이미 상태를 보고 온
+    경로(_tracking_for_listed_order)는 check_status=False로 건너뛴다.
+    """
+    trace_url = TRACE_URL.format(order_no=order_no)
+    if check_status:
+        page = _open_logged_in(context, ORDER_DETAIL_URL.format(order_no=order_no),
+                               expect_selector=DETAIL_TABLE_SELECTOR)
+        try:
+            if page.locator(DETAIL_TABLE_SELECTOR).count() == 0:
+                raise ParseError(
+                    f"주문상세 레이어가 열리지 않습니다 (주문번호={order_no}, "
+                    f"열린 주소={page.url}) - 없는 주문번호이거나 화면 구조가 바뀐 것으로 보입니다."
+                )
+            status = _order_status_from_detail(page)
+            if status:
+                # 주문상태를 정확히 읽었으므로 취소/품절 판정을 먼저 한다.
+                raise_if_cancelled(status, order_no)
+                if any(pattern in status for pattern in NOT_YET_STATUSES):
+                    raise TrackingNotAvailableYet(
+                        f"아직 발송 전입니다 (주문번호={order_no}, 주문상태={status})."
+                    )
+            _goto_settled(page, trace_url)
+        except Exception:
+            page.close()
+            raise
+    else:
+        page = _open_logged_in(context, trace_url, expect_selector=NEXT_DATA_SELECTOR)
+    try:
+        if "tracking.auction.co.kr" not in page.url:
+            # 봇 확인 화면이나 오류 페이지로 우회된 것이다 - 그대로 두면
+            # '아직 미발급'(스킵)으로 잘못 기록되므로 사유를 정확히 남긴다.
             if _looks_like_bot_check(page):
                 raise BlockedError(
                     "옥션 봇 확인 화면이 떴습니다 (배송조회). 브라우저에서 직접 통과한 뒤 다시 실행해주세요."
                 )
+            raise ParseError(
+                f"배송조회 화면 대신 다른 페이지가 열렸습니다 (주문번호={order_no}, "
+                f"열린 주소={page.url})."
+            )
+        info = _read_shipping_info(page)
+        if info is None:
             fallback = _parse_delivery_text(page)
             if fallback is None:
                 raise TrackingNotAvailableYet(
@@ -627,7 +707,8 @@ def _tracking_for_listed_order(context: BrowserContext, order: ListedOrder) -> T
         raise ParseError(
             f"배송조회를 할 수 없는 주문입니다 (주문번호={order.order_no}, 주문상태={order.status})."
         )
-    return _fetch_tracking(context, order.order_no)
+    # 목록에서 이미 주문상태를 봤으므로 주문상세 레이어는 다시 열지 않는다.
+    return _fetch_tracking(context, order.order_no, check_status=False)
 
 
 def get_tracking(
