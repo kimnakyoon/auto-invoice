@@ -24,6 +24,7 @@
 """
 
 import argparse
+import contextlib
 import sys
 from pathlib import Path
 
@@ -83,8 +84,18 @@ def main() -> None:
           f"{' / 저장된 세션 무시' if args.fresh else ''}")
 
     failed = False
-    with sync_playwright() as p:
-        if args.fresh:
+    with sync_playwright() as p, contextlib.ExitStack() as stack:
+        if getattr(adapter, "WANTS_CDP_CHROME", False):
+            # 실전(orchestrator)과 같은 경로 - 번들 크로미엄이라는 것 자체로
+            # 봇 확인에 걸리는 사이트(옥션)는 진짜 크롬(CDP)에서 조회한다.
+            # 프로필(auth/chrome_profile_<사이트>)에 로그인이 남으므로 --fresh는
+            # 의미가 없다.
+            if args.fresh:
+                print("(이 사이트는 진짜 크롬 프로필을 쓰므로 --fresh는 무시합니다)")
+            browser_mod.remember_playwright(p)
+            context = stack.enter_context(browser_mod.real_chrome_cdp_context(adapter.SITE_KEY))
+            browser = None
+        elif args.fresh:
             # 세션 없이 시작해 반드시 로그인 경로를 타게 한다. 자동 로그인이
             # 따로 크롬을 띄우는 어댑터(현대몰/CJ온스타일 등)를 위해 Playwright
             # 인스턴스를 기억시켜둔다 - get_context()를 안 거치기 때문이다.
@@ -92,43 +103,42 @@ def main() -> None:
             browser = p.chromium.launch(headless=headless)
             context = browser.new_context()
             browser_mod.block_heavy_resources(context)
+            stack.callback(browser.close)
         else:
             browser, context = browser_mod.get_context(p, adapter.SITE_KEY, headless=headless)
+            stack.callback(browser.close)
 
-        try:
-            for url in args.urls:
-                print(f"\n--- {url}")
-                extra = {}
-                if getattr(adapter, "WANTS_RECIPIENT_NAME", False) and args.recipient:
-                    extra["recipient_name"] = args.recipient
-                try:
-                    result = adapter.get_tracking(context, url, headless=headless,
-                                                  order_option=args.option, **extra)
-                except Exception as e:  # noqa: BLE001 - 어떤 예외든 사람이 보고 판단한다
-                    failed = True
-                    print(f"❌ {type(e).__name__}: {e}")
-                    _save_screenshot(context, adapter.SITE_KEY)
-                    continue
+        for url in args.urls:
+            print(f"\n--- {url}")
+            extra = {}
+            if getattr(adapter, "WANTS_RECIPIENT_NAME", False) and args.recipient:
+                extra["recipient_name"] = args.recipient
+            try:
+                result = adapter.get_tracking(context, url, headless=headless,
+                                              order_option=args.option, **extra)
+            except Exception as e:  # noqa: BLE001 - 어떤 예외든 사람이 보고 판단한다
+                failed = True
+                print(f"❌ {type(e).__name__}: {e}")
+                _save_screenshot(context, adapter.SITE_KEY)
+                continue
 
-                print(f"   송장번호: {result.tracking_no}")
-                print(f"   택배사:   {result.courier}")
-                if result.order_date:
-                    print(f"   주문일:   {result.order_date}")
-                if result.delivery_note:
-                    print(f"   예정문구: {result.delivery_note}")
-                if args.expect and result.tracking_no != args.expect:
-                    failed = True
-                    print(f"⚠️ 예상한 송장번호({args.expect})와 다릅니다.")
-                else:
-                    print("✅ 조회 성공")
+            print(f"   송장번호: {result.tracking_no}")
+            print(f"   택배사:   {result.courier}")
+            if result.order_date:
+                print(f"   주문일:   {result.order_date}")
+            if result.delivery_note:
+                print(f"   예정문구: {result.delivery_note}")
+            if args.expect and result.tracking_no != args.expect:
+                failed = True
+                print(f"⚠️ 예상한 송장번호({args.expect})와 다릅니다.")
+            else:
+                print("✅ 조회 성공")
 
-            if args.fresh and not failed:
-                browser_mod.save_state(context, adapter.SITE_KEY)
-                print(f"\n새 로그인 세션을 저장했습니다: {browser_mod.state_path(adapter.SITE_KEY)}")
-            elif args.fresh:
-                print("\n실패가 있어 세션을 저장하지 않았습니다 (기존 세션은 그대로입니다).")
-        finally:
-            browser.close()
+        if args.fresh and browser is not None and not failed:
+            browser_mod.save_state(context, adapter.SITE_KEY)
+            print(f"\n새 로그인 세션을 저장했습니다: {browser_mod.state_path(adapter.SITE_KEY)}")
+        elif args.fresh and browser is not None:
+            print("\n실패가 있어 세션을 저장하지 않았습니다 (기존 세션은 그대로입니다).")
 
     sys.exit(1 if failed else 0)
 

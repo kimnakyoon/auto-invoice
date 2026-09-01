@@ -169,12 +169,11 @@ NEXT_DATA_SELECTOR = "#__NEXT_DATA__"
 
 BOT_CHECK_PATTERNS = ["사람인지 확인", "봇(Bot)이란", "로봇이 아닙니다"]
 
-# 요청 간격 (오케스트레이터가 기본 1.5~4초 대신 쓴다). 이베이코리아(옥션/지마켓)는
-# 주문 사이 간격이 짧으면 "로봇이 아닙니다" 봇 확인이 뜬다(2026-09-01 사용자 관찰).
-# 기본 간격은 조회 한 건에 걸리는 시간보다 짧아 사실상 쉬는 시간이 0이었다 -
-# 간격이 '요청 시작 시각' 기준이라, 조회가 몇 초 걸려도 그 사이에 몇 초는 쉬도록
-# 여유 있게 잡는다.
-REQUEST_GAP = (6.0, 12.0)
+# 요청 간격은 기본값(1.5~4초)을 그대로 쓴다. 지마켓처럼 (6, 12초)로 늘렸었는데,
+# 옥션의 봇 확인은 간격이 아니라 **번들 크로미엄이라는 것 자체**에 걸리는
+# 것이었고(아래 WANTS_CDP_CHROME), 진짜 크롬(CDP)에서는 간격 없이 연속으로
+# 열어도(2026-09-01 프로브 여러 번) 봇 확인이 한 번도 안 떴다. 설령 뜨더라도
+# CDP 크롬에서는 Turnstile이 몇 초 만에 저절로 풀린다(browser.py 주석).
 
 # 조회 자체를 우리가 직접 실행한 진짜 크롬(CDP)에서 한다는 표시 (orchestrator.py).
 # 옥션은 간격 문제가 아니라 **번들 크로미엄이라는 것 자체**로 봇 확인에 걸린다 -
@@ -384,6 +383,21 @@ def _open_logged_in(context: BrowserContext, url: str, expect_selector: str | No
     except Exception:
         page.close()
         raise
+
+
+# 조회에 재사용하는 탭 (컨텍스트당 하나). 주문마다 탭을 열고 닫으면 그 비용이
+# 매번 드는 데다, 눈에 보이는 크롬 창(CDP)에서는 탭이 주문 수만큼 깜빡인다.
+# 어차피 조회는 매번 goto로 시작하므로 이전 주문의 화면이 남아 있어도 상관없다.
+_LOOKUP_PAGE: dict[int, Page] = {}
+
+
+def _lookup_page(context: BrowserContext) -> Page:
+    page = _LOOKUP_PAGE.get(id(context))
+    if page is None or page.is_closed():
+        browser_mod.block_heavy_resources(context)
+        page = context.new_page()
+        _LOOKUP_PAGE[id(context)] = page
+    return page
 
 
 # --------------------------------------------------------------------------
@@ -621,79 +635,73 @@ def _fetch_tracking(context: BrowserContext, order_no: str,
     경로(_tracking_for_listed_order)는 check_status=False로 건너뛴다.
     """
     trace_url = TRACE_URL.format(order_no=order_no)
+    page = _lookup_page(context)
     if check_status:
-        page = _open_logged_in(context, ORDER_DETAIL_URL.format(order_no=order_no),
-                               expect_selector=DETAIL_TABLE_SELECTOR)
-        try:
-            if page.locator(DETAIL_TABLE_SELECTOR).count() == 0:
-                raise ParseError(
-                    f"주문상세 레이어가 열리지 않습니다 (주문번호={order_no}, "
-                    f"열린 주소={page.url}) - 없는 주문번호이거나 화면 구조가 바뀐 것으로 보입니다."
-                )
-            status = _order_status_from_detail(page)
-            if status:
-                # 주문상태를 정확히 읽었으므로 취소/품절 판정을 먼저 한다.
-                raise_if_cancelled(status, order_no)
-                if any(pattern in status for pattern in NOT_YET_STATUSES):
-                    raise TrackingNotAvailableYet(
-                        f"아직 발송 전입니다 (주문번호={order_no}, 주문상태={status})."
-                    )
-            _goto_settled(page, trace_url)
-        except Exception:
-            page.close()
-            raise
-    else:
-        page = _open_logged_in(context, trace_url, expect_selector=NEXT_DATA_SELECTOR)
-    try:
-        if "tracking.auction.co.kr" not in page.url:
-            # 봇 확인 화면이나 오류 페이지로 우회된 것이다 - 그대로 두면
-            # '아직 미발급'(스킵)으로 잘못 기록되므로 사유를 정확히 남긴다.
-            if _looks_like_bot_check(page):
-                raise BlockedError(
-                    "옥션 봇 확인 화면이 떴습니다 (배송조회). 브라우저에서 직접 통과한 뒤 다시 실행해주세요."
-                )
+        _goto_logged_in(page, ORDER_DETAIL_URL.format(order_no=order_no),
+                        expect_selector=DETAIL_TABLE_SELECTOR)
+        if page.locator(DETAIL_TABLE_SELECTOR).count() == 0:
             raise ParseError(
-                f"배송조회 화면 대신 다른 페이지가 열렸습니다 (주문번호={order_no}, "
-                f"열린 주소={page.url})."
+                f"주문상세 레이어가 열리지 않습니다 (주문번호={order_no}, "
+                f"열린 주소={page.url}) - 없는 주문번호이거나 화면 구조가 바뀐 것으로 보입니다."
             )
-        info = _read_shipping_info(page)
-        if info is None:
-            fallback = _parse_delivery_text(page)
-            if fallback is None:
+        status = _order_status_from_detail(page)
+        if status:
+            # 주문상태를 정확히 읽었으므로 취소/품절 판정을 먼저 한다.
+            raise_if_cancelled(status, order_no)
+            if any(pattern in status for pattern in NOT_YET_STATUSES):
                 raise TrackingNotAvailableYet(
-                    f"배송조회 화면에 아직 송장번호가 없습니다 (주문번호={order_no})."
+                    f"아직 발송 전입니다 (주문번호={order_no}, 주문상태={status})."
                 )
-            tracking_no, raw_courier = fallback
-            return TrackingResult(tracking_no=tracking_no, courier=common.normalize_courier(raw_courier))
-
-        # 엉뚱한 주문의 송장을 가져오지 않았는지 검증한다.
-        trace_order_no = str(info.get("orderNo") or "").strip()
-        if trace_order_no and trace_order_no != order_no:
-            raise ParseError(
-                f"배송조회 화면의 주문번호({trace_order_no})가 조회하려던 주문번호({order_no})와 다릅니다."
+        _goto_settled(page, trace_url)
+    else:
+        _goto_logged_in(page, trace_url, expect_selector=NEXT_DATA_SELECTOR)
+    if "tracking.auction.co.kr" not in page.url:
+        # 봇 확인 화면이나 오류 페이지로 우회된 것이다 - 그대로 두면
+        # '아직 미발급'(스킵)으로 잘못 기록되므로 사유를 정확히 남긴다.
+        if _looks_like_bot_check(page):
+            raise BlockedError(
+                "옥션 봇 확인 화면이 떴습니다 (배송조회). 브라우저에서 직접 통과한 뒤 다시 실행해주세요."
             )
-
-        invoice_numbers = info.get("invoiceNo") or []
-        if isinstance(invoice_numbers, str):
-            invoice_numbers = [invoice_numbers]
-        distinct = {re.sub(r"[^0-9]", "", str(n)) for n in invoice_numbers if str(n).strip()}
-        distinct.discard("")
-        if not distinct:
+        raise ParseError(
+            f"배송조회 화면 대신 다른 페이지가 열렸습니다 (주문번호={order_no}, "
+            f"열린 주소={page.url})."
+        )
+    info = _read_shipping_info(page)
+    if info is None:
+        fallback = _parse_delivery_text(page)
+        if fallback is None:
             raise TrackingNotAvailableYet(
-                f"아직 송장번호가 발급되지 않았습니다 (주문번호={order_no})."
+                f"배송조회 화면에 아직 송장번호가 없습니다 (주문번호={order_no})."
             )
-        if len(distinct) > 1:
-            raise ParseError(
-                f"한 주문에 서로 다른 송장번호가 여러 개 있습니다 (주문번호={order_no}) - "
-                "상품별로 나눠 배송된 것으로 보입니다."
-            )
+        tracking_no, raw_courier = fallback
+        return TrackingResult(tracking_no=tracking_no, courier=common.normalize_courier(raw_courier))
 
-        # shippingCompany는 "롯데택배                    "처럼 뒤에 공백이 붙어 오는 경우가 있다.
-        raw_courier = str(info.get("shippingCompany") or "").strip()
-        courier = common.normalize_courier(raw_courier) if raw_courier else DEFAULT_COURIER
-        return TrackingResult(tracking_no=distinct.pop(), courier=courier)
-    finally:
-        page.close()
+    # 엉뚱한 주문의 송장을 가져오지 않았는지 검증한다.
+    trace_order_no = str(info.get("orderNo") or "").strip()
+    if trace_order_no and trace_order_no != order_no:
+        raise ParseError(
+            f"배송조회 화면의 주문번호({trace_order_no})가 조회하려던 주문번호({order_no})와 다릅니다."
+        )
+
+    invoice_numbers = info.get("invoiceNo") or []
+    if isinstance(invoice_numbers, str):
+        invoice_numbers = [invoice_numbers]
+    distinct = {re.sub(r"[^0-9]", "", str(n)) for n in invoice_numbers if str(n).strip()}
+    distinct.discard("")
+    if not distinct:
+        raise TrackingNotAvailableYet(
+            f"아직 송장번호가 발급되지 않았습니다 (주문번호={order_no})."
+        )
+    if len(distinct) > 1:
+        raise ParseError(
+            f"한 주문에 서로 다른 송장번호가 여러 개 있습니다 (주문번호={order_no}) - "
+            "상품별로 나눠 배송된 것으로 보입니다."
+        )
+
+    # shippingCompany는 "롯데택배                    "처럼 뒤에 공백이 붙어 오는 경우가 있다.
+    raw_courier = str(info.get("shippingCompany") or "").strip()
+    courier = common.normalize_courier(raw_courier) if raw_courier else DEFAULT_COURIER
+    return TrackingResult(tracking_no=distinct.pop(), courier=courier)
 
 
 def _tracking_for_listed_order(context: BrowserContext, order: ListedOrder) -> TrackingResult:
