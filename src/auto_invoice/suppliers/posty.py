@@ -28,6 +28,7 @@
 - 한 번 로그인하면 쿠키(ZIBETID/connect.sid)가 auth/posty_state.json에
   저장되어 다음 실행부터는 로그인 없이 조회만 한다(browser.save_state).
 - 주문상태(status)는 영문 코드다. 실측한 값은 AWAITING_SHIPMENT(배송준비중),
+  SHIPMENT_PROCESS_REQUESTED(발송처리 요청됨 - 화면엔 배송준비중으로 보인다),
   CONFIRMED(구매확정), CANCELLED(취소완료), RETURNED(반품완료)이고, 나머지는
   같은 계열 이름으로 넣어뒀다. 취소/반품 건은 송장번호가 남아 있어도(반품
   주문에는 처음 나갈 때의 송장이 그대로 있다) 올리면 안 되므로 상태를 먼저
@@ -197,6 +198,9 @@ NOT_YET_STATUSES = {
     "PAYMENT_COMPLETED": "결제완료",
     "AWAITING_SHIPMENT": "배송준비중",
     "PREPARING_SHIPMENT": "배송준비중",
+    # 발송처리를 요청해둔 상태 - 화면에는 배송준비중으로 보이고 송장은 아직
+    # 없다 (2026-09-01 실측: 실패로 잘못 기록되던 상태).
+    "SHIPMENT_PROCESS_REQUESTED": "배송준비중",
     "SHIPMENT_HOLD": "발송보류",
 }
 
