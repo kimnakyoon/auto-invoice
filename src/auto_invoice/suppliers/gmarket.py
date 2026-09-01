@@ -9,11 +9,12 @@
   안에서 읽어야 한다. 모달 안에는 "택배사명 송장번호"가 같은 줄에 붙어서
   나온다 (예: "CJ택배 501707425705").
 - 지마켓은 롯데온(Imperva)과 별개로 Cloudflare Turnstile 봇 확인 화면이 뜬다.
-  이 화면은 사람이 직접 체크박스를 눌러도 "확인 중..."에서 넘어가지 않는
-  경우가 있었다 (자동화 브라우저 자체를 의심하는 것으로 보임). 우회를
-  시도하지 않고, 롯데온의 Imperva 차단과 동일하게 BlockedError로 알리고
-  사람이 직접 해결하도록 한다. 다만 아래 로그인 실측에서는 이 화면이 뜨지
-  않았다 - 상품/주문 페이지 쪽에서만 뜬 것으로 보인다.
+  번들 크로미엄에서는 사람이 직접 체크박스를 눌러도 "확인 중..."에서 넘어가지
+  않는 경우가 있었다 (자동화 브라우저 자체를 의심하는 것으로 보임). 그래서
+  조회를 우리가 직접 실행한 진짜 크롬(CDP, WANTS_CDP_CHROME)에서 한다 -
+  이 크롬에서는 봇 확인이 아예 안 뜨고, 떠도 몇 초 만에 저절로 풀린다(옥션
+  실측). 그래도 감지되면 풀리기를 기다렸다가 진행하고, 안 풀리면
+  BlockedError로 알린다.
 - 로그인이 안 되어 있으면 mobile.gmarket.co.kr/Login/Login?URL=<원래주소>로
   리다이렉트된다. 로그인 폼 셀렉터는 옥션(같은 이베이코리아 통합 로그인)과
   거의 같다: 아이디 input#typeMemberInputId, 비밀번호
@@ -42,6 +43,7 @@ from urllib.parse import urlparse
 from dotenv import load_dotenv
 from playwright.sync_api import BrowserContext
 
+from .. import browser as browser_mod
 from ..models import TrackingResult
 from . import common
 from .base import (
@@ -82,10 +84,13 @@ TRACKING_LINE_ANY_PATTERN = re.compile(TRACKING_LINE_PATTERN.pattern, re.MULTILI
 NOT_YET_PATTERNS = ["배송준비중", "상품준비중", "결제확인중", "주문확인중"]
 BOT_CHECK_PATTERNS = ["사람인지 확인", "봇(Bot)이란", "로봇이 아닙니다"]
 
-# 요청 간격 (오케스트레이터가 기본 1.5~4초 대신 쓴다). 이베이코리아(옥션/지마켓)는
-# 주문 사이 간격이 짧으면 "로봇이 아닙니다" 봇 확인이 뜬다(2026-09-01 사용자 관찰).
-# 옥션 어댑터의 REQUEST_GAP 주석 참고.
-REQUEST_GAP = (6.0, 12.0)
+# 조회를 우리가 직접 실행한 진짜 크롬(CDP)에서 한다는 표시 (orchestrator.py).
+# 번들 크로미엄에서는 요청이 빠르면 "로봇이 아닙니다" 봇 확인이 떠서 한동안
+# 요청 간격을 6~12초로 늘려 피했는데(2026-09-01), 옥션에서 확인한 대로 진짜
+# 크롬(CDP)은 봇 확인이 아예 안 뜨고 떠도 저절로 풀리므로, 간격을 늘리는 대신
+# 브라우저를 바꾸고 간격은 기본값(1.5~4초)으로 되돌렸다. 실행 중 크롬 창이
+# 하나 뜬다 (옥션과 별도 프로필 auth/chrome_profile_gmarket).
+WANTS_CDP_CHROME = True
 
 
 def extract_order_id(product_url: str) -> str:
@@ -298,45 +303,53 @@ def _scrape_tracking_from_page(page, order_id: str, order_option: str | None = N
     return TrackingResult(tracking_no=tracking_no, courier=courier)
 
 
+# 조회에 재사용하는 탭 (컨텍스트당 하나). 주문마다 탭을 열고 닫으면 그 비용이
+# 매번 드는 데다, 눈에 보이는 크롬 창(CDP)에서는 탭이 주문 수만큼 깜빡인다.
+# 어차피 조회는 매번 goto로 시작하므로 이전 주문의 화면이 남아 있어도 상관없다.
+_LOOKUP_PAGE: dict[int, object] = {}
+
+
+def _lookup_page(context: BrowserContext):
+    page = _LOOKUP_PAGE.get(id(context))
+    if page is None or page.is_closed():
+        browser_mod.block_heavy_resources(context)
+        page = context.new_page()
+        _LOOKUP_PAGE[id(context)] = page
+    return page
+
+
 def get_tracking(
     context: BrowserContext, product_url: str, headless: bool = True, order_option: str | None = None
 ) -> TrackingResult:
     order_id = extract_order_id(product_url)
-    page = context.new_page()
-    try:
+    page = _lookup_page(context)
+    page.goto(product_url, wait_until="domcontentloaded")
+
+    if _looks_like_bot_check(page):
+        # 진짜 크롬(CDP)에서는 Turnstile이 몇 초 만에 저절로 풀린다(옥션과
+        # 같은 원리). 창이 항상 떠 있으므로 headless 설정과 무관하게, 안
+        # 풀리면 사람이 그 창에서 직접 통과할 수도 있다.
+        common.safe_print("[gmarket] 봇 확인 화면이 떴습니다. 저절로 풀리기를 기다립니다 (뜬 크롬 창에서 직접 통과해도 됩니다).")
+        if not _wait_for_bot_check_to_clear(page):
+            raise BlockedError("봇 확인 대기 시간(3분)이 지났습니다. 통과 후 다시 실행해주세요.")
         page.goto(product_url, wait_until="domcontentloaded")
 
-        if _looks_like_bot_check(page):
-            if headless:
-                raise BlockedError(
-                    "지마켓 봇 확인(Cloudflare) 화면이 떴습니다. 먼저 --headless 없이 실행해 수동으로 통과해주세요."
-                )
-            common.safe_print("[gmarket] 봇 확인 화면이 떴습니다. 뜬 브라우저 창에서 직접 체크박스를 눌러 통과해주세요.")
-            if not _wait_for_bot_check_to_clear(page):
-                raise BlockedError("봇 확인 대기 시간(3분)이 지났습니다. 통과 후 다시 실행해주세요.")
-            page.goto(product_url, wait_until="domcontentloaded")
-
+    if _looks_like_login_page(page):
+        if _auto_login(page):
+            common.safe_print("[gmarket] 로그인 세션이 없어 자동 로그인했습니다.")
+        else:
+            # GMARKET_PW가 없거나 캡차가 요구된 경우 - 크롬 창이 항상 떠
+            # 있으므로(CDP) 사람이 직접 로그인할 때까지 기다린다.
+            _prefill_login_id(page)
+            common.safe_print("[gmarket] 아이디는 자동으로 입력했습니다. 뜬 크롬 창에서 비밀번호를 입력하고 로그인해주세요.")
+            common.safe_print("[gmarket] 로그인이 완료되면 자동으로 이어서 진행합니다 (최대 5분 대기).")
+            if not _wait_for_manual_login(page):
+                raise BlockedError("로그인 대기 시간(5분)이 지났습니다. 로그인 후 다시 실행해주세요.")
+        page.goto(product_url, wait_until="domcontentloaded")
         if _looks_like_login_page(page):
-            if _auto_login(page):
-                common.safe_print("[gmarket] 로그인 세션이 없어 자동 로그인했습니다.")
-            elif headless:
-                raise BlockedError(
-                    "지마켓 로그인이 필요합니다. .env에 GMARKET_PW를 넣으면 자동 로그인하고, "
-                    "비밀번호를 저장하지 않으려면 --headless 없이 실행해 직접 로그인해주세요."
-                )
-            else:
-                _prefill_login_id(page)
-                common.safe_print("[gmarket] 아이디는 자동으로 입력했습니다. 뜬 브라우저 창에서 비밀번호를 입력하고 로그인해주세요.")
-                common.safe_print("[gmarket] 로그인이 완료되면 자동으로 이어서 진행합니다 (최대 5분 대기).")
-                if not _wait_for_manual_login(page):
-                    raise BlockedError("로그인 대기 시간(5분)이 지났습니다. 로그인 후 다시 실행해주세요.")
-            page.goto(product_url, wait_until="domcontentloaded")
-            if _looks_like_login_page(page):
-                raise BlockedError("로그인 후에도 여전히 로그인 페이지입니다.")
+            raise BlockedError("로그인 후에도 여전히 로그인 페이지입니다.")
 
-        # 주문상세는 자바스크립트로 그려진다 - 주문번호가 화면에 뜨면 다 그려진 것이다.
-        common.wait_for_text(page, order_id)
-        # 주문상세 화면을 떠나기 전에 주문일부터 읽어둔다 (오래된 주문을 결과에 따로 모으는 데 쓴다).
-        return with_order_date(page, lambda: _scrape_tracking_from_page(page, order_id, order_option))
-    finally:
-        page.close()
+    # 주문상세는 자바스크립트로 그려진다 - 주문번호가 화면에 뜨면 다 그려진 것이다.
+    common.wait_for_text(page, order_id)
+    # 주문상세 화면을 떠나기 전에 주문일부터 읽어둔다 (오래된 주문을 결과에 따로 모으는 데 쓴다).
+    return with_order_date(page, lambda: _scrape_tracking_from_page(page, order_id, order_option))
