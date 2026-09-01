@@ -26,6 +26,7 @@
 
 from __future__ import annotations
 
+import contextlib
 import os
 import re
 from datetime import date, datetime
@@ -156,7 +157,32 @@ def prepare_batch(context: BrowserContext, orders, headless: bool = True) -> Non
         return
 
     page = context.new_page()
+
+    # [더보기] 한 번에 실제 데이터 요청(getOrderList)은 하나인데, 카드마다
+    # **몸통까지 똑같은** 라벨 조회(ui/code·ui/info)가 15쌍씩 따라온다
+    # (2026-09-01 실측: 첫 렌더 34건, 클릭마다 30건). 첫 응답을 받아두고
+    # 반복 요청은 그걸로 대신 채워 왕복을 줄인다 - 클릭당 대기 중앙값
+    # 0.9~1.3초 -> 0.7~0.8초 실측, 카드의 상태/예정 값은 캐시를 써도
+    # 같았다(102장 비교). 뭐든 실패하면 원래대로 흘려보낸다.
+    label_cache: dict[tuple[str, str | None], str] = {}
+
+    def _serve_label_from_cache(route) -> None:
+        try:
+            key = (route.request.url, route.request.post_data)
+            body = label_cache.get(key)
+            if body is not None:
+                route.fulfill(status=200, content_type="application/json", body=body)
+                return
+            response = route.fetch()
+            label_cache[key] = response.text()
+            route.fulfill(response=response)
+        except Exception:  # noqa: BLE001 - 캐시는 거들 뿐, 실패하면 원래 경로로
+            with contextlib.suppress(Exception):
+                route.continue_()
+
     try:
+        page.route("**/order/fo/ui/code", _serve_label_from_cache)
+        page.route("**/order/fo/ui/info", _serve_label_from_cache)
         page.goto(ORDER_LIST_URL, wait_until="domcontentloaded")
         _wait_for_more_cards(page, 0, LIST_RENDER_WAIT_MS)
         seen: dict[str, dict] = {}
@@ -212,6 +238,7 @@ def _raise_if_listed_settled(card: dict, od_no: str) -> None:
         raise_if_cancelled_any(statuses, od_no)
     except (OrderCancelled, TrackingNotAvailableYet) as e:
         e.order_date, e.delivery_note = order_date, note
+        e.sent_request = False  # 미리 읽어둔 목록으로 답했다 - 새 요청 없음
         raise
 
     if not all(any(k in s for k in LIST_NOT_YET_STATUSES) for s in statuses):
@@ -221,13 +248,19 @@ def _raise_if_listed_settled(card: dict, od_no: str) -> None:
     # 안 나갔나'를 판단할 때 쓰는 값이라(report.stale_entries), 목록에 없는
     # 문구까지 챙겨야 한다. 주문일을 못 읽었으면 오래된 건인지 알 수 없으므로
     # 마찬가지로 상세를 연다.
-    if order_date is None or order_date_mod.is_stale(order_date):
+    #
+    # 단, 그 문구를 **목록에서 이미 읽었으면** 상세를 열 이유가 없다. 롯데온은
+    # 목록 카드에도 "9/3(목) 이내 도착확률 91%"를 적어두고, 상세에 있는 것도
+    # 같은 문구다(2026-09-01 실측). 2026-09-01 실행 기준 롯데온 스킵 33건 중
+    # 12건이 '오래된 주문'이라 이 자리에서 상세로 갔다 - 건당 1.2초씩이다.
+    if note is None and (order_date is None or order_date_mod.is_stale(order_date)):
         return
 
     error = TrackingNotAvailableYet(
         f"아직 송장번호가 발급되지 않았습니다 (odNo={od_no}, 주문내역 '{statuses[0]}')."
     )
     error.order_date, error.delivery_note = order_date, note
+    error.sent_request = False  # 미리 읽어둔 목록으로 답했다 - 새 요청 없음
     raise error
 
 

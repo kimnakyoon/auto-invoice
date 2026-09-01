@@ -39,10 +39,16 @@ class AdapterError(Exception):
     delivery_note: 같은 화면에서 읽은 '출고예정 2026-09-02' 같은 안내 문구
     (eta.py). 주문일이 오래됐는데 아직 송장이 없는 건을 사람이 볼 때, 공급사가
     이미 예정일을 알려주고 있는지가 판단의 절반이라 같이 실어 보낸다.
+
+    sent_request: 이 결론을 내리기까지 공급사 사이트에 요청을 보냈는가.
+    미리 읽어둔 주문내역 목록만으로 답한 경우(롯데온 prepare_batch)만 False다.
+    오케스트레이터가 요청 사이 간격(1.5~4초)을 지킬지 판단하는 데 쓴다 -
+    요청을 안 보냈으면 간격을 둘 이유도 없다.
     """
 
     order_date: date | None = None
     delivery_note: str | None = None
+    sent_request: bool = True
 
 
 class OrderNotFound(AdapterError):

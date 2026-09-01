@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import contextlib
 import threading
+import time
 from collections import Counter
 from concurrent.futures import ThreadPoolExecutor
 from typing import Callable, Iterable
@@ -135,10 +136,16 @@ def run(
 
     if by_site:
         workers = max(1, min(settings.workers, len(by_site)))
+        # 주문이 많은 사이트부터 맡긴다. 전체 시간은 '가장 오래 걸리는 사이트가
+        # 언제 끝나는가'로 정해지는데, 지금까지는 엑셀에 먼저 나온 사이트부터
+        # 맡겨서 제일 큰 사이트가 뒤로 밀리면 그만큼 통째로 늦어졌다. 실제로
+        # 2026-09-01 실행은 98건 중 51건이 롯데온이었다 - 이 한 사이트가 언제
+        # 시작하느냐가 전체 시간이다. 작은 사이트들은 남는 일꾼이 알아서 채운다.
+        by_size = sorted(by_site.items(), key=lambda item: len(item[1]), reverse=True)
         with ThreadPoolExecutor(max_workers=workers) as pool:
             futures = [pool.submit(_lookup_site, site_key, jobs,
                                    settings=settings, headless=headless, shared=shared)
-                       for site_key, jobs in by_site.items()]
+                       for site_key, jobs in by_size]
             for future in futures:
                 future.result()  # 스레드 안에서 터진 예외를 여기서 다시 올린다
 
@@ -175,11 +182,18 @@ def _lookup_site(site_key: str, jobs: list, *, settings, headless: bool,
                 with contextlib.suppress(Exception):
                     prepare(context, [order for order, _ in jobs], headless=headless)
 
-            # 대기는 '다음 요청과 간격을 두려고' 넣는 것이라, 그 사이트의
-            # 마지막 주문 뒤에는 잘 이유가 없다 - 사이트마다 한 번씩
-            # 평균 2.75초를 그냥 버리고 있었다.
-            last_index = len(jobs) - 1
-            for index, (order, adapter) in enumerate(jobs):
+            # 요청 간격: 봇으로 보이지 않게 같은 사이트에는 1.5~4초(설정값)
+            # 간격으로만 요청한다. 예전에는 성공/실패한 주문 '뒤에' 이 시간을
+            # 통째로 자서 실제 간격이 '조회 시간 + 대기'로 늘 길었고, 반대로
+            # 요청을 보내고도 미발급이라 스킵한 주문 뒤에는 간격이 아예 없었다.
+            # 지금은 '요청을 시작한 시각 + 랜덤 간격' 전에는 다음 요청을
+            # 시작하지 않는다 - 조회에 걸린 시간이 간격에 포함되고, 요청을
+            # 보냈으면 결과가 무엇이든 간격이 지켜진다 (2026-09-01 결정).
+            # 요청을 안 보낸 주문(롯데온이 목록으로 답한 것)은 간격을 새로
+            # 세우지 않고, 대기가 요청 '앞'에 붙으므로 마지막 주문 뒤에는
+            # 자연히 아무것도 기다리지 않는다.
+            gate = 0.0  # 다음 요청을 시작해도 되는 시각 (time.monotonic 기준)
+            for order, adapter in jobs:
                 message = ""
                 try:
                     if blocked_reason:
@@ -197,14 +211,29 @@ def _lookup_site(site_key: str, jobs: list, *, settings, headless: bool,
                     if getattr(adapter, "WANTS_RECIPIENT_NAME", False):
                         extra_kwargs["recipient_name"] = order.recipient_name
 
+                    # 지난 요청과의 간격이 아직 안 찼으면 모자란 만큼만 쉰다.
+                    remaining = gate - time.monotonic()
+                    if remaining > 0:
+                        time.sleep(remaining)
+
+                    lookup_started = time.monotonic()
+                    sent_request = True  # 무슨 일이 있었는지 모르면 보냈다고 본다
                     try:
-                        result = adapter.get_tracking(
-                            context,
-                            order.product_url,
-                            headless=headless,
-                            order_option=order.order_option,
-                            **extra_kwargs,
-                        )
+                        try:
+                            result = adapter.get_tracking(
+                                context,
+                                order.product_url,
+                                headless=headless,
+                                order_option=order.order_option,
+                                **extra_kwargs,
+                            )
+                        except AdapterError as e:
+                            sent_request = e.sent_request
+                            raise
+                        finally:
+                            if sent_request:
+                                gate = lookup_started + rate_limit.request_gap(
+                                    settings.delay_min, settings.delay_max)
                     except TrackingNotAvailableYet as e:
                         # 사유까지 로그에 남긴다 - '취소' 표시가 있는데 '준비'가
                         # 함께 있어 취소 대신 미발급으로 넘긴 건이 여기 섞인다.
@@ -265,9 +294,6 @@ def _lookup_site(site_key: str, jobs: list, *, settings, headless: bool,
                                            product_url=order.product_url)
                 finally:
                     shared.finished(order.order_id, message)
-
-                if index < last_index:
-                    rate_limit.humanized_delay(settings.delay_min, settings.delay_max)
         finally:
             browser_mod.save_state(context, site_key)
             browser.close()

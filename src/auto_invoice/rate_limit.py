@@ -1,8 +1,16 @@
-"""요청 사이에 사람처럼 보이는 랜덤 대기를 넣어 봇 탐지(Imperva 등)를 피한다."""
+"""같은 사이트에 보내는 요청 사이에 사람처럼 보이는 랜덤 간격을 지킨다."""
 
 import random
-import time
 
 
-def humanized_delay(min_s: float = 1.5, max_s: float = 4.0) -> None:
-    time.sleep(random.uniform(min_s, max_s))
+def request_gap(min_s: float = 1.5, max_s: float = 4.0) -> float:
+    """다음 요청까지 지킬 간격(초)을 무작위로 뽑는다.
+
+    예전의 humanized_delay는 조회가 끝난 '뒤에' 이만큼을 통째로 잤다. 그러면
+    실제 요청 간격은 '조회 시간 + 대기'가 되어 설정값보다 늘 길었고(평균 4초쯤),
+    반대로 요청을 보내고도 미발급이라 스킵한 주문 뒤에는 간격이 아예 없었다.
+    지금은 오케스트레이터가 '요청을 시작한 시각 + 이 값' 전에는 다음 요청을
+    시작하지 않는 방식이다 - 조회에 걸린 시간이 간격에 포함되고, 요청을 보낸
+    주문이면 결과가 무엇이든 같은 간격이 지켜진다 (2026-09-01 결정).
+    """
+    return random.uniform(min_s, max_s)
