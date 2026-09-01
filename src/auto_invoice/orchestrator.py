@@ -232,8 +232,15 @@ def _lookup_site(site_key: str, jobs: list, *, settings, headless: bool,
                             raise
                         finally:
                             if sent_request:
+                                # 봇 확인이 잘 뜨는 사이트(옥션/지마켓)는 어댑터가
+                                # 자기 간격(REQUEST_GAP)을 따로 정한다 - 기본
+                                # 간격(1.5~4초)은 조회 자체에 걸리는 시간보다
+                                # 짧아서, 사실상 쉬지 않고 다음 주문을 열었다.
+                                gap_min, gap_max = getattr(
+                                    adapter, "REQUEST_GAP",
+                                    (settings.delay_min, settings.delay_max))
                                 gate = lookup_started + rate_limit.request_gap(
-                                    settings.delay_min, settings.delay_max)
+                                    gap_min, gap_max)
                     except TrackingNotAvailableYet as e:
                         # 사유까지 로그에 남긴다 - '취소' 표시가 있는데 '준비'가
                         # 함께 있어 취소 대신 미발급으로 넘긴 건이 여기 섞인다.

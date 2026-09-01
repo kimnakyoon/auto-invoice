@@ -167,7 +167,14 @@ MAX_RECIPIENT_LOOKUPS = 15
 DELIVERY_TEXT_SELECTOR = "span.text__delivery-cooper"
 NEXT_DATA_SELECTOR = "#__NEXT_DATA__"
 
-BOT_CHECK_PATTERNS = ["사람인지 확인", "봇(Bot)이란"]
+BOT_CHECK_PATTERNS = ["사람인지 확인", "봇(Bot)이란", "로봇이 아닙니다"]
+
+# 요청 간격 (오케스트레이터가 기본 1.5~4초 대신 쓴다). 이베이코리아(옥션/지마켓)는
+# 주문 사이 간격이 짧으면 "로봇이 아닙니다" 봇 확인이 뜬다(2026-09-01 사용자 관찰).
+# 기본 간격은 조회 한 건에 걸리는 시간보다 짧아 사실상 쉬는 시간이 0이었다 -
+# 간격이 '요청 시작 시각' 기준이라, 조회가 몇 초 걸려도 그 사이에 몇 초는 쉬도록
+# 여유 있게 잡는다.
+REQUEST_GAP = (6.0, 12.0)
 # 목록의 주문상태가 이 값이면 아직 발송 전이라 송장번호가 없는 게 정상이다.
 NOT_YET_STATUSES = ["입금확인중", "결제완료", "배송준비중", "상품준비중", "주문확인중"]
 
@@ -565,6 +572,12 @@ def _fetch_tracking(context: BrowserContext, order_no: str) -> TrackingResult:
     try:
         info = _read_shipping_info(page)
         if info is None:
+            # 봇 확인 화면이면 __NEXT_DATA__도 대체 경로도 없다 - 그대로 두면
+            # '아직 미발급'(스킵)으로 잘못 기록되므로 먼저 가려낸다.
+            if _looks_like_bot_check(page):
+                raise BlockedError(
+                    "옥션 봇 확인 화면이 떴습니다 (배송조회). 브라우저에서 직접 통과한 뒤 다시 실행해주세요."
+                )
             fallback = _parse_delivery_text(page)
             if fallback is None:
                 raise TrackingNotAvailableYet(

@@ -80,7 +80,12 @@ TRACKING_LINE_PATTERN = re.compile(r"([가-힣A-Za-z]{2,20})\s*([0-9][0-9\-]{7,}
 # 맨 마지막 줄만 보게 된다.
 TRACKING_LINE_ANY_PATTERN = re.compile(TRACKING_LINE_PATTERN.pattern, re.MULTILINE)
 NOT_YET_PATTERNS = ["배송준비중", "상품준비중", "결제확인중", "주문확인중"]
-BOT_CHECK_PATTERNS = ["사람인지 확인", "봇(Bot)이란"]
+BOT_CHECK_PATTERNS = ["사람인지 확인", "봇(Bot)이란", "로봇이 아닙니다"]
+
+# 요청 간격 (오케스트레이터가 기본 1.5~4초 대신 쓴다). 이베이코리아(옥션/지마켓)는
+# 주문 사이 간격이 짧으면 "로봇이 아닙니다" 봇 확인이 뜬다(2026-09-01 사용자 관찰).
+# 옥션 어댑터의 REQUEST_GAP 주석 참고.
+REQUEST_GAP = (6.0, 12.0)
 
 
 def extract_order_id(product_url: str) -> str:
@@ -245,6 +250,12 @@ def _scrape_tracking_from_page(page, order_id: str, order_option: str | None = N
     clicked = _click_tracking_button(page)
     if not clicked:
         body_text = page.inner_text("body")
+        # 페이지를 연 직후의 검사를 통과한 뒤에 봇 확인으로 바뀌었을 수 있다 -
+        # 그대로 두면 '버튼을 못 찾았다'는 엉뚱한 실패 사유가 남는다.
+        if any(p in body_text for p in BOT_CHECK_PATTERNS):
+            raise BlockedError(
+                "지마켓 봇 확인 화면이 떴습니다 (주문상세). 브라우저에서 직접 통과한 뒤 다시 실행해주세요."
+            )
         if any(p in body_text for p in NOT_YET_PATTERNS):
             raise TrackingNotAvailableYet(f"아직 송장번호가 발급되지 않았습니다 (orderId={order_id}).")
         raise_if_cancelled(body_text, order_id)
