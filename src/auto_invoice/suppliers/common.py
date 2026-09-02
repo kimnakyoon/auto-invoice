@@ -100,6 +100,29 @@ LOGIN_REDIRECT_SETTLE_MS = 1500
 LOGIN_FORM_SETTLE_MS = 1500
 
 
+def goto_settled(page, url: str, *, retries: int = 3, settle_ms: int = 1500) -> None:
+    """url로 이동하되, 진행 중인 리다이렉트 체인에 인터럽트되면 쉬었다 다시 간다.
+
+    로그인/SSO 직후에는 사이트가 여러 단계 리다이렉트를 도는 중이라, 그때
+    goto하면 Playwright가 "is interrupted by another navigation"으로 예외를
+    낸다 (옥션 2026-09-01 실측: LoginThrough.aspx가 끼어들었다).
+    ERR_ABORTED는 떠나려는 페이지가 자기 리다이렉트를 쏘면서 우리 goto를
+    끊은 것이다 (옥션 2026-09-02 실측). 둘 다 잠깐 가라앉히고 다시 가면 된다.
+    """
+    last_error: Exception | None = None
+    for _ in range(retries):
+        try:
+            page.goto(url, wait_until="domcontentloaded")
+            return
+        except Exception as e:  # noqa: BLE001 - 이동이 끊긴 경우만 다시 시도한다
+            if ("is interrupted by another navigation" not in str(e)
+                    and "net::ERR_ABORTED" not in str(e)):
+                raise
+            last_error = e
+            page.wait_for_timeout(settle_ms)
+    raise last_error  # type: ignore[misc]
+
+
 def wait_for_url(page, url_matches: Callable[[str], bool], timeout_ms: int,
                  poll_ms: int = 100) -> bool:
     """주소가 이렇게 바뀌는지 그동안만 지켜본다 (자바스크립트 리다이렉트용).

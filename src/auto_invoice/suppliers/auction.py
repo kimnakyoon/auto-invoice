@@ -349,27 +349,9 @@ def _auto_login(page: Page) -> bool:
 
 
 def _goto_settled(page: Page, url: str) -> None:
-    """url로 이동하되, 진행 중인 리다이렉트 체인에 인터럽트되면 쉬었다 다시 간다.
-
-    로그인/SSO 직후에는 사이트가 여러 단계 리다이렉트를 도는 중이라, 그때
-    goto하면 Playwright가 "is interrupted by another navigation"으로 예외를
-    낸다 (2026-09-01 실측: LoginThrough.aspx가 끼어들었다).
-    """
-    last_error: Exception | None = None
-    for _ in range(3):
-        try:
-            page.goto(url, wait_until="domcontentloaded")
-            return
-        except Exception as e:  # noqa: BLE001 - 이동이 끊긴 경우만 다시 시도한다
-            # ERR_ABORTED: 떠나려는 페이지가 자기 리다이렉트를 쏘면서 우리 goto를
-            # 끊은 것이다 (2026-09-02 실측: 미로그인 배송조회 페이지에서 주문상세로
-            # 이동할 때). 잠깐 가라앉히고 다시 가면 된다.
-            if ("is interrupted by another navigation" not in str(e)
-                    and "net::ERR_ABORTED" not in str(e)):
-                raise
-            last_error = e
-            page.wait_for_timeout(1500)
-    raise last_error  # type: ignore[misc]
+    """url로 이동하되, 진행 중인 리다이렉트 체인에 인터럽트되면 쉬었다 다시 간다
+    (지마켓과 같은 문제라 common.goto_settled로 합쳤다 - 그쪽 주석 참고)."""
+    common.goto_settled(page, url)
 
 
 def _goto_logged_in(page: Page, url: str, expect_selector: str | None = None) -> None:

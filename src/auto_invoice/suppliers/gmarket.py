@@ -24,6 +24,16 @@
   뜨지 않았고 캡차 입력칸(#typeMemberCaptcha)도 DOM에는 있지만 화면에는
   보이지 않았다. 그래서 GMARKET_ID/GMARKET_PW 환경변수로 완전 자동 로그인한다
   (SSG/더현대/NS홈쇼핑/11번가/옥션과 동일한 패턴).
+- 로그인 버튼을 누르면 mobile.gmarket.co.kr/login/loginProc(빈 중간 페이지)
+  을 거쳐 원래 주소로 돌아온다(2026-09-02 실측: 0.3초 -> 0.8초). 이 중간
+  페이지에는 비밀번호 칸이 없어 _looks_like_login_page가 "로그인 화면 아님"
+  이라 하는데, 그 순간 주문상세로 goto하면 **아직 도는 중인 리다이렉트를
+  끊어서 쿠키가 다 붙기 전에 다시 로그인 페이지로 튕긴다** - 2026-09-02 16:31
+  실행에서 그렇게 "로그인 후에도 여전히 로그인 페이지" 실패가 나고, 한 번
+  막히면 나머지 27건이 전부 실패로 남았다(평소에는 1.5초 안에 체인이 끝나
+  안 걸렸다). 그래서 로그인 뒤에는 주소가 /login 바깥으로 나올 때까지
+  기다리고(_wait_for_login_redirects), 그래도 로그인 페이지면 잠깐 뒤 한 번
+  더 가본 다음에야 포기한다.
 - 로그인 실패는 화면 문구가 아니라 **alert()** 으로 알려준다 (실측: 없는
   아이디로 시도하면 "아이디 확인 후 다시 입력해 주세요."). 롯데온과 같은
   방식이라, dialog 핸들러로 그 문구를 받아 실패 사유째로 올린다. 핸들러가
@@ -71,6 +81,9 @@ DEFAULT_COURIER = "택배"  # 모달에서 택배사명을 못 읽었을 때만 
 
 LOGIN_WAIT_TIMEOUT_MS = 5 * 60 * 1000  # 수동 로그인 대기 최대 5분
 AUTO_LOGIN_WAIT_TIMEOUT_MS = 30 * 1000  # 자동 로그인 후 리다이렉트 대기 최대 30초
+# 로그인 직후 리다이렉트 체인(Login -> login/loginProc -> 원래 주소)이 끝나기를
+# 기다리는 최대 시간. 실측 0.8초, 느린 날을 감안해 넉넉히.
+LOGIN_REDIRECT_SETTLE_MS = 15 * 1000
 BOT_CHECK_WAIT_TIMEOUT_MS = 3 * 60 * 1000  # 봇 확인 통과 대기 최대 3분
 
 TRACKING_BUTTON_TEXTS = ["배송조회"]
@@ -101,9 +114,29 @@ def extract_order_id(product_url: str) -> str:
     return segments[-1]
 
 
+def _is_login_flow_url(url: str) -> bool:
+    """로그인 폼(Login)과 그 처리 중간 페이지(login/loginProc) 둘 다 해당한다."""
+    return "signinssl.gmarket.co.kr" in url or "/login" in url.lower()
+
+
 def _looks_like_login_page(page) -> bool:
-    return common.looks_like_login_page(
-        page, lambda url: "signinssl.gmarket.co.kr" in url or "/login" in url.lower())
+    return common.looks_like_login_page(page, _is_login_flow_url)
+
+
+def _wait_for_login_redirects(page) -> None:
+    """로그인 직후 리다이렉트 체인이 원래 주소까지 다 돌기를 기다린다.
+
+    주소가 /login 바깥으로 나오면 체인이 끝난 것이다. 그 뒤 화면이 그려질
+    때까지 한 번 더 기다려, 뒤따르는 goto가 체인을 끊지 않게 한다(맨 위
+    docstring). 시간 안에 안 나와도 예외는 내지 않는다 - 호출자가 goto 뒤에
+    로그인 페이지인지 다시 본다.
+    """
+    common.wait_for_url(page, lambda url: not _is_login_flow_url(url), LOGIN_REDIRECT_SETTLE_MS)
+    try:
+        page.wait_for_load_state("domcontentloaded", timeout=LOGIN_REDIRECT_SETTLE_MS)
+    except Exception:  # noqa: BLE001 - 다음 goto가 어차피 다시 확인한다
+        pass
+    page.wait_for_timeout(500)
 
 
 def _looks_like_bot_check(page) -> bool:
@@ -171,6 +204,9 @@ def _auto_login(page) -> bool:
             # 자체는 된 경우(비밀번호 변경 안내 등)가 있어, 페이지 상태를
             # alert보다 먼저 본다 (롯데온과 동일한 순서).
             if not _looks_like_login_page(page):
+                # 로그인 폼은 벗어났지만 중간 페이지(loginProc)일 수 있다 - 원래
+                # 주소까지 돌아올 때까지 기다린 뒤에 돌려준다(맨 위 docstring).
+                _wait_for_login_redirects(page)
                 return True
             if alerts:
                 raise BlockedError(f"지마켓 자동 로그인이 거부됐습니다: {alerts[0].strip()}")
@@ -345,7 +381,12 @@ def get_tracking(
             common.safe_print("[gmarket] 로그인이 완료되면 자동으로 이어서 진행합니다 (최대 5분 대기).")
             if not _wait_for_manual_login(page):
                 raise BlockedError("로그인 대기 시간(5분)이 지났습니다. 로그인 후 다시 실행해주세요.")
-        page.goto(product_url, wait_until="domcontentloaded")
+            _wait_for_login_redirects(page)
+        common.goto_settled(page, product_url)
+        if _looks_like_login_page(page):
+            # 로그인 쿠키가 아직 다 안 붙었을 수 있다 - 잠깐 뒤 한 번만 더 가본다.
+            page.wait_for_timeout(2000)
+            common.goto_settled(page, product_url)
         if _looks_like_login_page(page):
             raise BlockedError("로그인 후에도 여전히 로그인 페이지입니다.")
 
