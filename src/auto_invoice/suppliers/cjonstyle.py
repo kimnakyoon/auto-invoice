@@ -348,13 +348,14 @@ def _read_tracking_sheet(page: Page) -> str:
 
     이 페이지는 이동이 끝난 직후에는 "송장번호"/"택배업체" 자리가 아직 비어
     있고 1초쯤 뒤에 채워진다 - 바로 읽으면 송장이 있는 주문도 "아직 미발급"으로
-    잘못 판단한다(2026-08-28 실측).
+    잘못 판단한다(2026-08-28 실측). 500ms 단위로 돌던 것을 100ms로 좁혔다 -
+    채워지는 시점은 고정이 아니라서, 굵은 폴링은 평균 그 절반씩을 그냥 버린다.
     """
     elapsed_ms = 0
     body_text = page.inner_text("body")
     while "송장번호" not in body_text and elapsed_ms < TRACKING_TEXT_WAIT_TIMEOUT_MS:
-        page.wait_for_timeout(500)
-        elapsed_ms += 500
+        page.wait_for_timeout(100)
+        elapsed_ms += 100
         body_text = page.inner_text("body")
     return body_text
 
@@ -372,24 +373,29 @@ def _parse_tracking_page(body_text: str, order_no: str) -> tuple[str, str]:
     return tracking_no, courier
 
 
-def _click_tracking_link(page: Page, product_url: str, order_no: str, link) -> tuple[str, str]:
+def _click_tracking_link(page: Page, product_url: str, order_no: str, link,
+                         *, return_to_detail: bool) -> tuple[str, str]:
     """"배송조회" 버튼은 새 탭이 아니라 같은 탭에서 결과 페이지로 이동한다.
 
-    다음 버튼을 클릭할 수 있도록, 결과를 읽은 뒤 주문상세 페이지로 되돌아간다.
+    return_to_detail은 결과를 읽은 뒤 주문상세 페이지로 되돌아갈지다 - 다음에
+    누를 버튼이 남았을 때만 필요하다. 버튼이 하나뿐인 보통 주문에서까지
+    무조건 되돌아가면 주문마다 페이지 이동 하나가 통째로 낭비다
+    (이 복귀를 없애고 폴링을 100ms로 좁혀 실측 주문당 5.4초 -> 2.9초).
     """
     link.click()
     elapsed_ms = 0
     while TRACKING_URL_MARKER not in page.url and elapsed_ms < TRACKING_NAV_WAIT_TIMEOUT_MS:
-        page.wait_for_timeout(500)
-        elapsed_ms += 500
+        page.wait_for_timeout(100)
+        elapsed_ms += 100
     if TRACKING_URL_MARKER not in page.url:
         raise ParseError("배송조회 클릭 후 결과 페이지로 이동하지 못했습니다.")
 
     result = _parse_tracking_page(_read_tracking_sheet(page), order_no)
-    # 다음 버튼을 누르려면 주문상세가 다시 그려져 있어야 한다 - 주문번호가
-    # 다시 보이면 그때가 다 그려진 때다(예전에는 여기서도 2.5초를 잤다).
-    page.goto(product_url, wait_until="domcontentloaded")
-    common.wait_for_text(page, order_no, common.ORDER_RENDER_WAIT_MS)
+    if return_to_detail:
+        # 다음 버튼을 누르려면 주문상세가 다시 그려져 있어야 한다 - 주문번호가
+        # 다시 보이면 그때가 다 그려진 때다(예전에는 여기서도 2.5초를 잤다).
+        page.goto(product_url, wait_until="domcontentloaded")
+        common.wait_for_text(page, order_no, common.ORDER_RENDER_WAIT_MS)
     return result
 
 
@@ -428,23 +434,26 @@ def _scrape_tracking_from_page(page: Page, product_url: str, order_no: str, orde
         raise ParseError(f"화면에서 배송조회 버튼을 찾지 못했습니다 (주문번호={order_no}).")
 
     if count == 1:
-        tracking_no, courier = _click_tracking_link(page, product_url, order_no, links.first)
+        tracking_no, courier = _click_tracking_link(
+            page, product_url, order_no, links.first, return_to_detail=False)
         return TrackingResult(tracking_no=tracking_no, courier=courier)
 
     body_text = page.inner_text("body")
     matched_idx = _select_link_index_by_order_option(body_text, count, order_option)
     if matched_idx is not None:
-        tracking_no, courier = _click_tracking_link(page, product_url, order_no, links.nth(matched_idx))
+        tracking_no, courier = _click_tracking_link(
+            page, product_url, order_no, links.nth(matched_idx), return_to_detail=False)
         return TrackingResult(tracking_no=tracking_no, courier=courier)
 
     # 옵션으로 특정할 수 없으면 전부 클릭해서 실제로 서로 다른 송장인지 확인한다
-    # (다른 어댑터와 동일한 안전 규칙). 클릭할 때마다 주문상세 페이지로 돌아오므로,
-    # 매번 버튼을 새로 조회해야 한다(이전 로케이터는 이동한 페이지 기준이라
-    # 재사용할 수 없다).
+    # (다른 어댑터와 동일한 안전 규칙). 클릭할 때마다 주문상세 페이지로 돌아오므로
+    # (마지막 클릭 뒤에는 돌아올 필요가 없다), 매번 버튼을 새로 조회해야 한다
+    # (이전 로케이터는 이동한 페이지 기준이라 재사용할 수 없다).
     results = []
     for i in range(count):
         fresh_links = page.get_by_text(TRACKING_LINK_TEXT, exact=True)
-        results.append(_click_tracking_link(page, product_url, order_no, fresh_links.nth(i)))
+        results.append(_click_tracking_link(page, product_url, order_no, fresh_links.nth(i),
+                                            return_to_detail=i < count - 1))
 
     distinct_tracking_nos = {r[0] for r in results}
     if len(distinct_tracking_nos) > 1:

@@ -360,8 +360,12 @@ def _goto_settled(page: Page, url: str) -> None:
         try:
             page.goto(url, wait_until="domcontentloaded")
             return
-        except Exception as e:  # noqa: BLE001 - 인터럽트만 다시 시도한다
-            if "is interrupted by another navigation" not in str(e):
+        except Exception as e:  # noqa: BLE001 - 이동이 끊긴 경우만 다시 시도한다
+            # ERR_ABORTED: 떠나려는 페이지가 자기 리다이렉트를 쏘면서 우리 goto를
+            # 끊은 것이다 (2026-09-02 실측: 미로그인 배송조회 페이지에서 주문상세로
+            # 이동할 때). 잠깐 가라앉히고 다시 가면 된다.
+            if ("is interrupted by another navigation" not in str(e)
+                    and "net::ERR_ABORTED" not in str(e)):
                 raise
             last_error = e
             page.wait_for_timeout(1500)
@@ -648,38 +652,14 @@ def _order_status_from_detail(page: Page) -> str:
     return ""
 
 
-def _fetch_tracking(context: BrowserContext, order_no: str,
-                    *, check_status: bool = True) -> TrackingResult:
-    """주문번호로 송장을 읽는다. 상태 확인 -> 배송조회 순서다.
+def _parse_trace_page(page: Page, order_no: str) -> TrackingResult | None:
+    """지금 열려 있는 배송조회 화면에서 송장을 읽는다. 송장이 없으면 None.
 
-    배송조회(tracking.auction.co.kr)는 **아직 발송 전인 주문에서 HTTP 500 오류
-    페이지로 떨어진다**(2026-09-01 실측: 배송준비중 주문 3건 모두, 로그인된
-    진짜 크롬에서도 동일). 그 500 페이지를 예전에는 '아직 미발급'(스킵)으로
-    잘못 읽었다. 그래서 escrow의 주문상세 레이어에서 주문상태부터 읽고,
-    발송된 주문만 배송조회를 연다. 주문내역 목록에서 이미 상태를 보고 온
-    경로(_tracking_for_listed_order)는 check_status=False로 건너뛴다.
+    None인 이유는 여기서 판정하지 않는다 - 발송 전(500 페이지)일 수도,
+    **로그인이 풀린 상태**일 수도 있다(배송조회는 로그인 없이도 열리는데
+    송장 데이터만 빈 채로 온다 - 2026-09-02 실측). 구분은 호출자가
+    주문상세 레이어(로그인을 강제한다)를 열어서 한다.
     """
-    trace_url = TRACE_URL.format(order_no=order_no)
-    page = _lookup_page(context)
-    if check_status:
-        _goto_logged_in(page, ORDER_DETAIL_URL.format(order_no=order_no),
-                        expect_selector=DETAIL_TABLE_SELECTOR)
-        if page.locator(DETAIL_TABLE_SELECTOR).count() == 0:
-            raise ParseError(
-                f"주문상세 레이어가 열리지 않습니다 (주문번호={order_no}, "
-                f"열린 주소={page.url}) - 없는 주문번호이거나 화면 구조가 바뀐 것으로 보입니다."
-            )
-        status = _order_status_from_detail(page)
-        if status:
-            # 주문상태를 정확히 읽었으므로 취소/품절 판정을 먼저 한다.
-            raise_if_cancelled(status, order_no)
-            if any(pattern in status for pattern in NOT_YET_STATUSES):
-                raise TrackingNotAvailableYet(
-                    f"아직 발송 전입니다 (주문번호={order_no}, 주문상태={status})."
-                )
-        _goto_settled(page, trace_url)
-    else:
-        _goto_logged_in(page, trace_url, expect_selector=NEXT_DATA_SELECTOR)
     if "tracking.auction.co.kr" not in page.url:
         # 봇 확인 화면이나 오류 페이지로 우회된 것이다 - 그대로 두면
         # '아직 미발급'(스킵)으로 잘못 기록되므로 사유를 정확히 남긴다.
@@ -695,9 +675,7 @@ def _fetch_tracking(context: BrowserContext, order_no: str,
     if info is None:
         fallback = _parse_delivery_text(page)
         if fallback is None:
-            raise TrackingNotAvailableYet(
-                f"배송조회 화면에 아직 송장번호가 없습니다 (주문번호={order_no})."
-            )
+            return None
         tracking_no, raw_courier = fallback
         return TrackingResult(tracking_no=tracking_no, courier=common.normalize_courier(raw_courier))
 
@@ -714,9 +692,7 @@ def _fetch_tracking(context: BrowserContext, order_no: str,
     distinct = {re.sub(r"[^0-9]", "", str(n)) for n in invoice_numbers if str(n).strip()}
     distinct.discard("")
     if not distinct:
-        raise TrackingNotAvailableYet(
-            f"아직 송장번호가 발급되지 않았습니다 (주문번호={order_no})."
-        )
+        return None
     if len(distinct) > 1:
         raise ParseError(
             f"한 주문에 서로 다른 송장번호가 여러 개 있습니다 (주문번호={order_no}) - "
@@ -727,6 +703,69 @@ def _fetch_tracking(context: BrowserContext, order_no: str,
     raw_courier = str(info.get("shippingCompany") or "").strip()
     courier = common.normalize_courier(raw_courier) if raw_courier else DEFAULT_COURIER
     return TrackingResult(tracking_no=distinct.pop(), courier=courier)
+
+
+def _fetch_tracking(context: BrowserContext, order_no: str,
+                    *, check_status: bool = True) -> TrackingResult:
+    """주문번호로 송장을 읽는다. 배송조회부터 열고, 송장이 없을 때만 상태를 확인한다.
+
+    배송조회(tracking.auction.co.kr)는 **아직 발송 전인 주문에서 HTTP 500 오류
+    페이지로 떨어진다**(2026-09-01 실측: 배송준비중 주문 3건 모두, 로그인된
+    진짜 크롬에서도 동일). 그 500 페이지를 예전에는 '아직 미발급'(스킵)으로
+    잘못 읽어서, 주문상세 레이어에서 상태부터 읽고 배송조회를 여는 순서
+    (주문마다 2페이지)로 고쳤었다. 하지만 상태가 필요한 것은 배송조회에 송장이
+    안 나온 주문뿐이라 순서를 뒤집었다 - 발송된 주문(송장이 나오는, 실제로
+    반영까지 가는 주문)은 배송조회 한 페이지로 끝난다(실측 주문당 1.02초 ->
+    0.28초). 송장이 안 나온 주문만 주문상세 레이어에서 정확한 사유
+    (취소/발송 전/없는 주문번호)를 읽는다.
+
+    한 가지 함정: 배송조회는 **로그인 없이도 송장만 빈 채로 열린다**(2026-09-02
+    실측). 그래서 송장이 안 나왔을 때 곧바로 '발송 전'으로 판정하면 로그인이
+    풀린 첫 주문을 오판한다 - 주문상세 레이어(로그인을 강제한다)에서 상태를
+    읽고, 발송 전이 아니면 로그인된 상태로 배송조회를 한 번 더 연다.
+    """
+    trace_url = TRACE_URL.format(order_no=order_no)
+    page = _lookup_page(context)
+    # __NEXT_DATA__는 서버에서 렌더링되어 오므로 기다릴 것이 없다 - 500 페이지에서
+    # expect_selector로 1.5초를 기다리지 않도록 주소 확인만 맡긴다.
+    _goto_logged_in(page, trace_url)
+    result = _parse_trace_page(page, order_no)
+    if result is not None:
+        return result
+
+    if not check_status:
+        # 주문내역 목록에서 이미 발송된 것을 보고 온 주문이다 - 목록을 연 시점에
+        # 로그인도 끝나 있으므로, 송장이 없는 것은 정말 아직 없는 것이다.
+        raise TrackingNotAvailableYet(
+            f"배송조회 화면에 아직 송장번호가 없습니다 (주문번호={order_no})."
+        )
+
+    _goto_logged_in(page, ORDER_DETAIL_URL.format(order_no=order_no),
+                    expect_selector=DETAIL_TABLE_SELECTOR)
+    if page.locator(DETAIL_TABLE_SELECTOR).count() == 0:
+        raise ParseError(
+            f"주문상세 레이어가 열리지 않습니다 (주문번호={order_no}, "
+            f"열린 주소={page.url}) - 없는 주문번호이거나 화면 구조가 바뀐 것으로 보입니다."
+        )
+    status = _order_status_from_detail(page)
+    if status:
+        # 주문상태를 정확히 읽었으므로 취소/품절 판정을 먼저 한다.
+        raise_if_cancelled(status, order_no)
+        if any(pattern in status for pattern in NOT_YET_STATUSES):
+            raise TrackingNotAvailableYet(
+                f"아직 발송 전입니다 (주문번호={order_no}, 주문상태={status})."
+            )
+
+    # 발송 전도 아닌데 송장이 안 나왔었다 - 아까는 로그인이 풀려 있었던 것일 수
+    # 있으므로(위 docstring), 로그인이 확실한 지금 배송조회를 한 번 더 연다.
+    _goto_settled(page, trace_url)
+    result = _parse_trace_page(page, order_no)
+    if result is None:
+        raise TrackingNotAvailableYet(
+            f"아직 송장번호가 발급되지 않았습니다 (주문번호={order_no}"
+            + (f", 주문상태={status})." if status else ").")
+        )
+    return result
 
 
 def _tracking_for_listed_order(context: BrowserContext, order: ListedOrder) -> TrackingResult:
