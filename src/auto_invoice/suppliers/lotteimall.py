@@ -106,6 +106,13 @@ LOGIN_WAIT_TIMEOUT_MS = 5 * 60 * 1000  # 수동 로그인 대기 최대 5분
 AUTO_LOGIN_WAIT_TIMEOUT_MS = 30 * 1000  # 자동 로그인은 사람을 기다리지 않으니 짧게
 
 TRACKING_LINK_TEXT = "배송추적"
+# "배송추적" 링크의 onclick="fn_DeliveryTrace('주문번호','상세번호','hsm')" -
+# 사이트 JS(imall_orderList.js)는 이걸로 아래 주소의 팝업을 연다. 그 페이지는
+# 서버가 그려주므로 팝업을 띄우는 대신 HTML만 받는다 (2026-09-02 실측:
+# 팝업 열고 닫기 2~3초 -> 0.05초).
+TRACE_ONCLICK_PATTERN = re.compile(r"fn_DeliveryTrace\('([^']*)',\s*'([^']*)',\s*'([^']*)'")
+TRACE_URL = ("https://www.lotteimall.com/mypage/DeliveryTrace.lotte"
+             "?ord_no={ord_no}&ord_dtl_no={ord_dtl_no}&use_sct_cd=EC&hsm={hsm}")
 TRACKING_PATTERN = re.compile(r"송장\s*번호\s+([0-9][0-9\-]{5,})")
 COURIER_PATTERN = re.compile(r"택배사\s+([^\n(]+)")
 NOT_YET_PATTERNS = ["주문접수", "결제완료", "상품준비중"]
@@ -250,18 +257,26 @@ def _scrape_popup(popup) -> tuple[str, str]:
     body_text = common.wait_for_match(
         popup, lambda: popup.inner_text("body"), TRACKING_PATTERN, timeout_ms=1000)
 
-    tracking_match = TRACKING_PATTERN.search(body_text)
-    if not tracking_match:
-        raise ParseError("배송추적 팝업에서 송장번호를 찾지 못했습니다.")
-    tracking_no = re.sub(r"[^0-9]", "", tracking_match.group(1))
+    return _parse_trace_text(body_text)
 
-    courier_match = COURIER_PATTERN.search(body_text)
-    courier = common.normalize_courier(courier_match.group(1).strip()) if courier_match else DEFAULT_COURIER
 
-    return tracking_no, courier
+def _trace_page_text(html: str) -> str:
+    """팝업 HTML을 화면 텍스트처럼 - 칸/줄 경계를 줄바꿈으로 바꿔 기존 패턴을 그대로 쓴다."""
+    text = re.sub(r"<(script|style)[^>]*>.*?</\1>", " ", html, flags=re.S)
+    text = re.sub(r"</(td|th|tr|p|div|li|dd|dt)>|<br\s*/?>", "\n", text, flags=re.I)
+    text = re.sub(r"<[^>]+>", " ", text)
+    return "\n".join(re.sub(r"[ \t]+", " ", line).strip() for line in text.splitlines() if line.strip())
 
 
 def _click_tracking_link(context: BrowserContext, link) -> tuple[str, str]:
+    """링크의 onclick에서 팝업 주소를 만들어 HTML만 받는다. 형식이 다르면 예전처럼 팝업을 연다."""
+    match = TRACE_ONCLICK_PATTERN.search(link.get_attribute("onclick") or "")
+    if match:
+        ord_no, ord_dtl_no, hsm = match.groups()
+        html = context.request.get(TRACE_URL.format(
+            ord_no=ord_no.replace("-", ""), ord_dtl_no=ord_dtl_no, hsm=hsm)).text()
+        return _parse_trace_text(_trace_page_text(html))
+
     with context.expect_page(timeout=10000) as popup_info:
         link.click()
     popup = popup_info.value
@@ -269,6 +284,16 @@ def _click_tracking_link(context: BrowserContext, link) -> tuple[str, str]:
         return _scrape_popup(popup)
     finally:
         popup.close()
+
+
+def _parse_trace_text(body_text: str) -> tuple[str, str]:
+    tracking_match = TRACKING_PATTERN.search(body_text)
+    if not tracking_match:
+        raise ParseError("배송추적 팝업에서 송장번호를 찾지 못했습니다.")
+    tracking_no = re.sub(r"[^0-9]", "", tracking_match.group(1))
+    courier_match = COURIER_PATTERN.search(body_text)
+    courier = common.normalize_courier(courier_match.group(1).strip()) if courier_match else DEFAULT_COURIER
+    return tracking_no, courier
 
 
 def _select_link_index_by_order_option(body_text: str, count: int, order_option: str | None) -> int | None:

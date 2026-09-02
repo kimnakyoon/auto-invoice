@@ -190,39 +190,51 @@ def _read_trace_order_no(page: Page) -> str | None:
     return None
 
 
+def _field_values(html: str) -> dict[str, str]:
+    """배송추적 페이지 div.delivery_info 의 <dt>라벨</dt><dd>값</dd> 쌍."""
+    return {label.strip(): _strip_tags(value)
+            for label, value in re.findall(r"<dt>\s*([^<]+?)\s*</dt>\s*<dd>(.*?)</dd>", html, re.S)}
+
+
+def _strip_tags(html: str) -> str:
+    return re.sub(r"\s+", " ", re.sub(r"<[^>]+>", " ", html)).strip()
+
+
 def _fetch_tracking_by_dlv_no(context: BrowserContext, dlv_no: str, order_no: str) -> tuple[str, str]:
-    """배송추적 페이지를 열어 (송장번호, 택배사)를 읽는다."""
-    page = context.new_page()
-    try:
-        page.goto(TRACE_URL.format(dlv_no=dlv_no), wait_until="domcontentloaded")
-        page.wait_for_timeout(1500)
+    """배송추적 페이지를 HTML로 받아 (송장번호, 택배사)를 읽는다.
 
-        if _looks_like_login_page(page):
-            raise BlockedError(f"배송추적 페이지에서 로그인이 풀렸습니다 (주문번호={order_no}).")
+    이 페이지는 서버가 그려서 내려주므로(자바스크립트 필요 없음) 화면을 열지
+    않고 context.request로 받는다 - 새 페이지를 열고 1.5초 자던 예전 방식
+    (2.5초)이 0.3초로 준다 (2026-09-02 실측).
+    """
+    response = context.request.get(TRACE_URL.format(dlv_no=dlv_no))
+    if "login.11st.co.kr" in response.url:
+        raise BlockedError(f"배송추적 페이지에서 로그인이 풀렸습니다 (주문번호={order_no}).")
+    html = response.text()
 
-        trace_order_no = _read_trace_order_no(page)
-        if trace_order_no and trace_order_no != order_no:
-            raise ParseError(
-                f"배송추적 페이지의 주문번호({trace_order_no})가 조회하려던 주문번호({order_no})와 다릅니다."
-            )
+    info_items = [_strip_tags(x) for x in re.findall(r'<p class="prd_info"[^>]*>(.*?)</p>', html, re.S)]
+    trace_order_no = next((item.replace(ORDER_NO_LABEL, "", 1).strip()
+                           for item in info_items if item.startswith(ORDER_NO_LABEL)), None)
+    if trace_order_no and trace_order_no != order_no:
+        raise ParseError(
+            f"배송추적 페이지의 주문번호({trace_order_no})가 조회하려던 주문번호({order_no})와 다릅니다."
+        )
 
-        raw_tracking = _read_field_value(page, TRACKING_FIELD_LABEL)
-        if not raw_tracking:
-            raise TrackingNotAvailableYet(
-                f"배송추적 페이지에 아직 송장번호가 없습니다 (주문번호={order_no}, dlvNo={dlv_no})."
-            )
-        tracking_no = re.sub(r"[^0-9]", "", raw_tracking)
-        if not tracking_no:
-            raise ParseError(f"송장번호를 숫자로 읽지 못했습니다: {raw_tracking!r} (주문번호={order_no}).")
+    fields = _field_values(html)
+    raw_tracking = fields.get(TRACKING_FIELD_LABEL)
+    if not raw_tracking:
+        raise TrackingNotAvailableYet(
+            f"배송추적 페이지에 아직 송장번호가 없습니다 (주문번호={order_no}, dlvNo={dlv_no})."
+        )
+    tracking_no = re.sub(r"[^0-9]", "", raw_tracking)
+    if not tracking_no:
+        raise ParseError(f"송장번호를 숫자로 읽지 못했습니다: {raw_tracking!r} (주문번호={order_no}).")
 
-        raw_courier = _read_field_value(page, COURIER_FIELD_LABEL) or ""
-        # "CJ대한통운 1588-1255" -> "CJ대한통운"
-        courier_name = COURIER_PHONE_PATTERN.sub("", raw_courier).strip()
-        courier = common.normalize_courier(courier_name) if courier_name else DEFAULT_COURIER
-
-        return tracking_no, courier
-    finally:
-        page.close()
+    raw_courier = fields.get(COURIER_FIELD_LABEL) or ""
+    # "CJ대한통운 1588-1255" -> "CJ대한통운"
+    courier_name = COURIER_PHONE_PATTERN.sub("", raw_courier).strip()
+    courier = common.normalize_courier(courier_name) if courier_name else DEFAULT_COURIER
+    return tracking_no, courier
 
 
 def _collect_dlv_nos(page: Page) -> list[tuple[str, str]]:
