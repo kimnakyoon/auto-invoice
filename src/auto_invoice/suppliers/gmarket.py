@@ -42,12 +42,26 @@
 - 비밀번호를 저장하고 싶지 않은 경우를 위해, GMARKET_PW가 비어 있으면
   예전처럼 아이디만 자동 입력하고 사람이 직접 로그인하는 경로로 넘어간다
   (롯데온과 동일).
+- **주문상세 JSON API로 화면 없이 답하기 (2026-09-02 실측).** 주문상세 화면이
+  그려질 때 GET my.gmarket.co.kr/api/pay-detail/<장바구니번호> 를 부르고,
+  거기 data.orderList[] 마다 displayOrderStatusName(배송중/배송준비중),
+  orderDateTime, orderDelivery.tracking{trackingNumber, transCompanyName,
+  transCompleteEstimateDate}, orderItem.itemName / itemOptionList 가 들어
+  있다 - 배송조회 모달(tracking.gmarket.co.kr iframe)을 열 필요가 없다.
+  context.request로 부르면 CDP 크롬의 쿠키를 그대로 써서 0.2초에 온다
+  (화면 방식 0.9초 + 모달). 200/JSON이 아니면(세션 만료, 봇 확인) 예전
+  화면 경로로 가서 로그인·봇 확인을 지나고, 그 뒤 API를 한 번 더 부른다.
+  조회가 JSON GET 하나라 요청 간격도 4910과 같은 근거로 0.5~1.2초.
+  화면 방식은 모달 텍스트의 상품명 끝 상품코드("... 네이비 15151448")까지
+  송장 패턴에 걸려 송장이 하나뿐인 주문을 '여러 송장'으로 오판했다(2026-09-02
+  실주문 2건 확인). JSON에는 송장 필드가 따로 있어 그런 오판이 없다.
 """
 
 from __future__ import annotations
 
 import os
 import re
+from datetime import date, datetime, timedelta, timezone
 from urllib.parse import urlparse
 
 from dotenv import load_dotenv
@@ -60,8 +74,10 @@ from .base import (
     BlockedError,
     ParseError,
     TrackingNotAvailableYet,
+    attach_order_date,
     normalize_option,
     raise_if_cancelled,
+    raise_if_cancelled_any,
     with_order_date,
 )
 
@@ -104,10 +120,13 @@ BOT_CHECK_PATTERNS = ["사람인지 확인", "봇(Bot)이란", "로봇이 아닙
 # 브라우저를 바꾸고 간격은 기본값(1.5~4초)으로 되돌렸다. 실행 중 크롬 창이
 # 하나 뜬다 (옥션과 별도 프로필 auth/chrome_profile_gmarket).
 WANTS_CDP_CHROME = True
-# 요청 간격. 기본(1.5~4초)이면 27건에 74초로, 조회 자체(0.9초/건)보다 간격이
-# 시간의 전부다(2026-09-02 실측). 진짜 크롬(CDP)에서는 봇 확인이 뜨지 않아
-# 조금 좁혔다 - 막히기 시작하면 이 값을 도로 넓히면 된다.
-REQUEST_GAP = (1.0, 2.0)
+# 요청 간격. 조회가 가벼운 JSON GET 하나라(맨 위 docstring) 4910과 같은
+# 근거로 좁게 둔다 - 봇 확인이 뜨기 시작하면 이 값을 도로 넓히면 된다.
+REQUEST_GAP = (0.5, 1.2)
+
+# 주문상세 화면이 부르는 JSON API (맨 위 docstring).
+PAY_DETAIL_API_URL = "https://my.gmarket.co.kr/api/pay-detail/{cart_no}"
+KST = timezone(timedelta(hours=9))
 
 
 def extract_order_id(product_url: str) -> str:
@@ -349,6 +368,82 @@ def _scrape_tracking_from_page(page, order_id: str, order_option: str | None = N
 _LOOKUP_PAGE: dict[int, object] = {}
 
 
+def _kst_date(iso_text: str | None) -> date | None:
+    """API의 ISO 시각("2026-09-01T22:39:38.380Z", UTC)을 한국 날짜로."""
+    if not iso_text:
+        return None
+    try:
+        parsed = datetime.fromisoformat(str(iso_text).replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return parsed.astimezone(KST).date()
+
+
+def _fetch_pay_detail(context: BrowserContext, cart_no: str) -> dict | None:
+    """주문상세 JSON. 세션이 없거나 봇 확인에 걸리면(200/JSON이 아니면) None."""
+    try:
+        response = context.request.get(PAY_DETAIL_API_URL.format(cart_no=cart_no))
+        if response.status != 200 or "json" not in response.headers.get("content-type", ""):
+            return None
+        payload = response.json()
+    except Exception:  # noqa: BLE001 - API가 안 되면 화면 경로가 대신한다
+        return None
+    data = payload.get("data") if isinstance(payload, dict) else None
+    if not isinstance(data, dict) or not data.get("orderList"):
+        return None
+    return data
+
+
+def _option_text(order: dict) -> str:
+    """상품명 + 옵션 값들 - 샵마인 '주문옵션'과 대조할 때 쓴다."""
+    item = order.get("orderItem") or {}
+    parts = [str(item.get("itemName") or "")]
+    for option in item.get("itemOptionList") or []:
+        parts.extend(str(option.get(key) or "") for key in ("itemOptionName", "value1", "value2", "value3"))
+    return " ".join(parts)
+
+
+def _answer_from_pay_detail(data: dict, order_id: str, order_option: str | None) -> TrackingResult:
+    """주문상세 JSON으로 결론을 낸다 (화면 방식과 같은 규칙)."""
+    orders = data.get("orderList") or []
+    statuses = [str(o.get("displayOrderStatusName") or "").strip() for o in orders]
+    order_date = _kst_date(data.get("payDate")) or _kst_date(orders[0].get("orderDateTime"))
+    arrivals = []
+    for o in orders:
+        tracking = (o.get("orderDelivery") or {}).get("tracking") or {}
+        arrival = _kst_date(tracking.get("transCompleteEstimateDate"))
+        if arrival and arrival.isoformat() not in arrivals:
+            arrivals.append(arrival.isoformat())
+    note = " / ".join(f"도착예정 {a}" for a in arrivals) or None
+
+    def fetch() -> TrackingResult:
+        raise_if_cancelled_any(statuses, order_id)
+        shipped = []
+        for o in orders:
+            tracking = (o.get("orderDelivery") or {}).get("tracking") or {}
+            number = re.sub(r"[^0-9]", "", str(tracking.get("trackingNumber") or ""))
+            if number:
+                shipped.append((o, number, str(tracking.get("transCompanyName") or "").strip()))
+        if not shipped:
+            if any(p in status for status in statuses for p in NOT_YET_PATTERNS):
+                raise TrackingNotAvailableYet(f"아직 송장번호가 발급되지 않았습니다 (orderId={order_id}).")
+            raise ParseError(f"주문 응답에 송장번호가 없습니다 (orderId={order_id}, 상태={', '.join(statuses)}).")
+        if len({number for _, number, _ in shipped}) > 1:
+            target = normalize_option(order_option) if order_option else ""
+            matched = [s for s in shipped if target and target in normalize_option(_option_text(s[0]))]
+            if len({number for _, number, _ in matched}) != 1:
+                # 상품별로 나눠 배송된 주문 - 어느 걸 써야 할지 확신할 수 없어 사람이 확인한다.
+                raise ParseError(f"한 주문에 서로 다른 송장번호가 여러 개 있습니다 (orderId={order_id}) - 상품별로 나눠 배송된 것으로 보입니다.")
+            shipped = matched
+        _, tracking_no, company = shipped[0]
+        courier = common.normalize_courier(company) if company else DEFAULT_COURIER
+        return TrackingResult(tracking_no=tracking_no, courier=courier)
+
+    return attach_order_date(order_date, fetch, delivery_note=note)
+
+
 def _lookup_page(context: BrowserContext):
     page = _LOOKUP_PAGE.get(id(context))
     if page is None or page.is_closed():
@@ -362,6 +457,13 @@ def get_tracking(
     context: BrowserContext, product_url: str, headless: bool = True, order_option: str | None = None
 ) -> TrackingResult:
     order_id = extract_order_id(product_url)
+
+    # 화면을 열지 않고 JSON API로 먼저 답한다 (맨 위 docstring). 세션이 없거나
+    # 봇 확인에 걸리면 None - 아래 화면 경로가 로그인/봇 확인을 처리한다.
+    data = _fetch_pay_detail(context, order_id)
+    if data is not None:
+        return _answer_from_pay_detail(data, order_id, order_option)
+
     page = _lookup_page(context)
     page.goto(product_url, wait_until="domcontentloaded")
 
@@ -393,6 +495,11 @@ def get_tracking(
             common.goto_settled(page, product_url)
         if _looks_like_login_page(page):
             raise BlockedError("로그인 후에도 여전히 로그인 페이지입니다.")
+
+    # 로그인/봇 확인을 지났으니 API를 한 번 더 - 그래도 안 되면 화면에서 읽는다.
+    data = _fetch_pay_detail(context, order_id)
+    if data is not None:
+        return _answer_from_pay_detail(data, order_id, order_option)
 
     # 주문상세는 자바스크립트로 그려진다 - 주문번호가 화면에 뜨면 다 그려진 것이다.
     common.wait_for_text(page, order_id)
