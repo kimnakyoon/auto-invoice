@@ -26,6 +26,7 @@ from . import rate_limit
 from .config import load_settings
 from .report import RunReport
 from .shopmine import excel_io
+from .suppliers import common
 from .suppliers.base import AdapterError, BlockedError, OrderCancelled, TrackingNotAvailableYet
 from .suppliers.registry import get_adapter
 
@@ -167,7 +168,14 @@ def _lookup_site(site_key: str, jobs: list, *, settings, headless: bool,
     Playwright sync API 객체는 만든 스레드 밖에서 쓸 수 없어서, 스레드마다
     자기 Playwright를 연다.
     """
-    with sync_playwright() as p, contextlib.ExitStack() as stack:
+    started = time.monotonic()
+    # 전체 시간은 '가장 오래 걸리는 사이트'가 정한다 - 어느 사이트를 손봐야
+    # 하는지 알 수 있게 사이트별 소요 시간을 남긴다.
+    stack_exit = contextlib.ExitStack()
+    stack_exit.callback(
+        lambda: common.safe_print(
+            f"[{site_key}] {len(jobs)}건 조회에 {time.monotonic() - started:.1f}초 걸렸습니다."))
+    with stack_exit, sync_playwright() as p, contextlib.ExitStack() as stack:
         if getattr(jobs[0][1], "WANTS_CDP_CHROME", False):
             # 번들 크로미엄이라는 것 자체로 봇 확인에 걸리는 사이트(옥션)는
             # 우리가 직접 실행한 진짜 크롬(CDP)에서 조회한다 - 창이 하나 뜬다.
