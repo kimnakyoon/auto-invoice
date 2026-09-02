@@ -54,8 +54,10 @@
 
 from __future__ import annotations
 
+import json
 import os
 import re
+from datetime import date, datetime, timedelta, timezone
 from urllib.parse import urlparse
 
 from dotenv import load_dotenv
@@ -69,8 +71,10 @@ from .base import (
     OrderNotFound,
     ParseError,
     TrackingNotAvailableYet,
+    attach_order_date,
     normalize_option,
     raise_if_cancelled,
+    raise_if_cancelled_any,
     with_order_date,
 )
 
@@ -132,6 +136,124 @@ TRACKING_RENDER_TIMEOUT_MS = 2000  # [배송조회] 누른 뒤 송장번호가 �
 REDIRECT_SETTLE_MS = 1200  # 예전 고정 대기(1.2초)와 같은 크기
 
 _second_context_cache: dict[int, BrowserContext] = {}
+
+# ---------------------------------------------------------------------------
+# 주문상세 화면이 부르는 JSON API로 화면 없이 답하기 (2026-09-02 실측)
+# ---------------------------------------------------------------------------
+# 주문상세(SPA)가 그려질 때 세 가지를 부른다. 셋 다 context.request로 그대로
+# 부를 수 있다(0.1초씩):
+#   GET  /orderApi/orderSheet/detail/?orderNo=<주문번호>
+#        -> result.order.orderDateTime(epoch ms), result.productOrders[]
+#           {productOrderNo, productOrderStatusType(PAYED/DELIVERING/...),
+#            exposureStatusType(상품준비중 ...), optionContents, productName}
+#        다른 계정의 주문이면 400 + code "99", 세션이 없으면 403 + code "25"
+#        (result.status "NOT_LOGIN_USER") - 화면 방식의 '목록으로 튕김'과
+#        '로그인 페이지'를 이 둘로 구분한다.
+#   POST /orderApi/orderSheet/detail/assignments {orderNo, claimNos:[]}
+#        -> 화면의 버튼 목록. "배송조회" 버튼의 pcUrl이
+#           /order/delivery/tracking/<productOrderNo>/<deliveryNo> 라서
+#           여기서 deliveryNo를 얻는다 (상세 응답에는 없다).
+#   GET  /orderApi/orderSheet/universal/delivery/tracking/customer
+#           ?deliveryNo=&productOrderNo=
+#        -> result.deliveryTrace[<deliveryNo>].stackTrace
+#           {deliveryCompanyName, invoiceNo}
+# 화면 방식(주문당 5~8초: SPA 렌더 + 튕김 대기 + 모달)이 0.3초로 준다.
+# 발송 전 주문은 첫 호출로 끝난다. 어느 호출이든 예상 밖이면 예전 화면
+# 경로로 간다(로그인은 그쪽이 처리한다).
+DETAIL_API_URL = "https://orders.pay.naver.com/orderApi/orderSheet/detail/?orderNo={order_no}"
+ASSIGNMENTS_API_URL = "https://orders.pay.naver.com/orderApi/orderSheet/detail/assignments"
+TRACKING_API_URL = ("https://orders.pay.naver.com/orderApi/orderSheet/universal/delivery/tracking/customer"
+                    "?deliveryNo={delivery_no}&productOrderNo={product_order_no}")
+TRACK_URL_PATTERN = re.compile(r"/order/delivery/tracking/(\d+)/(\d+)")
+API_HEADERS = {"accept": "application/json, text/plain, */*", "referer": "https://orders.pay.naver.com/"}
+# 조회가 가벼운 JSON 호출 두어 개라 간격을 조금 좁힌다 (지마켓/4910 참고).
+# 네이버는 로그인에 캡차를 거는 곳이라 4910만큼 좁히지는 않는다.
+REQUEST_GAP = (1.0, 2.0)
+KST = timezone(timedelta(hours=9))
+
+
+def _kst_date(epoch_ms) -> date | None:
+    try:
+        return datetime.fromtimestamp(int(epoch_ms) / 1000, tz=KST).date()
+    except (TypeError, ValueError, OSError):
+        return None
+
+
+def _api_json(context: BrowserContext, method: str, url: str, payload: dict | None = None):
+    """(HTTP 상태, JSON 또는 None). 예외는 삼킨다 - 호출한 쪽이 화면 경로로 간다."""
+    try:
+        if method == "POST":
+            response = context.request.post(url, data=json.dumps(payload or {}),
+                                            headers={**API_HEADERS, "content-type": "application/json"})
+        else:
+            response = context.request.get(url, headers=API_HEADERS)
+        body = response.json() if "json" in response.headers.get("content-type", "") else None
+        return response.status, body
+    except Exception:  # noqa: BLE001
+        return 0, None
+
+
+def _fetch_detail(context: BrowserContext, order_no: str) -> tuple[str, dict | None]:
+    """"ok"(result) / "not_mine"(다른 계정 주문) / "login"(세션 없음) / "error"."""
+    status, body = _api_json(context, "GET", DETAIL_API_URL.format(order_no=order_no))
+    code = str((body or {}).get("code") or "")
+    if status == 200 and code == "00" and isinstance((body or {}).get("result"), dict):
+        return "ok", body["result"]
+    if status == 400 and code == "99":
+        return "not_mine", None
+    if status == 403 or code == "25":
+        return "login", None
+    return "error", None
+
+
+def _answer_from_api(context: BrowserContext, detail: dict, order_no: str, order_option: str | None) -> TrackingResult:
+    product_orders = detail.get("productOrders") or []
+    by_no = {str(po.get("productOrderNo")): po for po in product_orders}
+    statuses = [str(po.get("exposureStatusType") or "") for po in product_orders]
+    # 취소는 상태 코드에 더 확실히 드러난다 - 한국어 판정 함수에 그 낱말로 넣어준다.
+    statuses += ["취소" for po in product_orders if "CANCEL" in str(po.get("productOrderStatusType") or "")]
+    order_date = _kst_date((detail.get("order") or {}).get("orderDateTime"))
+    notes = []
+    for po in product_orders:
+        for key, label in (("arrivalGuaranteeDateTime", "도착예정"), ("dispatchDueDateTime", "발송예정")):
+            found = _kst_date(po.get(key))
+            if found and f"{label} {found}" not in notes:
+                notes.append(f"{label} {found}")
+                break
+    note = " / ".join(notes) or None
+
+    def fetch() -> TrackingResult:
+        raise_if_cancelled_any(statuses, order_no)
+        status, body = _api_json(context, "POST", ASSIGNMENTS_API_URL, {"orderNo": order_no, "claimNos": []})
+        if status != 200 or body is None:
+            raise ParseError(f"배송조회 버튼 정보를 받지 못했습니다 (주문번호={order_no}, HTTP {status}).")
+        targets = dict(TRACK_URL_PATTERN.findall(json.dumps(body)))  # productOrderNo -> deliveryNo
+        if not targets:
+            if any(p in status_text for status_text in statuses for p in NOT_YET_PATTERNS):
+                raise TrackingNotAvailableYet(f"아직 송장번호가 발급되지 않았습니다 (주문번호={order_no}).")
+            raise ParseError(f"배송조회 버튼을 찾지 못했습니다 (주문번호={order_no}).")
+        found = []  # (productOrderNo, 송장번호, 택배사)
+        for product_order_no, delivery_no in targets.items():
+            status, body = _api_json(context, "GET", TRACKING_API_URL.format(
+                delivery_no=delivery_no, product_order_no=product_order_no))
+            trace = (((body or {}).get("result") or {}).get("deliveryTrace") or {}).get(delivery_no) or {}
+            stack = trace.get("stackTrace") or {}
+            invoice = re.sub(r"[^0-9]", "", str(stack.get("invoiceNo") or ""))
+            if invoice:
+                found.append((product_order_no, invoice, str(stack.get("deliveryCompanyName") or "").strip()))
+        if not found:
+            raise TrackingNotAvailableYet(f"배송조회는 열리지만 아직 송장번호가 없습니다 (주문번호={order_no}).")
+        if len({invoice for _, invoice, _ in found}) > 1:
+            target = normalize_option(order_option) if order_option else ""
+            matched = [f for f in found if target and target in normalize_option(
+                f"{by_no.get(f[0], {}).get('productName', '')} {by_no.get(f[0], {}).get('optionContents', '')}")]
+            if len({invoice for _, invoice, _ in matched}) != 1:
+                raise ParseError(f"한 주문에 서로 다른 송장번호가 여러 개 있습니다 (주문번호={order_no}) - 상품별로 나눠 배송된 것으로 보입니다.")
+            found = matched
+        _, tracking_no, company = found[0]
+        return TrackingResult(tracking_no=tracking_no, courier=common.normalize_courier(company) if company else "택배")
+
+    return attach_order_date(order_date, fetch, delivery_note=note)
 
 
 def extract_order_no(product_url: str) -> str:
@@ -401,6 +523,14 @@ def _get_tracking_from_account(
     account_label: str,
     order_option: str | None,
 ) -> TrackingResult:
+    # 화면 없이 API로 먼저 답한다 (위 API 주석). 세션이 없거나 API가 예상
+    # 밖이면 아래 화면 경로가 로그인부터 처리한다.
+    kind, detail = _fetch_detail(context, order_no)
+    if kind == "not_mine":
+        raise OrderNotFound(f"이 계정({account_label})에서 주문을 찾을 수 없습니다 (주문번호={order_no}).")
+    if kind == "ok":
+        return _answer_from_api(context, detail, order_no, order_option)
+
     page = context.new_page()
     logged_in = False
     try:
@@ -422,6 +552,13 @@ def _get_tracking_from_account(
                     raise BlockedError(f"네이버페이({account_label}) 로그인 후에도 여전히 로그인 페이지입니다.")
             state_path = browser_mod.state_path(SITE_KEY if account_label == "1" else SECOND_ACCOUNT_STATE_KEY)
             context.storage_state(path=str(state_path))
+
+        # 로그인이 됐으니 API를 한 번 더 - 그래도 안 되면 화면에서 읽는다.
+        kind, detail = _fetch_detail(context, order_no)
+        if kind == "not_mine":
+            raise OrderNotFound(f"이 계정({account_label})에서 주문을 찾을 수 없습니다 (주문번호={order_no}).")
+        if kind == "ok":
+            return _answer_from_api(context, detail, order_no, order_option)
 
         # '다른 계정 주문이라 목록으로 튕기는가'와 '주문상세가 그려졌는가'를
         # 한 번에 지켜본다 - 예전에는 튕김 대기 1.2초를 다 채운 뒤에야 렌더를
