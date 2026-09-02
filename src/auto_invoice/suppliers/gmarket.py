@@ -104,6 +104,10 @@ BOT_CHECK_PATTERNS = ["사람인지 확인", "봇(Bot)이란", "로봇이 아닙
 # 브라우저를 바꾸고 간격은 기본값(1.5~4초)으로 되돌렸다. 실행 중 크롬 창이
 # 하나 뜬다 (옥션과 별도 프로필 auth/chrome_profile_gmarket).
 WANTS_CDP_CHROME = True
+# 요청 간격. 기본(1.5~4초)이면 27건에 74초로, 조회 자체(0.9초/건)보다 간격이
+# 시간의 전부다(2026-09-02 실측). 진짜 크롬(CDP)에서는 봇 확인이 뜨지 않아
+# 조금 좁혔다 - 막히기 시작하면 이 값을 도로 넓히면 된다.
+REQUEST_GAP = (1.0, 2.0)
 
 
 def extract_order_id(product_url: str) -> str:
