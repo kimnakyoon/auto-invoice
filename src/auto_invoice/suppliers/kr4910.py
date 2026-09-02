@@ -72,6 +72,13 @@ SITE_KEY = "4910"
 # 옥션처럼 상품URL만으로 주문을 특정하지 못할 수 있어 수령인 이름도 받는다.
 WANTS_RECIPIENT_NAME = True
 
+# 요청 간격. 기본 간격(1.5~4초)은 화면을 여는 사이트 기준이라 여기엔 과하다 -
+# 이 어댑터가 보내는 것은 4910 웹 화면이 페이지 하나를 열 때 4~5개씩 같은 초에
+# 쏘는 것과 같은 가벼운 JSON GET 하나뿐이고(실측 0.05~0.25초), 봇 확인도 없다
+# (캡차/Cloudflare 없이 istio+CloudFront 직결). 사람이 주문마다 배송조회를
+# 눌러보는 속도(1초 안팎)로만 맞춘다.
+REQUEST_GAP = (0.5, 1.2)
+
 API_HOST = "https://api.a-bly.com"
 LIST_URL = API_HOST + "/aglo/api/orders/?page={page}"
 DETAIL_URL = API_HOST + "/aglo/api/orders/{order_no}/"
@@ -106,7 +113,9 @@ CANCELLED_KEYWORDS = ("취소", "반품", "교환", "환불", "품절")
 
 # 주문목록 캐시. 컨텍스트(=이번 실행의 브라우저)별로 담는다. 한 공급사는
 # 스레드 하나가 맡으므로 잠금은 필요 없다 (29CM와 동일).
-_orders_cache: dict[int, list[dict]] = {}
+# 페이지를 어디까지 읽었는지 같이 담아서, 찾던 주문이 다 나오면 더 읽지 않고
+# 멈췄다가 나중에 더 필요해지면 그 페이지부터 이어 읽는다.
+_orders_cache: dict[int, dict] = {}  # {"orders": [...], "next_page": int, "done": bool}
 # 이 컨텍스트로 지금까지 보낸 API 요청 수. get_tracking이 호출 전후를 비교해
 # '이번 주문은 캐시만으로 답했다'(sent_request=False)를 알아내는 데 쓴다 -
 # 오케스트레이터는 요청을 안 보낸 주문 뒤에 간격(1.5~4초)을 두지 않는다.
@@ -252,31 +261,58 @@ def _api_get(context: BrowserContext, url: str, headless: bool) -> tuple[int, di
     return resp.status, resp.json()
 
 
-def _load_orders(context: BrowserContext, headless: bool) -> list[dict]:
-    """주문목록 전체(최대 LIST_MAX_PAGES 페이지)를 한 번만 읽어 캐시한다."""
-    cached = _orders_cache.get(id(context))
-    if cached is not None:
-        return cached
-    orders: list[dict] = []
-    for page_no in range(1, LIST_MAX_PAGES + 1):
-        _, data = _api_get(context, LIST_URL.format(page=page_no), headless)
+def _load_orders(context: BrowserContext, headless: bool,
+                 want_order_snos: set[str] | None = None) -> list[dict]:
+    """주문목록을 읽어 캐시한다. 필요한 만큼만, 이어서 읽는다.
+
+    want_order_snos를 주면 그 주문번호가 전부 나온 순간 페이지 넘기기를
+    멈춘다 - 목록은 최신순이라 조회할 주문(대개 최근 주문)은 첫 페이지에
+    몰려 있고, 주문이 몇백 건 쌓여도 끝까지 읽을 이유가 없다. 주문번호가
+    유일한 값이라 일찍 멈춰도 결과가 달라질 수 없다.
+
+    반대로 상품번호/옵션으로 **찾아야** 하는 경우(want_order_snos=None)는
+    같은 상품을 여러 고객에게 사준 주문이 뒤 페이지에 더 있을 수 있어서,
+    모호함을 놓치지 않으려면 끝(최대 LIST_MAX_PAGES)까지 읽어야 한다.
+    """
+    state = _orders_cache.setdefault(
+        id(context), {"orders": [], "next_page": 1, "done": False})
+
+    def _missing() -> set[str]:
+        if want_order_snos is None:
+            return set()  # 아래 while 조건에서 done까지 읽게 한다
+        return want_order_snos - {str(o.get("sno")) for o in state["orders"]}
+
+    while not state["done"] and state["next_page"] <= LIST_MAX_PAGES \
+            and (want_order_snos is None or _missing()):
+        _, data = _api_get(context, LIST_URL.format(page=state["next_page"]), headless)
         if data is None:
+            state["done"] = True
             break
-        orders.extend(data.get("orders") or [])
-        if page_no >= int(data.get("max_page_number") or 1):
-            break
-    _orders_cache[id(context)] = orders
-    return orders
+        state["orders"].extend(data.get("orders") or [])
+        if state["next_page"] >= int(data.get("max_page_number") or 1):
+            state["done"] = True
+        state["next_page"] += 1
+    return state["orders"]
 
 
 def prepare_batch(context: BrowserContext, orders, headless: bool = True) -> None:
     """오케스트레이터가 첫 조회 전에 한 번 불러준다 - 주문목록을 미리 읽어둔다.
 
+    상품URL이 전부 주문번호 형태면 그 주문들이 나올 때까지만 읽고, 상품번호/
+    옵션으로 찾아야 하는 건이 하나라도 있으면 전체를 읽는다(_load_orders 참고).
     실패해도 예외를 내보내지 않는다 - get_tracking이 어차피 같은 목록을
     스스로 읽는다(그때 나는 예외가 주문별 실패로 정리된다).
     """
+    wanted: set[str] | None = set()
+    for order in orders:
+        kind, value = parse_product_url(order.product_url)
+        if kind == "order" and wanted is not None:
+            wanted.add(value)
+        else:
+            wanted = None  # 상품번호/옵션 검색이 섞여 있다 - 전체를 읽어야 한다
+            break
     try:
-        loaded = _load_orders(context, headless)
+        loaded = _load_orders(context, headless, want_order_snos=wanted)
         common.safe_print(f"[4910] 주문목록 {len(loaded)}건을 미리 읽었습니다.")
     except Exception as e:  # noqa: BLE001 - 목록을 못 읽으면 주문별 조회에서 다시 시도한다
         common.safe_print(f"[4910] 주문목록을 미리 읽지 못했습니다 ({e}).")
@@ -385,7 +421,10 @@ def _find_candidates(context: BrowserContext, product_url: str, headless: bool,
                      recipient_name: str | None) -> list[tuple[dict, dict]]:
     """상품URL로 (주문, 주문상품) 후보를 모아 하나로 좁혀본다."""
     kind, value = parse_product_url(product_url)
-    orders = _load_orders(context, headless)
+    # 주문번호 형태면 그 번호가 나올 때까지만 목록을 읽는다. 상품번호/옵션으로
+    # 찾는 형태면 모호함(같은 상품을 산 다른 주문)을 놓치지 않게 전체를 읽는다.
+    orders = _load_orders(context, headless,
+                          want_order_snos={value} if kind == "order" else None)
 
     if kind == "order":
         order = next((o for o in orders if str(o.get("sno")) == value), None)
