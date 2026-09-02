@@ -8,6 +8,7 @@
 
 from __future__ import annotations
 
+import time
 from typing import Callable
 
 from .. import browser as browser_mod
@@ -98,6 +99,12 @@ def wait_for_manual_login(page, is_login_page: Callable[[], bool],
 LOGIN_REDIRECT_SETTLE_MS = 1500
 # 로그인 주소는 맞는데 입력창이 아직 안 그려졌을 때 기다리는 시간.
 LOGIN_FORM_SETTLE_MS = 1500
+
+
+def sleep(seconds: float) -> None:
+    """요청 사이 간격용. 페이지 없이 API만 부르는 자리에서 쓴다."""
+    if seconds > 0:
+        time.sleep(seconds)
 
 
 def goto_settled(page, url: str, *, retries: int = 3, settle_ms: int = 1500) -> None:

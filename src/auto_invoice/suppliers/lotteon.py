@@ -22,14 +22,38 @@
   기다리게 된다. 그래서 이 어댑터만 dialog 핸들러를 쓴다.
   (비밀번호는 페이지 JS가 세션별 키로 암호화해 members.lpoint.com으로 보내므로,
   브라우저 없이 requests로 직접 로그인하는 방식은 쓸 수 없다.)
+- **주문목록 API로 성공까지 답하기 (2026-09-02 실측).** 마이롯데 주문내역
+  화면이 부르는 것은 세 가지다:
+    POST pbf.lotteon.com/order/v1/mylotte/getOrderList  {pageNo, prdStrtDt,
+         prdEndDt, searchPdNmBrdNmText:"", odInfwRteCd:"LTON"} -> dataList[]
+         15건/페이지. 항목마다 odNo/odSeq/procSeq, **invcNo(송장번호)**,
+         odAccpDttm(주문일시), dvBgtCnts("9/7(월) 이내 도착확률 90%"),
+         sitmNm(옵션), pdNm(상품명). 오늘 성공한 13건의 송장이 상세 화면
+         값과 전부 같았다.
+    POST pbf.lotteon.com/order/v2/fo/ui/states {orderReqList:[{odNo,odSeq,
+         procSeq}], withDvInfo:"N"} -> data[].stateText.title (상품준비중/
+         출고지시/배송중 ...) - 목록 카드의 상태 글자가 이것이다. 한 번에
+         여러 건을 물을 수 있다.
+    GET  www.lotteon.com/p/delivery/deliverysearch/search?odNo=&odSeq=&invcNo=
+         &procSeq=  - [배송조회] 모달이 여는 페이지. 서버가 그려주는 HTML 안의
+         JSON에 dvcNm("롯데택배")이 있다. 목록 항목에는 택배사명이 없어서
+         (dvMnsCd는 전부 "DPCL") 발송 건마다 이 페이지를 한 번 받는다.
+  위의 Imperva 건(getOrderDetail을 페이지 안에서 연달아 fetch하니 999)이 있어
+  요청 수를 **사람이 화면을 볼 때와 같게** 둔다 - 목록 페이지 수는 [더보기]
+  횟수와 같고, 상태 조회는 한 번, 배송조회는 발송 건마다 한 번(모달을 여는
+  것과 같다). 세 호출 모두 context.request로 보낸다(브라우저 쿠키를 그대로
+  쓴다). 어느 하나라도 200이 아니면 예전의 화면 [더보기] 방식으로 돌아간다.
+  실측: 목록 7페이지 4.8초 + 상태 0.4초 + 배송조회 0.3~0.5초/건. 화면 방식은
+  목록만 17.8초였고 성공 건은 상세를 따로 열었다(2.5초/건).
 """
 
 from __future__ import annotations
 
 import contextlib
+import json
 import os
 import re
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
 from urllib.parse import parse_qs, urlparse
 
 from dotenv import load_dotenv
@@ -38,6 +62,7 @@ from playwright.sync_api import BrowserContext
 from .. import eta as eta_mod
 from .. import order_date as order_date_mod
 from ..models import TrackingResult
+from .. import rate_limit
 from . import common
 from .base import (
     BlockedError,
@@ -95,6 +120,23 @@ _CARD_COUNT_JS = "() => document.querySelectorAll('.orderGroupWrap').length"
 # 목록을 훑는 값이 상세를 여는 것보다 싼 최소 건수. 몇 건 안 되면 그냥 상세를 연다.
 LIST_PREFETCH_MIN_ORDERS = 5
 
+# 주문목록 API (맨 위 docstring). 화면 방식과 요청 수를 같게 유지한다.
+LIST_API_URL = "https://pbf.lotteon.com/order/v1/mylotte/getOrderList"
+STATES_API_URL = "https://pbf.lotteon.com/order/v2/fo/ui/states"
+TRACE_PAGE_URL = ("https://www.lotteon.com/p/delivery/deliverysearch/search"
+                  "?odNo={od_no}&odSeq={od_seq}&invcNo={invc_no}&procSeq={proc_seq}")
+LIST_API_MAX_PAGES = 12        # 15건씩 -> 최대 180건. 못 덮은 주문은 상세 폴백으로.
+LIST_API_LOOKBACK_DAYS = 45    # 발송대상에 남아 있는 주문은 이보다 오래되지 않는다
+TRACE_GAP_SEC = (0.2, 0.4)     # 배송조회 페이지를 연달아 받을 때 사이 간격 (페이지 자체는 0.05초, 실측)
+API_HEADERS = {
+    "accept": "application/json, text/plain, */*",
+    "content-type": "application/json;charset=UTF-8",
+    "referer": "https://www.lotteon.com/",
+}
+# 배송조회 페이지 HTML 안의 JSON은 따옴표가 여러 겹 이스케이프돼 있다
+# ( dvcNm\\\":\\\"롯데택배 ). 백슬래시 개수에 상관없이 잡는다.
+COURIER_NAME_PATTERN = re.compile(r'dvcNm\\*"\s*:\s*\\*"([^"\\]+)')
+
 # 이 상태로 적힌 주문은 송장번호가 아직 없다 - 상세를 열어도 '미발급'만 나온다.
 # 2026-08-31 실측으로 확인한 것만 넣었다(상품준비중 2/2, 출고지시 3/3이 상세에서
 # 미발급). 여기 없는 상태(예: "09/02 도착예정")는 예전처럼 상세를 열어 확인한다.
@@ -141,11 +183,13 @@ def prepare_batch(context: BrowserContext, orders, headless: bool = True) -> Non
     """이번에 조회할 주문들을 주문내역 목록에서 미리 훑어둔다.
 
     오케스트레이터가 이 공급사의 첫 조회 전에 한 번 불러준다. 여기서 읽어둔
-    상태는 get_tracking이 상세를 열기 전에 본다 - '아직 안 나간 주문'이면
-    상세를 아예 열지 않는다.
+    것은 get_tracking이 상세를 열기 전에 본다 - '아직 안 나간 주문'이면
+    상세를 아예 열지 않고, 송장번호까지 읽었으면 성공도 여기서 답한다.
 
-    실패하면 아무것도 읽지 않은 것과 같아서, 모든 주문이 예전처럼 상세를
-    여는 경로로 간다. 그래서 여기서는 어떤 예외도 밖으로 내보내지 않는다.
+    먼저 주문목록 API로 읽고(맨 위 docstring), 거부되면 예전의 화면
+    [더보기] 방식으로 읽는다. 둘 다 실패하면 아무것도 읽지 않은 것과 같아서,
+    모든 주문이 예전처럼 상세를 여는 경로로 간다. 그래서 여기서는 어떤
+    예외도 밖으로 내보내지 않는다.
     """
     wanted = set()
     for order in orders:
@@ -156,6 +200,123 @@ def prepare_batch(context: BrowserContext, orders, headless: bool = True) -> Non
     if len(wanted) < LIST_PREFETCH_MIN_ORDERS:
         return
 
+    found = None
+    try:
+        found = _prefetch_via_api(context, wanted)
+    except Exception as e:  # noqa: BLE001 - API가 안 되면 화면 방식으로
+        common.safe_print(f"[lotteon] 주문목록 API를 읽지 못해 화면 목록으로 대신합니다 ({e}).")
+    if found is None:
+        found = _prefetch_via_ui(context, wanted)
+    if found is None:
+        return
+    _listed_orders[id(context)] = found
+    shipped = sum(1 for card in found.values() if any(it.get("invcNo") for it in card.get("items") or []))
+    common.safe_print(
+        f"[lotteon] 주문내역 목록에서 {len(found)}/{len(wanted)}건을 미리 확인했습니다"
+        f" (송장까지 읽은 건 {shipped}건).")
+
+
+def _post_json(context: BrowserContext, url: str, payload: dict) -> dict | None:
+    """API 한 번. 200이 아니면 None - 호출한 쪽이 화면 방식으로 물러난다."""
+    response = context.request.post(url, data=json.dumps(payload), headers=API_HEADERS)
+    if response.status != 200:
+        common.safe_print(f"[lotteon] {url.rsplit('/', 1)[-1]} 응답이 {response.status}입니다.")
+        return None
+    return response.json()
+
+
+def _prefetch_via_api(context: BrowserContext, wanted: set[str]) -> dict[str, dict] | None:
+    """주문목록 API로 wanted 주문들의 상태·송장·택배사를 읽는다 (docstring)."""
+    today = date.today()
+    rows_by_od: dict[str, list[dict]] = {}
+    for page_no in range(1, LIST_API_MAX_PAGES + 1):
+        data = _post_json(context, LIST_API_URL, {
+            "pageNo": page_no,
+            "prdStrtDt": f"{today - timedelta(days=LIST_API_LOOKBACK_DAYS):%Y%m%d}",
+            "prdEndDt": f"{today:%Y%m%d}",
+            "searchPdNmBrdNmText": "",
+            "odInfwRteCd": "LTON",
+        })
+        if data is None:
+            return None
+        rows = data.get("dataList") or []
+        if not rows:
+            break  # 목록의 끝
+        for row in rows:
+            od_no = str(row.get("odNo") or "")
+            if od_no in wanted:
+                rows_by_od.setdefault(od_no, []).append(row)
+        if not (wanted - rows_by_od.keys()):
+            break
+    if not rows_by_od:
+        return {}
+
+    # 상태 글자(상품준비중/출고지시/배송중 ...)는 별도 API - 한 번에 다 묻는다.
+    req = [{"odNo": r["odNo"], "odSeq": int(r["odSeq"]), "procSeq": int(r["procSeq"])}
+           for rows in rows_by_od.values() for r in rows]
+    states = _post_json(context, STATES_API_URL, {"orderReqList": req, "withDvInfo": "N"})
+    if states is None:
+        return None
+    title_by_key: dict[tuple[str, str, str], str] = {}
+    for d in states.get("data") or []:
+        title = ((d.get("stateText") or {}).get("title") or "").strip()
+        title_by_key[(str(d.get("odNo")), str(d.get("odSeq")), str(d.get("procSeq")))] = title
+
+    found: dict[str, dict] = {}
+    for od_no, rows in rows_by_od.items():
+        items = []
+        for r in rows:
+            items.append({
+                "odSeq": str(r.get("odSeq")), "procSeq": str(r.get("procSeq")),
+                "invcNo": re.sub(r"[^0-9]", "", str(r.get("invcNo") or "")) or None,
+                "option": r.get("sitmNm") or r.get("itmNm") or "",
+                "name": r.get("pdNm") or "",
+                "status": title_by_key.get((od_no, str(r.get("odSeq")), str(r.get("procSeq"))), ""),
+                "eta": (r.get("dvBgtCnts") or "").strip(),
+                "courier": None,
+            })
+        accepted = str(rows[0].get("odAccpDttm") or "")
+        found[od_no] = {
+            # 화면 카드와 같은 모양(date/statuses/etas)으로 둬서 판정 함수를 공유한다.
+            "date": f"{accepted[:4]}.{accepted[4:6]}.{accepted[6:8]}" if len(accepted) >= 8 else "",
+            "statuses": [it["status"] for it in items if it["status"]],
+            "etas": [it["eta"] for it in items if it["eta"]],
+            "items": items,
+        }
+
+    # 택배사명은 발송 건마다 배송조회 페이지에서 읽는다 (같은 송장은 한 번만).
+    courier_by_invc: dict[str, str] = {}
+    for od_no, card in found.items():
+        for it in card["items"]:
+            invc = it["invcNo"]
+            if not invc:
+                continue
+            if invc not in courier_by_invc:
+                if courier_by_invc:
+                    time_sleep = rate_limit.request_gap(*TRACE_GAP_SEC)
+                    common.sleep(time_sleep)
+                courier_by_invc[invc] = _fetch_courier_name(context, od_no, it)
+            it["courier"] = courier_by_invc[invc]
+    return found
+
+
+def _fetch_courier_name(context: BrowserContext, od_no: str, item: dict) -> str | None:
+    """배송조회 페이지 HTML에서 택배사명. 못 읽으면 None - 그 주문은 상세로 간다."""
+    try:
+        response = context.request.get(TRACE_PAGE_URL.format(
+            od_no=od_no, od_seq=item["odSeq"], invc_no=item["invcNo"], proc_seq=item["procSeq"]))
+        if response.status != 200:
+            return None
+        match = COURIER_NAME_PATTERN.search(response.text())
+    except Exception:  # noqa: BLE001 - 택배사명 하나 때문에 목록 전체를 버리지 않는다
+        return None
+    if not match:
+        return None
+    return common.normalize_courier(match.group(1).strip())
+
+
+def _prefetch_via_ui(context: BrowserContext, wanted: set[str]) -> dict[str, dict] | None:
+    """예전 방식 - 마이롯데 주문내역 화면을 [더보기]로 훑는다 (API 폴백)."""
     page = context.new_page()
 
     # [더보기] 한 번에 실제 데이터 요청(getOrderList)은 하나인데, 카드마다
@@ -200,11 +361,10 @@ def prepare_batch(context: BrowserContext, orders, headless: bool = True) -> Non
             if not _wait_for_more_cards(page, before, LIST_MORE_WAIT_MS):
                 break  # 눌러도 더 안 붙으면 목록의 끝이다
 
-        found = {od_no: card for od_no, card in seen.items() if od_no in wanted}
-        _listed_orders[id(context)] = found
-        common.safe_print(f"[lotteon] 주문내역 목록에서 {len(found)}/{len(wanted)}건을 미리 확인했습니다.")
+        return {od_no: card for od_no, card in seen.items() if od_no in wanted}
     except Exception as e:  # noqa: BLE001 - 목록을 못 읽으면 그냥 예전처럼 상세를 연다
         common.safe_print(f"[lotteon] 주문내역 목록을 읽지 못해 주문마다 상세를 엽니다 ({e}).")
+        return None
     finally:
         page.close()
 
@@ -382,6 +542,35 @@ def _select_by_order_option(body_text: str, matches: list, order_option: str | N
     return candidates[0] if len(candidates) == 1 else None
 
 
+def _answer_from_listed(card: dict, od_no: str, order_option: str | None) -> TrackingResult | None:
+    """목록 API가 송장번호와 택배사명까지 읽어뒀으면 상세를 열지 않고 답한다.
+
+    None이면 결론을 못 낸 것이다(송장이 없거나, 여러 송장인데 옵션으로 못
+    고르거나, 택배사명을 못 읽음) - 호출한 쪽이 예전처럼 상세를 연다. 여러
+    송장인 주문은 상세 경로가 같은 규칙(옵션 매칭 -> 사람 확인)으로 처리한다.
+    """
+    shipped = [it for it in card.get("items") or [] if it.get("invcNo")]
+    if not shipped:
+        return None
+    tracking_nos = {it["invcNo"] for it in shipped}
+    if len(tracking_nos) == 1:
+        chosen = shipped[0]
+    else:
+        target = normalize_option(order_option) if order_option else ""
+        matched = [it for it in shipped
+                   if target and target in normalize_option(f"{it.get('name', '')} {it.get('option', '')}")]
+        if len({it["invcNo"] for it in matched}) != 1:
+            return None
+        chosen = matched[0]
+    if not chosen.get("courier"):
+        return None
+    result = TrackingResult(tracking_no=chosen["invcNo"], courier=chosen["courier"])
+    result.order_date = _listed_order_date(card.get("date") or "")
+    result.delivery_note = eta_mod.from_text(" ".join(card.get("statuses") or []) + " " + " ".join(card.get("etas") or []))
+    result.sent_request = False  # 미리 읽어둔 목록으로 답했다 - 새 요청 없음
+    return result
+
+
 def _scrape_tracking_from_page(page, od_no: str, order_option: str | None = None) -> TrackingResult:
     # 버튼을 눌렀으면 송장번호가 화면에 뜰 때까지만 기다린다 - 예전에는 여기서
     # 무조건 1.5초를 잤는데, 실측(실주문 3건) 0.06~0.17초면 떠서 그 차이가
@@ -430,6 +619,9 @@ def get_tracking(
     listed = _listed_orders.get(id(context), {}).get(od_no)
     if listed is not None:
         _raise_if_listed_settled(listed, od_no)
+        answered = _answer_from_listed(listed, od_no, order_option)
+        if answered is not None:
+            return answered
 
     page = context.new_page()
     try:
