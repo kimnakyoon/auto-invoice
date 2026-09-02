@@ -12,7 +12,10 @@
     https://escrow.auction.co.kr/Close/OrderProcessDetailLayer.aspx?order_no=<주문번호>
     https://tracking.auction.co.kr/?orderNo=<주문번호>
 - 로그인이 안 되어 있으면 signin.auction.co.kr/Authenticate/MobileLogin.aspx로
-  리다이렉트된다. 로그인 폼 셀렉터: 아이디 input#typeMemberInputId, 비밀번호
+  리다이렉트된다. 단, **주문목록만** 그렇다 - 주문상세 레이어와 배송조회는
+  세션이 만료되면 signin이 아니라 홈(www.auction.co.kr/?redirect=1)으로 조용히
+  리다이렉트된다(2026-09-02 실측). 그래서 홈으로 밀려난 것도 로그인 만료로
+  판정한다(_bounced_to_home). 로그인 폼 셀렉터: 아이디 input#typeMemberInputId, 비밀번호
   input#typeMemberInputPassword, 로그인 버튼 button#btnLogin (지마켓과 같은
   이베이코리아 통합 로그인이다). 사용자가 "첫 로그인부터 쿠키로 자동 로그인"을
   요청했고, 실제로 아이디+비밀번호를 채우고 로그인 버튼을 자동 클릭해도 캡차나
@@ -292,6 +295,21 @@ def _looks_like_login_page(page: Page) -> bool:
     return page.locator("input[type='password']").count() > 0
 
 
+# 세션이 만료됐을 때 밀려나는 옥션 홈 주소들. 주문목록(OrderProcessList)은
+# signin으로 302되지만, 주문상세 레이어(OrderProcessDetailLayer)와 배송조회는
+# 홈(https://www.auction.co.kr/?redirect=1)으로 **조용히** 리다이렉트된다
+# (2026-09-02 실측 - 어제까지 되던 조회가 세션 만료 하루 만에 이 경로로 전부
+# 실패했다). 홈에는 로그인 폼이 없어 signin 판정으로는 잡히지 않는다.
+_HOME_HOSTS = {"auction.co.kr", "www.auction.co.kr", "m.auction.co.kr"}
+
+
+def _bounced_to_home(page: Page, requested_url: str) -> bool:
+    """escrow/tracking 주소를 요청했는데 옥션 홈으로 밀려났는지 (=세션 만료)."""
+    landed_host = (urlparse(page.url).hostname or "").lower()
+    requested_host = (urlparse(requested_url).hostname or "").lower()
+    return landed_host in _HOME_HOSTS and requested_host not in _HOME_HOSTS
+
+
 def _looks_like_bot_check(page: Page) -> bool:
     try:
         body_text = page.inner_text("body")
@@ -359,19 +377,26 @@ def _goto_logged_in(page: Page, url: str, expect_selector: str | None = None) ->
     때만 잠깐 기다렸다 다시 확인한다 (정상 경로에서는 기다리지 않는다).
     """
     _goto_settled(page, url)
-    if not _looks_like_login_page(page):
+    if not _looks_like_login_page(page) and not _bounced_to_home(page, url):
         if expect_selector is None or page.locator(expect_selector).count() > 0:
             return
         page.wait_for_timeout(1500)
-        if not _looks_like_login_page(page):
+        if not _looks_like_login_page(page) and not _bounced_to_home(page, url):
             return
 
     common.safe_print("[auction] 로그인 세션이 없어 자동 로그인을 시도합니다.")
-    if not _auto_login(page):
-        raise BlockedError("옥션 자동 로그인 후에도 로그인 페이지에서 벗어나지 못했습니다.")
-    _goto_settled(page, url)
+    if _bounced_to_home(page, url):
+        # 홈에는 로그인 폼이 없다 - signin으로 확실히 302되는 주문목록을 거쳐
+        # 로그인 화면으로 간다 (위 _bounced_to_home 주석 참고).
+        _goto_settled(page, ORDER_LIST_URL)
     if _looks_like_login_page(page):
-        raise BlockedError("옥션 로그인 후에도 여전히 로그인 페이지입니다.")
+        if not _auto_login(page):
+            raise BlockedError("옥션 자동 로그인 후에도 로그인 페이지에서 벗어나지 못했습니다.")
+    _goto_settled(page, url)
+    if _looks_like_login_page(page) or _bounced_to_home(page, url):
+        raise BlockedError(
+            f"옥션 로그인 후에도 주문 화면 대신 다른 페이지가 열립니다 (열린 주소={page.url})."
+        )
 
 
 def _open_logged_in(context: BrowserContext, url: str, expect_selector: str | None = None) -> Page:

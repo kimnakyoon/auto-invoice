@@ -30,6 +30,10 @@
   CJONSTYLE_PW가 비어 있으면 예전처럼 아이디만 자동 입력하고 사람이 직접
   로그인하는 경로로 넘어간다. 로그인 세션은 storage_state(쿠키)로 저장되므로
   다음 실행부터는 재로그인 없이 바로 조회된다.
+  로그인 여부 판정은 '로그인 페이지가 아니면 성공' 같은 소극 판정이 아니라
+  로그인된 화면에만 뜨는 "로그아웃" 표시로 확정한다(_login_check_result) -
+  소극 판정은 리다이렉트가 늦으면 만료된 세션을 성공으로 오판해 만료된
+  쿠키를 이식했다(2026-09-02 실행 실패의 원인).
 - 로그인이 계속 실패하면 폼에 사이트 자체 캡차(#reCaptchaWarning /
   #turnstileWarning 경고 문구, "보안메뉴 (CAPTCHA)를 확인해 주세요")가 뜨는데,
   그때는 자동 로그인을 포기하고 사람에게 넘긴다(롯데아이몰과 같은 규칙).
@@ -108,6 +112,8 @@ LOGIN_CHECK_URL = "https://base.cjonstyle.com/p/myzone/orderList?listType=ORDER&
 DEFAULT_COURIER = "택배"  # 택배사명을 못 읽었을 때만 쓰는 기본값
 
 LOGIN_WAIT_TIMEOUT_MS = 5 * 60 * 1000  # 로그인 대기 최대 5분 (사람이 캡차+비번 입력)
+LOGIN_CHECK_SETTLE_MS = 15 * 1000  # orderList가 로그인/마이존 어느 쪽인지 확정될 때까지 대기
+LOGIN_FORM_RENDER_WAIT_MS = 5 * 1000  # 로그인 주소가 된 뒤 폼(입력창)이 그려질 때까지 대기
 TURNSTILE_WAIT_TIMEOUT_MS = 30 * 1000  # "사람인지 확인" 토큰이 저절로 차기를 기다리는 최대 30초
 AUTO_LOGIN_WAIT_TIMEOUT_MS = 30 * 1000  # 자동 로그인 제출 후 결과 대기 최대 30초
 TRACKING_NAV_WAIT_TIMEOUT_MS = 5 * 1000  # 배송조회 클릭 후 페이지 이동 대기 최대 5초
@@ -143,6 +149,35 @@ def _looks_authenticated(page: Page) -> bool:
     비로그인 상태면 로그인 폼이 아니라 홈으로 조용히 리다이렉트되므로,
     로그인 폼 유무가 아니라 마이존 경로에 남아있는지로 판단해야 한다."""
     return MYZONE_PATH_PREFIX in urlparse(page.url).path
+
+
+def _login_check_result(page: Page) -> str:
+    """orderList로 이동한 결과가 어느 쪽인지 **확정될 때까지** 지켜본다.
+
+    돌려주는 값: "authenticated" | "login" | ""(시간 안에 확정 못 함).
+
+    goto 직후에는 주소가 아직 orderList(마이존 경로)라서 주소만으로는 '로그인돼
+    있어서 남아 있는 것'과 '곧 로그인 페이지로 넘어갈 것'을 구분할 수 없다.
+    예전에는 2.5초 자고 '로그인 페이지가 아니면 로그인된 것'으로 봤는데, 크롬
+    첫 실행 직후처럼 리다이렉트가 그보다 늦으면 **만료된 세션을 로그인된 것으로
+    오판**해 만료된 쿠키를 이식하고 성공을 보고했다(2026-09-02 아침 두 번의
+    실행이 전부 이 경로로 실패했다). 그래서 소극 판정 대신, 로그인된 화면에만
+    뜨는 헤더의 "로그아웃"이 보이거나 로그인 주소가 되거나 - 둘 중 하나가 될
+    때까지 기다려서 확정한다 (로그인돼 있으면 0.5초 안에 "로그아웃"이 뜨는 것을
+    확인했다).
+    """
+    elapsed_ms = 0
+    while elapsed_ms < LOGIN_CHECK_SETTLE_MS:
+        if LOGIN_PATH in urlparse(page.url).path:
+            return "login"
+        try:
+            if _looks_authenticated(page) and "로그아웃" in page.inner_text("body"):
+                return "authenticated"
+        except Exception:  # noqa: BLE001 - 이동 중이면 본문을 못 읽는다, 다음 바퀴에 다시
+            pass
+        page.wait_for_timeout(500)
+        elapsed_ms += 500
+    return ""
 
 
 def _wait_until_order_detail(page: Page, order_no: str) -> bool:
@@ -239,12 +274,21 @@ def _auto_login(context: BrowserContext) -> bool:
             page = login_context.pages[0] if login_context.pages else login_context.new_page()
 
             page.goto(LOGIN_CHECK_URL, wait_until="domcontentloaded")
-            page.wait_for_timeout(2500)
-            if not _looks_like_login_page(page):
+            check = _login_check_result(page)
+            if check == "authenticated":
                 # 이 프로필에 로그인이 남아 있으면 쿠키만 옮기고 끝낸다.
                 context.add_cookies(login_context.cookies())
                 return True
+            if check != "login":
+                common.safe_print("[cjonstyle] 로그인 여부를 확정하지 못했습니다 - 직접 로그인으로 넘어갑니다.")
+                return False
 
+            # _login_check_result는 주소가 로그인으로 바뀌는 즉시 돌아오므로,
+            # 그 시점에는 폼이 아직 그려지는 중일 수 있다 - 입력창을 기다려준다.
+            try:
+                page.wait_for_selector(LOGIN_ID_SELECTOR, state="attached", timeout=LOGIN_FORM_RENDER_WAIT_MS)
+            except Exception:  # noqa: BLE001 - 끝내 안 뜨면 아래에서 직접 로그인으로 넘어간다
+                pass
             if page.locator(LOGIN_ID_SELECTOR).count() == 0:
                 common.safe_print("[cjonstyle] 로그인 페이지에서 아이디 입력창을 찾지 못했습니다 - 직접 로그인으로 넘어갑니다.")
                 return False
@@ -267,6 +311,13 @@ def _auto_login(context: BrowserContext) -> bool:
                 # 매번 자면서 이 역할까지 겸했다(common.looks_like_login_page 주석).
                 page.wait_for_timeout(1500)
                 if not _looks_like_login_page(page):
+                    # 로그인 주소를 벗어났다고 세션 쿠키까지 다 깔린 것은 아니다 -
+                    # 리다이렉트 체인 도중에 복사하면 덜 깔린 쿠키가 옮겨진다.
+                    # orderList를 다시 열어 로그인을 확정한 뒤에 옮긴다.
+                    page.goto(LOGIN_CHECK_URL, wait_until="domcontentloaded")
+                    if _login_check_result(page) != "authenticated":
+                        common.safe_print("[cjonstyle] 로그인 결과가 확인되지 않습니다 - 직접 로그인으로 넘어갑니다.")
+                        return False
                     context.add_cookies(login_context.cookies())
                     common.safe_print("[cjonstyle] 자동 로그인에 성공했습니다.")
                     return True
