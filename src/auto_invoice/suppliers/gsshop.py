@@ -65,6 +65,26 @@
   URL은 코드만 알면 그대로 다시 열 수 있어(팝업 클릭을 흉내낼 필요 없이)
   직접 이동해서 택배사명만 이 페이지에서 읽어온다 - 송장번호는 이미
   entry-data에서 얻은 값을 그대로 쓴다(더 신뢰할 수 있는 구조화된 값).
+  이 페이지는 서버가 그려서 내려주므로(자바스크립트 필요 없음) 화면을 열지
+  않고 context.request.get()으로 HTML만 받아 <th>택배업체</th> 다음 칸을
+  읽는다 - 화면을 열고 1초 자던 예전 방식(1.5초)이 0.2~0.4초로 준다
+  (2026-09-02 실측). 그리고 **같은 코드는 같은 택배사**이므로 코드별로 이름을
+  기억해두고, 한 실행 안에서 같은 코드가 다시 나오면 요청 없이 답한다
+  (실측 코드: HD=롯데택배, DH=CJ대한통운).
+
+- **주문목록 한 번으로 여러 건 답하기 (prepare_batch, 2026-09-02 실측).**
+  /ord/dlvcursta/ordList.gs?pageIdx=N 도 주문상세와 똑같이 <script
+  id="entry-data">에 JSON을 심어서 내려준다(ordList[] 각 주문의 ordItemList[]).
+  이 항목이 상세 팝업의 ordItemList 항목과 **필드까지 같다** - invNo /
+  dlvsCoCd / ordItemStExposNm / hopeDlvYn / exposAttrPrdNm / exposPrdNm /
+  ordDt / dlvGuideStr / dlvGuideDt 전부 (배송준비중 3건·배송완료 1건·수거중
+  1건 대조, 배송 관련 값은 모두 일치). 그래서 상세 팝업 대신 목록 항목을
+  같은 파서(_select_item)에 넣어 성공까지 목록으로 답한다. 기본 조회 기간은
+  최근 1개월, 20건씩이고(1.2~1.5초/페이지), 필요한 주문이 다 나올 때까지만
+  넘긴다. 목록에 없는 주문(1개월보다 오래됨 등)만 예전처럼 상세로 간다.
+  출고/도착 예정 문구는 상세 화면 텍스트 대신 항목의 dlvGuideStr+dlvGuideDt
+  ("배송예정일" + "9/5(토)까지<br/>도착예정")를 같은 파서(eta.from_text)에
+  넣어 상세와 같은 문구를 만든다.
 """
 
 from __future__ import annotations
@@ -78,12 +98,16 @@ from dotenv import load_dotenv
 from playwright.sync_api import BrowserContext
 
 from .. import browser as browser_mod
+from .. import eta as eta_mod
+from .. import order_date as order_date_mod
 from ..models import TrackingResult
 from . import common
 from .base import (
+    AdapterError,
     BlockedError,
     ParseError,
     TrackingNotAvailableYet,
+    attach_order_date,
     normalize_option,
     raise_if_cancelled,
     with_order_date,
@@ -114,6 +138,29 @@ TRACE_PATH = "/ord/dlvcursta/popup/dlvTrace.gs?ordNo={ord_no}&ordItemId={ord_ite
 
 DEFAULT_COURIER = "택배"  # 배송현황조회 팝업에서 택배사명을 못 읽었을 때만 쓰는 기본값
 
+# 주문상세/주문목록 페이지가 <script type="application/json" id="entry-data">에
+# 심어 내려주는 JSON. 화면을 열지 않고 HTML만 받아 여기서 바로 꺼낸다.
+ENTRY_DATA_PATTERN = re.compile(r'<script[^>]*id="entry-data"[^>]*>(.*?)</script>', re.S)
+
+# 배송현황조회 팝업 HTML의 "<th>택배업체</th><td> 롯데택배 대표번호 : ..." 칸.
+COURIER_CELL_PATTERN = re.compile(r"<th>\s*택배업체\s*</th>\s*<td>\s*([^<\n]+)")
+
+# 한 실행 안에서 이미 알아낸 {dlvsCoCd: 택배사명}. 같은 코드는 같은 택배사라
+# 두 번째부터는 배송현황조회 팝업을 열지 않는다.
+_courier_by_code: dict[str, str] = {}
+
+# ---------------------------------------------------------------------------
+# 주문목록 한 번으로 여러 건 답하기 (prepare_batch) - 맨 위 docstring 참고.
+# ---------------------------------------------------------------------------
+ORDER_LIST_PATH = "/ord/dlvcursta/ordList.gs?pageIdx={page}"
+LIST_MAX_PAGES = 5            # 20건씩 -> 최대 100건. 못 덮은 주문은 상세 폴백으로.
+LIST_PREFETCH_MIN_ORDERS = 2  # 1건이면 목록이나 상세나 요청 하나라 이득이 없다.
+
+# prepare_batch가 읽어둔 {"<주문번호>:<주문유형>": 목록의 그 주문 JSON}.
+# 컨텍스트(=이번 실행의 브라우저)별로 담는다. 반품(R) 주문은 원주문과 번호가
+# 달라 섞이지 않지만, URL의 ecOrdTypCd까지 같이 키로 써서 확실히 가른다.
+_listed_orders: dict[int, dict[str, dict]] = {}
+
 LOGIN_WAIT_TIMEOUT_MS = 5 * 60 * 1000  # 수동 로그인 대기 최대 5분
 # 로그인 리다이렉트는 두 단계로 온다(2026-09-02 실측): 주문상세 -> 302 ->
 # /cust/login/popup/login.gs(입력창이 하나도 없는 빈 중간 페이지) -> 자바스크립트
@@ -126,9 +173,6 @@ CHECKBOX_WAIT_TIMEOUT_MS = 5 * 60 * 1000  # 사람이 체크박스를 누르기�
 # 체크박스가 의심스러울 때 구글이 띄우는 이미지 고르기 화면(평소엔 숨어 있다).
 RECAPTCHA_CHALLENGE_FRAME = "iframe[src*='bframe']"
 
-# "택배업체\t롯데택배 대표번호 : 1588-2121" 형태 - 대표번호가 없는 택배사도
-# 있을 수 있어(예: 편의점 락커 배송) "대표번호"가 없으면 줄 끝까지를 쓴다.
-COURIER_PATTERN = re.compile(r"택배업체[\t ]*([^\n]+?)(?:\s+대표번호|$)", re.MULTILINE)
 NOT_YET_PATTERNS = ["결제완료", "상품준비중", "배송준비중", "주문확인중", "입금대기"]
 
 
@@ -139,6 +183,92 @@ def extract_order_no(product_url: str) -> str:
     if not values:
         raise ParseError(f"URL에서 ordNo 파라미터를 찾을 수 없습니다: {product_url}")
     return values[0]
+
+
+def extract_order_type(product_url: str) -> str:
+    """URL의 ecOrdTypCd (S=일반 주문, R=반품). 없으면 S로 본다."""
+    values = parse_qs(urlparse(product_url).query).get("ecOrdTypCd")
+    return values[0] if values else "S"
+
+
+def _list_key(ord_no: str, order_type: str) -> str:
+    return f"{ord_no}:{order_type}"
+
+
+def _fetch_entry_data(context: BrowserContext, url: str) -> tuple[str, dict | None]:
+    """화면을 열지 않고 HTML만 받아 entry-data JSON을 꺼낸다.
+
+    (최종 주소, JSON)을 돌려준다 - 세션이 만료됐으면 최종 주소가 로그인
+    주소이고 JSON은 None이다.
+    """
+    response = context.request.get(url)
+    match = ENTRY_DATA_PATTERN.search(response.text())
+    if not match:
+        return response.url, None
+    return response.url, json.loads(match.group(1))
+
+
+def _is_login_url(url: str) -> bool:
+    return "/cust/login/" in urlparse(url).path
+
+
+def prepare_batch(context: BrowserContext, orders, headless: bool = True) -> None:
+    """이번에 조회할 주문들을 주문목록 JSON으로 미리 통째로 읽어둔다.
+
+    오케스트레이터가 이 공급사의 첫 조회 전에 한 번 불러준다. 실패하면(세션
+    만료 포함) 아무것도 읽지 않은 것과 같아서 모든 주문이 예전처럼 상세
+    경로로 간다 - 그래서 어떤 예외도 밖으로 내보내지 않는다.
+    """
+    wanted: dict[str, str] = {}  # 목록 키 -> 상품URL (로그인이 필요할 때 하나 쓴다)
+    for order in orders:
+        try:
+            wanted[_list_key(extract_order_no(order.product_url),
+                             extract_order_type(order.product_url))] = order.product_url
+        except ParseError:
+            continue  # 이런 주문은 어차피 상세 경로에서 같은 이유로 실패한다
+    if len(wanted) < LIST_PREFETCH_MIN_ORDERS:
+        return
+
+    sample_url = next(iter(wanted.values()))
+    origin = extract_origin(sample_url)
+    try:
+        found: dict[str, dict] = {}
+        for page_no in range(1, LIST_MAX_PAGES + 1):
+            list_url = origin + ORDER_LIST_PATH.format(page=page_no)
+            final_url, entry = _fetch_entry_data(context, list_url)
+            if page_no == 1 and _is_login_url(final_url):
+                # 세션이 만료됐으면 여기서 한 번 로그인해둔다 - 실패하면 조용히
+                # 물러나고, 사유는 상세 경로의 로그인 시도가 주문별로 남긴다.
+                if not _auto_login(context, sample_url, headless=headless):
+                    return
+                final_url, entry = _fetch_entry_data(context, list_url)
+            listed = (entry or {}).get("ordList") or []
+            if not listed:
+                break  # 목록의 끝(빈 페이지) - 못 찾은 건은 상세 폴백으로
+            for order in listed:
+                found[_list_key(str(order.get("ordNo")), str(order.get("ecOrdTypCd") or "S"))] = order
+            if not (wanted.keys() - found.keys()):
+                break
+        _listed_orders[id(context)] = found
+        common.safe_print(
+            f"[gsshop] 주문목록에서 {len(wanted.keys() & found.keys())}/{len(wanted)}건을 미리 읽었습니다.")
+    except Exception as e:  # noqa: BLE001 - 목록을 못 읽으면 그냥 상세 경로로 간다
+        common.safe_print(f"[gsshop] 주문목록을 읽지 못해 주문마다 상세 화면을 엽니다 ({e}).")
+
+
+def _strip_tags(html: str | None) -> str:
+    return re.sub(r"\s+", " ", re.sub(r"<[^>]+>", " ", html or "").replace("&nbsp;", " ")).strip()
+
+
+def _delivery_note_of(order: dict) -> str | None:
+    """목록 항목의 안내 문구("배송예정일" + "9/5(토)까지<br/>도착예정")를 상세
+    화면 텍스트와 같은 파서에 넣어 같은 문구를 만든다."""
+    lines = []
+    for item in order.get("ordItemList") or []:
+        line = _strip_tags(f"{item.get('dlvGuideStr') or ''} {item.get('dlvGuideDt') or ''}")
+        if line:
+            lines.append(line)
+    return eta_mod.from_text("\n".join(lines)) if lines else None
 
 
 def extract_origin(product_url: str) -> str:
@@ -436,15 +566,49 @@ def _select_item(entry: dict, ord_no: str, order_option: str | None) -> dict:
     return shipped[0]
 
 
-def _fetch_courier_name(page, origin: str, ord_no: str, ord_item_id: str) -> str:
-    trace_url = origin + TRACE_PATH.format(ord_no=ord_no, ord_item_id=ord_item_id)
-    page.goto(trace_url, wait_until="domcontentloaded")
-    page.wait_for_timeout(1000)
-    body_text = page.inner_text("body")
-    match = COURIER_PATTERN.search(body_text)
+def _courier_name(context: BrowserContext, origin: str, ord_no: str, item: dict) -> tuple[str, bool]:
+    """상품의 택배사명과, 그걸 알아내려고 요청을 보냈는지.
+
+    dlvsCoCd가 이미 아는 코드면 요청 없이 답한다. 아니면 배송현황조회 팝업
+    HTML만 받아 "택배업체" 칸을 읽고 코드별로 기억해둔다(맨 위 docstring).
+    """
+    code = str(item.get("dlvsCoCd") or "").strip()
+    if code and code in _courier_by_code:
+        return _courier_by_code[code], False
+
+    trace_url = origin + TRACE_PATH.format(ord_no=ord_no, ord_item_id=item["ordItemId"])
+    html = context.request.get(trace_url).text()
+    match = COURIER_CELL_PATTERN.search(html)
     if not match:
-        return DEFAULT_COURIER
-    return common.normalize_courier(match.group(1).strip())
+        return DEFAULT_COURIER, True
+    courier = common.normalize_courier(match.group(1).strip())
+    if code:
+        _courier_by_code[code] = courier
+    return courier, True
+
+
+def _answer_from_list(context: BrowserContext, order: dict, ord_no: str, origin: str,
+                      order_option: str | None) -> TrackingResult:
+    """미리 읽어둔 주문목록 항목으로 결론을 낸다 - 상세 팝업과 같은 구조라
+    같은 파서(_select_item)를 쓴다. 택배사명 때문에 요청을 보낸 경우만
+    sent_request=True로 표시해서 오케스트레이터가 간격을 지키게 한다."""
+    sent_request = False
+
+    def fetch() -> TrackingResult:
+        nonlocal sent_request
+        item = _select_item(order, ord_no, order_option)
+        tracking_no = re.sub(r"[^0-9]", "", str(item["invNo"]))
+        courier, sent_request = _courier_name(context, origin, ord_no, item)
+        return TrackingResult(tracking_no=tracking_no, courier=courier)
+
+    try:
+        result = attach_order_date(order_date_mod.from_json(order), fetch,
+                                   delivery_note=_delivery_note_of(order))
+    except AdapterError as e:
+        e.sent_request = sent_request
+        raise
+    result.sent_request = sent_request
+    return result
 
 
 def get_tracking(
@@ -452,6 +616,14 @@ def get_tracking(
 ) -> TrackingResult:
     ord_no = extract_order_no(product_url)
     origin = extract_origin(product_url)
+
+    # 주문목록에서 이미 통째로 읽어둔 주문이면 상세 팝업을 열지 않고 여기서
+    # 끝낸다 (prepare_batch). 목록에 없던 주문(1개월보다 오래됨 등)만 상세로.
+    listed = _listed_orders.get(id(context), {}).get(
+        _list_key(ord_no, extract_order_type(product_url)))
+    if listed is not None:
+        return _answer_from_list(context, listed, ord_no, origin, order_option)
+
     page = context.new_page()
     try:
         page.goto(product_url, wait_until="domcontentloaded")
@@ -485,7 +657,7 @@ def get_tracking(
         def fetch() -> TrackingResult:
             item = _select_item(entry, ord_no, order_option)
             tracking_no = re.sub(r"[^0-9]", "", str(item["invNo"]))
-            courier = _fetch_courier_name(page, origin, ord_no, str(item["ordItemId"]))
+            courier, _ = _courier_name(context, origin, ord_no, item)
             return TrackingResult(tracking_no=tracking_no, courier=courier)
 
         # 주문일은 화면 텍스트에서 라벨을 찾는 것보다 entry-data(JSON)에서
