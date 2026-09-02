@@ -68,6 +68,9 @@ LOGIN_SUCCESS_CODE = "0000"
 
 DOMAINS = {"digital-akplaza.com", "www.digital-akplaza.com"}
 SITE_KEY = "akplaza"
+# 요청 간격. 조회가 주문상세 API 호출 하나(0.1~0.3초)라 기본 간격(1.5~4초)이
+# 시간의 전부였다 - 4910과 같은 근거로 좁힌다 (2026-09-02).
+REQUEST_GAP = (0.5, 1.2)
 
 ORDER_DETAIL_URL = "https://www.digital-akplaza.com/mypage/orderList/{order_no}"
 
