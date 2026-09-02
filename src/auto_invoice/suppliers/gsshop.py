@@ -115,6 +115,12 @@ TRACE_PATH = "/ord/dlvcursta/popup/dlvTrace.gs?ordNo={ord_no}&ordItemId={ord_ite
 DEFAULT_COURIER = "택배"  # 배송현황조회 팝업에서 택배사명을 못 읽었을 때만 쓰는 기본값
 
 LOGIN_WAIT_TIMEOUT_MS = 5 * 60 * 1000  # 수동 로그인 대기 최대 5분
+# 로그인 리다이렉트는 두 단계로 온다(2026-09-02 실측): 주문상세 -> 302 ->
+# /cust/login/popup/login.gs(입력창이 하나도 없는 빈 중간 페이지) -> 자바스크립트
+# -> /cust/login/login.gs(실제 폼). 첫 단계 주소도 "/cust/login/"이라 로그인
+# 판정은 즉시 나는데, 그 순간에는 아직 폼이 없다 - 폼이 붙을 때까지 이만큼
+# 기다린다(실측 0.5초 안에 붙는다).
+LOGIN_FORM_WAIT_MS = 10 * 1000
 AUTO_LOGIN_WAIT_TIMEOUT_MS = 30 * 1000  # 사람 손이 필요 없는 구간은 짧게
 CHECKBOX_WAIT_TIMEOUT_MS = 5 * 60 * 1000  # 사람이 체크박스를 누르기를 기다리는 시간
 # 체크박스가 의심스러울 때 구글이 띄우는 이미지 고르기 화면(평소엔 숨어 있다).
@@ -150,14 +156,32 @@ def extract_origin(product_url: str) -> str:
 def _looks_like_login_page(page) -> bool:
     """로그인이 필요해 로그인 화면으로 넘어갔는지.
 
-    로그인 리다이렉트는 보통 /cust/login/login.gs 로 오지만, Playwright 기본
-    headless UA일 때는 /cust/login/popup/login.gs 로 오고 그 화면은 로그인 폼이
-    아니라 에러 페이지다(docstring 참고). 둘 다 "로그인이 필요하다"는 뜻이라
-    경로 접두사로 함께 판정한다 - 예전처럼 비밀번호 입력창 존재까지 요구하면
-    폼이 없는 후자를 놓쳐서, 로그인 안내 대신 엉뚱한 파싱 오류가 났다.
+    로그인 리다이렉트는 /cust/login/popup/login.gs(빈 중간 페이지)를 거쳐
+    /cust/login/login.gs(실제 폼)로 온다. Playwright 기본 headless UA일 때는
+    중간 페이지에서 멈추고 그 화면은 에러 페이지다(docstring 참고). 둘 다
+    "로그인이 필요하다"는 뜻이라 경로 접두사로 함께 판정한다 - 예전처럼 비밀번호
+    입력창 존재까지 요구하면 폼이 없는 후자를 놓쳐서, 로그인 안내 대신 엉뚱한
+    파싱 오류가 났다. 대신 폼이 필요한 쪽은 _wait_for_login_form()으로 따로
+    기다린다 - 판정 직후에는 아직 중간 페이지일 수 있기 때문이다.
     """
     return common.looks_like_login_page(
         page, lambda url: "/cust/login/" in urlparse(url).path, needs_password=False)
+
+
+def _wait_for_login_form(page) -> bool:
+    """로그인 판정 뒤 실제 폼(아이디 입력창)이 붙을 때까지 기다린다.
+
+    2026-09-02에 자동 로그인이 매번 "아이디 입력창을 찾지 못했습니다"로 빠지던
+    원인이다 - 판정은 중간 페이지(popup/login.gs) 주소에서 바로 나는데, 폼은
+    그 뒤 자바스크립트 리다이렉트로 0.5초쯤 뒤에야 나타난다. 예전에는 판정
+    자체가 1.5초를 자고 시작해서 우연히 가려져 있었다(common.looks_like_login_page
+    주석 참고).
+    """
+    try:
+        page.wait_for_selector(LOGIN_ID_SELECTOR, state="attached", timeout=LOGIN_FORM_WAIT_MS)
+        return True
+    except Exception:
+        return False
 
 
 def _prefill_login_id(page) -> None:
@@ -261,9 +285,10 @@ def _login_in_window(
         context.add_cookies(login_context.cookies())
         return True
 
-    if page.locator(LOGIN_ID_SELECTOR).count() == 0:
+    if not _wait_for_login_form(page):
         common.safe_print(
-            "[gsshop] 로그인 페이지에서 아이디 입력창을 찾지 못했습니다 - 직접 로그인으로 넘어갑니다."
+            f"[gsshop] 로그인 페이지에서 아이디 입력창을 찾지 못했습니다({page.url}) "
+            "- 직접 로그인으로 넘어갑니다."
         )
         return False
 
@@ -443,6 +468,7 @@ def get_tracking(
                     "scripts/import_chrome_session.py로 크롬 세션을 가져와주세요."
                 )
             else:
+                _wait_for_login_form(page)  # 중간 페이지라면 폼이 올 때까지 잠깐
                 _prefill_login_id(page)
                 common.safe_print("[gsshop] 아이디는 자동으로 입력했습니다. 뜬 브라우저 창에서 비밀번호를 입력하고 로그인해주세요.")
                 common.safe_print("[gsshop] 로그인이 완료되면 자동으로 이어서 진행합니다 (최대 5분 대기).")
