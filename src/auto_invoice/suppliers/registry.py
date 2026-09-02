@@ -21,6 +21,7 @@ from . import (
     gmarket,
     gsshop,
     hmall,
+    kr4910,
     lotteimall,
     lotteon,
     musinsa,
@@ -60,6 +61,7 @@ register(ssfshop)
 register(wconcept)
 register(posty)
 register(cm29)
+register(kr4910)
 # 새 공급사 추가 예시:
 # from . import newsupplier
 # register(newsupplier)
