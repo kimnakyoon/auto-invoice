@@ -10,9 +10,11 @@
   자동 로그인을 요청했고, 실제로 아이디+비밀번호를 채우고 로그인 버튼을 자동
   클릭해도 reCAPTCHA 등에 막히지 않는 것을 확인했다 (SSG/더현대와 동일한
   패턴). 그래서 NSMALL_ID/NSMALL_PW 환경변수로 완전 자동 로그인한다. 로그인
-  세션은 storage_state(쿠키)로 저장되므로 최초 1회만 자동 로그인하면 이후
-  실행부터는 쿠키로 재로그인 없이 바로 조회된다 (사용자가 원한 "쿠키로 자동
-  로그인").
+  세션은 storage_state(localStorage의 refresh_token)로 저장되지만 그 토큰의
+  수명이 30분이라(2026-09-03 디코드), 실행 사이가 30분 넘게 벌어지면 첫 주문
+  에서 자동 로그인을 다시 탄다 (같은 실행 안의 나머지 주문은 바로 조회된다).
+  로그인 여부는 주소가 아니라 화면(주문번호 vs 비밀번호 입력창)으로 판정한다
+  - 자세한 사연은 _wait_for_order_or_login 참고.
 - 주문상세 페이지의 "배송조회" 버튼을 클릭하면 새 탭이 아니라 같은 페이지 위에
   모달(role=dialog, class에 modal-delivery-state 포함)이 뜨고, 그 안에서
   GET https://mapi.nsmall.com/or/api/v1/order/order/order-dlvr-detail-with-gift
@@ -81,19 +83,57 @@ def extract_order_no(product_url: str) -> str:
     return values[0]
 
 
-def _looks_like_login_page(page: Page) -> bool:
-    # 이 사이트는 자바스크립트로 로그인 화면에 넘긴다(실측: goto 직후에는 아직
-    # 주문상세 주소) - 그래서 주소가 바뀌는지 잠깐 지켜본다.
-    return common.looks_like_login_page(
-        page, lambda url: urlparse(url).path.rstrip("/") == "/customer/login",
-        settle_ms=common.LOGIN_REDIRECT_SETTLE_MS)
+SCREEN_ORDER = "order"   # 주문상세가 그려졌다 (주문번호가 화면에 있다)
+SCREEN_LOGIN = "login"   # 로그인 화면이다 (비밀번호 입력창이 있다)
+SCREEN_NONE = "none"     # 시간 안에 둘 다 안 나왔다
 
 
-def _auto_login(page: Page) -> bool:
+def _wait_for_order_or_login(page: Page, order_no: str, timeout_ms: int, poll_ms: int = 100) -> str:
+    """주문상세가 그려지거나 로그인 화면이 뜨거나, 둘 중 먼저 오는 쪽을 알려준다.
+
+    이 사이트는 서버가 302로 넘기지 않고 화면의 자바스크립트가 로그인 상태를
+    확인한 뒤 로그인 화면으로 넘긴다. 실측(2026-09-03, 만료된 토큰): 주문상세
+    주소로 들어가 0.7초에 토큰이 지워지고 1.2초에 로그인 폼이 그려진 뒤 1.3초에
+    주소가 바뀐다. 예전에는 '주소가 로그인으로 바뀌는지 1.5초 지켜보기'로
+    판정했는데, 두 가지가 문제였다.
+
+    - 로그인이 살아 있는 평소에는 주소가 안 바뀌니 1.5초를 꼬박 기다렸다.
+      주문상세는 0.3~0.6초면 다 그려지는데 매 주문 1초 남짓을 버린 셈이다.
+    - 느린 날에 넘어가는 데 1.5초를 넘기면 '로그인 아님'으로 보고, 주문 정보가
+      아직 없는 화면을 읽어 엉뚱한 사유("배송조회 버튼 없음")로 실패했다.
+      2026-09-03 17:24 실행에서 '상품 준비 중'인 주문이 그렇게 기록됐다.
+
+    그래서 주소 대신 화면을 본다 - 주문번호가 찍히면 주문상세이고, 비밀번호
+    입력창이 생기면 로그인 화면이다. 어느 쪽이든 나타나는 즉시 끝난다.
+    """
+    waited_ms = 0
+    while True:
+        try:
+            if order_no in page.inner_text("body"):
+                return SCREEN_ORDER
+        except Exception:  # noqa: BLE001 - 그리는 중에는 읽기가 실패할 수 있다
+            pass
+        if page.locator(LOGIN_PW_SELECTOR).count() > 0:
+            return SCREEN_LOGIN
+        if waited_ms >= timeout_ms:
+            return SCREEN_NONE
+        page.wait_for_timeout(poll_ms)
+        waited_ms += poll_ms
+
+
+def _auto_login(page: Page) -> None:
     """NSMALL_ID/NSMALL_PW로 완전 자동 로그인한다 (사용자 명시 요청).
 
     SSG/더현대 어댑터와 동일한 패턴 - NS홈쇼핑은 자동 클릭 로그인이 reCAPTCHA
-    등에 막히지 않는 것을 확인했다.
+    등에 막히지 않는 것을 확인했다. 로그인 버튼을 누른 뒤에는 로그인 폼이
+    사라질 때까지만 기다린다(예전에는 1.5초 자고 주소를 1.5초 지켜보기를
+    반복해 최소 3초가 걸렸다). 로그인이 되면 사이트가 joinRedirectUri의
+    주문상세로 스스로 넘어간다.
+
+    저장해 둔 세션으로 로그인이 유지되는 시간은 짧다 - refresh_token(JWT)의
+    수명이 30분이라(2026-09-03 디코드), 지난 실행에서 30분이 넘게 지났으면
+    첫 주문에서 반드시 이 경로를 탄다. 같은 실행 안의 나머지 주문은 새 토큰으로
+    바로 조회된다.
     """
     login_id = os.environ.get("NSMALL_ID")
     login_pw = os.environ.get("NSMALL_PW")
@@ -105,16 +145,42 @@ def _auto_login(page: Page) -> bool:
     page.fill(LOGIN_ID_SELECTOR, login_id)
     page.fill(LOGIN_PW_SELECTOR, login_pw)
     page.click(LOGIN_BUTTON_SELECTOR)
+    try:
+        page.wait_for_selector(LOGIN_PW_SELECTOR, state="detached", timeout=LOGIN_WAIT_TIMEOUT_MS)
+    except Exception as e:  # noqa: BLE001 - 시간 안에 로그인 화면을 못 벗어났다
+        raise BlockedError("NS홈쇼핑 자동 로그인 후에도 로그인 페이지에서 벗어나지 못했습니다.") from e
 
-    elapsed_ms = 0
-    while elapsed_ms < LOGIN_WAIT_TIMEOUT_MS:
-        # 로그인이 끝나기를 기다리는 쉼 - 예전에는 _looks_like_login_page가
-        # 매번 자면서 이 역할까지 겸했다(common.looks_like_login_page 주석).
-        page.wait_for_timeout(1500)
-        if not _looks_like_login_page(page):
-            return True
-        elapsed_ms += 1500
-    return False
+
+def _open_order_screen(page: Page, product_url: str, order_no: str) -> None:
+    """주문상세 화면이 그려질 때까지 책임진다 - 로그인이 필요하면 하고,
+    늦게 그려지면 한 번 다시 불러보고, 끝내 안 되면 그 사유로 실패시킨다.
+
+    '주문번호가 화면에 있다'가 다 그려졌다는 유일한 기준이다. '배송조회' 같은
+    글자는 상단 메뉴에도 있어서 표식으로 쓰면 덜 그려진 화면을 다 그려진 것으로
+    볼 수 있고, 덜 그려진 화면을 읽으면 '아직 미발급'으로 조용히 틀릴 수 있다.
+    """
+    page.goto(product_url, wait_until="domcontentloaded")
+    screen = _wait_for_order_or_login(page, order_no, common.RENDER_WAIT_TIMEOUT_MS)
+
+    if screen == SCREEN_LOGIN:
+        common.safe_print("[nsmall] 로그인 세션이 없어 자동 로그인을 시도합니다.")
+        _auto_login(page)
+        if parse_qs(urlparse(page.url).query).get("orderNum", [None])[0] != order_no:
+            page.goto(product_url, wait_until="domcontentloaded")
+        screen = _wait_for_order_or_login(page, order_no, common.RENDER_WAIT_TIMEOUT_MS)
+        if screen == SCREEN_LOGIN:
+            raise BlockedError("NS홈쇼핑 로그인 후에도 여전히 로그인 페이지입니다.")
+
+    if screen == SCREEN_NONE:
+        common.safe_print(f"[nsmall] 주문상세 화면이 늦게 그려져 다시 불러옵니다 (주문번호={order_no}).")
+        page.goto(product_url, wait_until="domcontentloaded")
+        screen = _wait_for_order_or_login(page, order_no, common.RENDER_WAIT_TIMEOUT_MS)
+
+    if screen != SCREEN_ORDER:
+        raise ParseError(
+            f"주문상세 화면에 주문번호가 나타나지 않았습니다 (주문번호={order_no}, 현재 주소={page.url}) - "
+            "화면이 그려지지 않았거나 다른 화면으로 넘어간 것으로 보입니다."
+        )
 
 
 def _parse_tracking_response(body: dict, order_no: str) -> tuple[str, str]:
@@ -206,56 +272,13 @@ def _scrape_tracking_from_page(page: Page, order_no: str, order_option: str | No
     return TrackingResult(tracking_no=tracking_no, courier=courier)
 
 
-def _wait_for_order_screen(page: Page, product_url: str, order_no: str) -> None:
-    """주문번호가 화면에 뜰 때까지 기다리고, 끝내 안 뜨면 넘어가지 않는다.
-
-    2026-09-03 실행에서 '상품 준비 중'인 주문이 "배송조회 버튼을 찾지 못했다"는
-    실패로 기록됐다. 로그에 주문일도 비어 있었으니 주문 정보가 하나도 없는
-    화면을 읽은 것이다 - 예전에는 2초 안에 주문번호가 안 뜨면 그냥 다음으로
-    넘어가서, 상단 메뉴만 그려진 화면을 놓고 '배송조회도 없고 준비 중 문구도
-    없다'고 판정했다. 평소에는 0.3~0.6초면 뜨지만(실측 3회), 로그인 직후나
-    사이트가 느린 순간에는 그보다 늦을 수 있다.
-
-    그래서 상한을 공통 렌더 대기(8초)로 늘리고(뜨는 즉시 끝나니 평소 비용은
-    없다), 그래도 안 뜨면 한 번 다시 불러본 뒤, 끝내 안 뜨면 '화면이 안
-    그려졌다'는 사유로 실패시킨다 - 덜 그려진 화면을 읽고 엉뚱한 사유를 붙이는
-    것보다 사람이 원인을 바로 알 수 있는 쪽이 낫다.
-    """
-    if common.wait_for_text(page, order_no, common.RENDER_WAIT_TIMEOUT_MS):
-        return
-    common.safe_print(f"[nsmall] 주문상세 화면이 늦게 그려져 다시 불러옵니다 (주문번호={order_no}).")
-    page.goto(product_url, wait_until="domcontentloaded")
-    if common.wait_for_text(page, order_no, common.RENDER_WAIT_TIMEOUT_MS):
-        return
-    raise ParseError(
-        f"주문상세 화면에 주문번호가 나타나지 않았습니다 (주문번호={order_no}, 현재 주소={page.url}) - "
-        "화면이 그려지지 않았거나 다른 화면으로 넘어간 것으로 보입니다."
-    )
-
-
 def get_tracking(
     context: BrowserContext, product_url: str, headless: bool = True, order_option: str | None = None
 ) -> TrackingResult:
     order_no = extract_order_no(product_url)
     page = context.new_page()
     try:
-        page.goto(product_url, wait_until="domcontentloaded")
-
-        if _looks_like_login_page(page):
-            common.safe_print("[nsmall] 로그인 세션이 없어 자동 로그인을 시도합니다.")
-            if not _auto_login(page):
-                raise BlockedError("NS홈쇼핑 자동 로그인 후에도 로그인 페이지에서 벗어나지 못했습니다.")
-            if _looks_like_login_page(page):
-                raise BlockedError("NS홈쇼핑 로그인 후에도 여전히 로그인 페이지입니다.")
-            page.goto(product_url, wait_until="domcontentloaded")
-            if _looks_like_login_page(page):
-                raise BlockedError("NS홈쇼핑 로그인 후에도 여전히 로그인 페이지입니다.")
-
-        # 화면이 아직 덜 그려진 채로 읽으면 '아직 미발급'으로 잘못 넘길 수 있다
-        # (조용히 틀리는 쪽이라 특히 위험하다). 그 주문의 주문번호가 화면에
-        # 뜨면 다 그려진 것이다 - '배송조회' 같은 글자는 상단 메뉴에도 있어서
-        # 표식으로 쓰면 덜 그려진 화면을 다 그려진 것으로 볼 수 있다.
-        _wait_for_order_screen(page, product_url, order_no)
+        _open_order_screen(page, product_url, order_no)
         # 주문상세 화면을 떠나기 전에 주문일부터 읽어둔다 (오래된 주문을 결과에 따로 모으는 데 쓴다).
         return with_order_date(page, lambda: _scrape_tracking_from_page(page, order_no, order_option))
     finally:
