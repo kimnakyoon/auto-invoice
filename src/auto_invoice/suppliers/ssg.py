@@ -45,6 +45,7 @@ from . import common
 from .base import (
     AdapterError,
     BlockedError,
+    OrderCancelled,
     ParseError,
     TrackingNotAvailableYet,
     attach_order_date,
@@ -73,6 +74,14 @@ NOT_YET_PATTERNS = [
     "상품준비중",
     "배송준비중",
 ]
+# 취소/품절이 확정된 주문에만 찍히는 표시. 진행 중 주문은 화면에 진행 단계
+# 라벨("결제완료 / 상품준비중 / 배송준비중")이 항상 같이 찍혀 있어 NOT_YET
+# 판정이 먼저 이기므로, 이 표시는 NOT_YET 판정보다 **먼저** 본다. 2026-09-03
+# 실측: 품절 처리 중인 주문이 "상품품절" 표시와 진행 단계 라벨을 함께 보여줘
+# '아직 미발급'으로 넘어갔다 (환불이 끝난 뒤에야 "주문취소완료"로 바뀌고
+# 라벨이 사라진다). '준비' 우선 규칙(raise_if_cancelled)도 여기엔 안 쓴다 -
+# 그 라벨이 바로 '준비'라서 규칙을 적용하면 같은 이유로 또 놓친다.
+CANCELLED_MARKERS = ["주문취소완료", "취소완료", "상품품절", "품절취소"]
 
 # --------------------------------------------------------------------------
 # 주문목록 한 번으로 여러 건 답하기 (prepare_batch)
@@ -238,6 +247,12 @@ def _tracking_from_text(body_text: str, order_no: str, order_option: str | None 
             anchor_matches.append((pos, m))
 
     if not anchor_matches:
+        marker = next((m for m in CANCELLED_MARKERS if m in body_text), None)
+        if marker:
+            raise OrderCancelled(
+                f"주문 화면에 '{marker}' 표시가 있습니다 (orordNo={order_no}) - "
+                "취소/품절 주문인지 확인해주세요."
+            )
         combined = "\n".join(windows)
         if any(p in combined for p in NOT_YET_PATTERNS):
             raise TrackingNotAvailableYet(f"아직 송장번호가 발급되지 않았습니다 (orordNo={order_no}).")
