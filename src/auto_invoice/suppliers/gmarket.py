@@ -111,6 +111,12 @@ TRACKING_LINE_PATTERN = re.compile(r"([가-힣A-Za-z]{2,20})\s*([0-9][0-9\-]{7,}
 # 맨 마지막 줄만 보게 된다.
 TRACKING_LINE_ANY_PATTERN = re.compile(TRACKING_LINE_PATTERN.pattern, re.MULTILINE)
 NOT_YET_PATTERNS = ["배송준비중", "상품준비중", "결제확인중", "주문확인중"]
+# 주문상세 JSON의 주문상태(displayOrderStatusName)가 이 값이면 아직 발송 전이라
+# 송장번호가 없는 게 정상이다 (옥션 NOT_YET_STATUSES와 같은 목록). 화면 텍스트용
+# NOT_YET_PATTERNS와 따로 두는 이유: "결제완료"는 결제 정보 칸에도 찍히는 말이라
+# 화면 전체 텍스트에 대고 쓰면 취소 주문까지 '미발급'으로 넘어간다. 2026-09-03
+# 판매자 주문확인 전 주문(상태=결제완료)이 미발급 대신 실패로 기록된 것을 고친다.
+NOT_YET_STATUSES = ["입금확인중", "결제완료", "배송준비중", "상품준비중", "결제확인중", "주문확인중"]
 BOT_CHECK_PATTERNS = ["사람인지 확인", "봇(Bot)이란", "로봇이 아닙니다"]
 
 # 조회를 우리가 직접 실행한 진짜 크롬(CDP)에서 한다는 표시 (orchestrator.py).
@@ -427,8 +433,8 @@ def _answer_from_pay_detail(data: dict, order_id: str, order_option: str | None)
             if number:
                 shipped.append((o, number, str(tracking.get("transCompanyName") or "").strip()))
         if not shipped:
-            if any(p in status for status in statuses for p in NOT_YET_PATTERNS):
-                raise TrackingNotAvailableYet(f"아직 송장번호가 발급되지 않았습니다 (orderId={order_id}).")
+            if any(p in status for status in statuses for p in NOT_YET_STATUSES):
+                raise TrackingNotAvailableYet(f"아직 발송 전입니다 (orderId={order_id}, 상태={', '.join(statuses)}).")
             raise ParseError(f"주문 응답에 송장번호가 없습니다 (orderId={order_id}, 상태={', '.join(statuses)}).")
         if len({number for _, number, _ in shipped}) > 1:
             target = normalize_option(order_option) if order_option else ""
