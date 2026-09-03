@@ -125,7 +125,7 @@ LIST_API_URL = "https://pbf.lotteon.com/order/v1/mylotte/getOrderList"
 STATES_API_URL = "https://pbf.lotteon.com/order/v2/fo/ui/states"
 TRACE_PAGE_URL = ("https://www.lotteon.com/p/delivery/deliverysearch/search"
                   "?odNo={od_no}&odSeq={od_seq}&invcNo={invc_no}&procSeq={proc_seq}")
-LIST_API_MAX_PAGES = 12        # 15건씩 -> 최대 180건. 못 덮은 주문은 상세 폴백으로.
+LIST_API_MAX_PAGES = 30        # 15건씩 -> 최대 450건 (안전 상한). 보통은 아래 주문일 기준으로 훨씬 먼저 멈춘다.
 LIST_API_LOOKBACK_DAYS = 45    # 발송대상에 남아 있는 주문은 이보다 오래되지 않는다
 TRACE_GAP_SEC = (0.2, 0.4)     # 배송조회 페이지를 연달아 받을 때 사이 간격 (페이지 자체는 0.05초, 실측)
 API_HEADERS = {
@@ -139,9 +139,14 @@ COURIER_NAME_PATTERN = re.compile(r'dvcNm\\*"\s*:\s*\\*"([^"\\]+)')
 
 # 이 상태로 적힌 주문은 송장번호가 아직 없다 - 상세를 열어도 '미발급'만 나온다.
 # 2026-08-31 실측으로 확인한 것만 넣었다(상품준비중 2/2, 출고지시 3/3이 상세에서
-# 미발급). 여기 없는 상태(예: "09/02 도착예정")는 예전처럼 상세를 열어 확인한다.
+# 미발급). 여기 없는 상태는 예전처럼 상세를 열어 확인한다.
+# 아직 발송 전이라 송장이 없는 게 정상인 상태 글자. ui/states가 상태 대신
+# "09/09 도착예정"처럼 예정일 문구를 주는 주문이 있다(2026-09-03 실측, 미발송
+# 7건 중 6건) - 이걸 '모르는 상태'로 보면 상세를 열러 가서 건당 1초 + 요청
+# 간격이 붙는다. 송장이 이미 있는 주문은 이 판정에 오지 않으므로(아래
+# _raise_if_listed_settled) 예정일 문구를 미발급으로 봐도 안전하다.
 LIST_NOT_YET_STATUSES = ("상품준비중", "배송준비중", "결제완료", "입금대기",
-                         "주문접수", "출고지시")
+                         "주문접수", "출고지시", "도착예정", "발송예정")
 
 _LIST_CARDS_JS = """() => [...document.querySelectorAll('.orderGroupWrap')].map(card => ({
   odNo: ((card.querySelector('span.orderNumber') || {}).innerText || '').trim(),
@@ -228,6 +233,10 @@ def _post_json(context: BrowserContext, url: str, payload: dict) -> dict | None:
 def _prefetch_via_api(context: BrowserContext, wanted: set[str]) -> dict[str, dict] | None:
     """주문목록 API로 wanted 주문들의 상태·송장·택배사를 읽는다 (docstring)."""
     today = date.today()
+    # 주문번호(odNo) 앞 8자리가 주문일(YYYYMMDD)이고 목록은 최신순이다. 한
+    # 페이지의 주문이 전부 찾는 주문 중 가장 오래된 것보다 앞서면 더 넘겨봐야
+    # 없다 - 예전엔 한 건이라도 못 찾으면 상한(12페이지)까지 다 훑었다(7초).
+    oldest_wanted = min((od[:8] for od in wanted if od[:8].isdigit()), default="")
     rows_by_od: dict[str, list[dict]] = {}
     for page_no in range(1, LIST_API_MAX_PAGES + 1):
         data = _post_json(context, LIST_API_URL, {
@@ -248,6 +257,10 @@ def _prefetch_via_api(context: BrowserContext, wanted: set[str]) -> dict[str, di
                 rows_by_od.setdefault(od_no, []).append(row)
         if not (wanted - rows_by_od.keys()):
             break
+        dates = [str(r.get("odAccpDttm") or "")[:8] for r in rows]
+        dates = [d for d in dates if d.isdigit()]
+        if oldest_wanted and dates and max(dates) < oldest_wanted:
+            break  # 이 페이지부터는 찾는 주문보다 오래된 것뿐이다
     if not rows_by_od:
         return {}
 
@@ -377,6 +390,24 @@ def _listed_order_date(text: str) -> date | None:
         return None
 
 
+def _listed_note(card: dict) -> str | None:
+    """목록 카드의 상태 글자와 예정 문구로 엑셀용 예정 문구를 만든다.
+
+    줄마다 **따로** 파싱해서 합친다. 한 줄로 이어 붙이면("09/09 도착예정 9/7(월)
+    이내 발송예정") eta.from_text가 라벨 뒤를 먼저 보는 규칙 때문에 '도착예정'
+    뒤의 9/7을 도착예정일로 잘못 읽었다 (2026-09-03 실측).
+    """
+    found: list[str] = []
+    for text in (card.get("statuses") or []) + (card.get("etas") or []):
+        note = eta_mod.from_text(text)
+        if not note:
+            continue
+        for item in note.split(" / "):
+            if item not in found:
+                found.append(item)
+    return " / ".join(found) or None
+
+
 def _raise_if_listed_settled(card: dict, od_no: str) -> None:
     """목록에 적힌 상태만으로 결론이 나면 상세를 열지 않고 여기서 끝낸다.
 
@@ -387,7 +418,7 @@ def _raise_if_listed_settled(card: dict, od_no: str) -> None:
     if not statuses:
         return
     order_date = _listed_order_date(card.get("date") or "")
-    note = eta_mod.from_text(" ".join(statuses + (card.get("etas") or [])))
+    note = _listed_note(card)
 
     # 취소/품절은 기다려도 송장이 안 나온다. 주문상태를 정확히 읽을 수 있는
     # 공급사는 NOT_YET 판정보다 먼저 본다(base.raise_if_cancelled 규칙).
@@ -401,6 +432,8 @@ def _raise_if_listed_settled(card: dict, od_no: str) -> None:
         e.sent_request = False  # 미리 읽어둔 목록으로 답했다 - 새 요청 없음
         raise
 
+    if any(it.get("invcNo") for it in card.get("items") or []):
+        return  # 송장이 이미 있다 - _answer_from_listed가 답한다 (예정일 문구를 미발급으로 오판하지 않게)
     if not all(any(k in s for k in LIST_NOT_YET_STATUSES) for s in statuses):
         return  # 모르는 상태가 섞여 있으면 상세로 확인한다
 
@@ -566,7 +599,7 @@ def _answer_from_listed(card: dict, od_no: str, order_option: str | None) -> Tra
         return None
     result = TrackingResult(tracking_no=chosen["invcNo"], courier=chosen["courier"])
     result.order_date = _listed_order_date(card.get("date") or "")
-    result.delivery_note = eta_mod.from_text(" ".join(card.get("statuses") or []) + " " + " ".join(card.get("etas") or []))
+    result.delivery_note = _listed_note(card)
     result.sent_request = False  # 미리 읽어둔 목록으로 답했다 - 새 요청 없음
     return result
 

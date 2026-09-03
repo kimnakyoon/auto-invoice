@@ -8,6 +8,7 @@
 from __future__ import annotations
 
 import contextlib
+import json
 import os
 import socket
 import subprocess
@@ -187,6 +188,29 @@ def _wait_for_port(port: int, timeout_sec: float) -> bool:
     return False
 
 
+def restore_saved_cookies(context: BrowserContext, site_key: str) -> int:
+    """auth/<사이트>_state.json에 저장해 둔 쿠키를 컨텍스트에 넣는다 (넣은 개수).
+
+    우리가 직접 실행한 크롬(real_chrome_cdp_context)은 프로필이 남아도 로그인
+    쿠키는 대개 세션 쿠키(만료 없음)라 크롬을 닫으면 사라진다 - 지마켓은 매
+    실행 재로그인이었다(2026-09-03 실측). 조회가 끝날 때 orchestrator가
+    storage_state로 저장해 둔 것을 다음 실행 시작 때 되살린다. 만료된 쿠키는
+    빼고, 파일이 없거나 깨졌으면 아무것도 안 한다(그냥 다시 로그인한다).
+    """
+    sp = state_path(site_key)
+    if not sp.exists():
+        return 0
+    try:
+        cookies = json.loads(sp.read_text(encoding="utf-8")).get("cookies") or []
+        now = time.time()
+        cookies = [c for c in cookies if not (0 < float(c.get("expires", -1)) < now)]
+        if cookies:
+            context.add_cookies(cookies)
+        return len(cookies)
+    except Exception:  # noqa: BLE001 - 세션 복원 실패는 재로그인으로 이어질 뿐이다
+        return 0
+
+
 @contextlib.contextmanager
 def real_chrome_cdp_context(site_key: str, playwright: Playwright | None = None):
     """크롬을 **우리가 직접 실행**하고 CDP로 붙은 컨텍스트 (with 문으로 쓴다).
@@ -239,12 +263,21 @@ def real_chrome_cdp_context(site_key: str, playwright: Playwright | None = None)
             raise RuntimeError(f"크롬이 디버깅 포트({port})를 {CDP_READY_TIMEOUT_SEC}초 안에 열지 않았습니다.")
         browser = pw.chromium.connect_over_cdp(f"http://127.0.0.1:{port}")
         context = browser.contexts[0] if browser.contexts else browser.new_context()
+        restore_saved_cookies(context, site_key)
         yield context
     finally:
         if browser is not None:
+            # 크롬에 정상 종료를 요청한다 - connect_over_cdp로 붙은 browser.close()는
+            # 연결만 끊고, 곧바로 terminate()하면 프로필(쿠키 등)이 디스크에
+            # 반영되지 못한 채 죽는다(쿠키 파일이 하루 넘게 안 바뀌어 있었다).
+            with contextlib.suppress(Exception):
+                browser.new_browser_cdp_session().send("Browser.close")
             with contextlib.suppress(Exception):
                 browser.close()
         with contextlib.suppress(Exception):
-            proc.terminate()
-        with contextlib.suppress(Exception):
             proc.wait(timeout=10)
+        if proc.poll() is None:  # 정상 종료가 안 됐을 때만 강제로
+            with contextlib.suppress(Exception):
+                proc.terminate()
+            with contextlib.suppress(Exception):
+                proc.wait(timeout=10)
