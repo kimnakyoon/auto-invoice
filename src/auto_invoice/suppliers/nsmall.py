@@ -206,6 +206,33 @@ def _scrape_tracking_from_page(page: Page, order_no: str, order_option: str | No
     return TrackingResult(tracking_no=tracking_no, courier=courier)
 
 
+def _wait_for_order_screen(page: Page, product_url: str, order_no: str) -> None:
+    """주문번호가 화면에 뜰 때까지 기다리고, 끝내 안 뜨면 넘어가지 않는다.
+
+    2026-09-03 실행에서 '상품 준비 중'인 주문이 "배송조회 버튼을 찾지 못했다"는
+    실패로 기록됐다. 로그에 주문일도 비어 있었으니 주문 정보가 하나도 없는
+    화면을 읽은 것이다 - 예전에는 2초 안에 주문번호가 안 뜨면 그냥 다음으로
+    넘어가서, 상단 메뉴만 그려진 화면을 놓고 '배송조회도 없고 준비 중 문구도
+    없다'고 판정했다. 평소에는 0.3~0.6초면 뜨지만(실측 3회), 로그인 직후나
+    사이트가 느린 순간에는 그보다 늦을 수 있다.
+
+    그래서 상한을 공통 렌더 대기(8초)로 늘리고(뜨는 즉시 끝나니 평소 비용은
+    없다), 그래도 안 뜨면 한 번 다시 불러본 뒤, 끝내 안 뜨면 '화면이 안
+    그려졌다'는 사유로 실패시킨다 - 덜 그려진 화면을 읽고 엉뚱한 사유를 붙이는
+    것보다 사람이 원인을 바로 알 수 있는 쪽이 낫다.
+    """
+    if common.wait_for_text(page, order_no, common.RENDER_WAIT_TIMEOUT_MS):
+        return
+    common.safe_print(f"[nsmall] 주문상세 화면이 늦게 그려져 다시 불러옵니다 (주문번호={order_no}).")
+    page.goto(product_url, wait_until="domcontentloaded")
+    if common.wait_for_text(page, order_no, common.RENDER_WAIT_TIMEOUT_MS):
+        return
+    raise ParseError(
+        f"주문상세 화면에 주문번호가 나타나지 않았습니다 (주문번호={order_no}, 현재 주소={page.url}) - "
+        "화면이 그려지지 않았거나 다른 화면으로 넘어간 것으로 보입니다."
+    )
+
+
 def get_tracking(
     context: BrowserContext, product_url: str, headless: bool = True, order_option: str | None = None
 ) -> TrackingResult:
@@ -228,7 +255,7 @@ def get_tracking(
         # (조용히 틀리는 쪽이라 특히 위험하다). 그 주문의 주문번호가 화면에
         # 뜨면 다 그려진 것이다 - '배송조회' 같은 글자는 상단 메뉴에도 있어서
         # 표식으로 쓰면 덜 그려진 화면을 다 그려진 것으로 볼 수 있다.
-        common.wait_for_text(page, order_no, common.ORDER_RENDER_WAIT_MS)
+        _wait_for_order_screen(page, product_url, order_no)
         # 주문상세 화면을 떠나기 전에 주문일부터 읽어둔다 (오래된 주문을 결과에 따로 모으는 데 쓴다).
         return with_order_date(page, lambda: _scrape_tracking_from_page(page, order_no, order_option))
     finally:
