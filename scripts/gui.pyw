@@ -223,7 +223,7 @@ class App:
         if state is None:
             messagebox.showinfo("이어서 할 작업 없음",
                                 "이어서 할 진행 상황이 없습니다.\n"
-                                "[송장]로 처음부터 실행해주세요.")
+                                "[송장]으로 처음부터 실행해주세요.")
             self._refresh_resume()
             return
 
@@ -252,7 +252,7 @@ class App:
         if path is None:
             messagebox.showerror("결과 엑셀 없음",
                                  "바탕화면에 '송장조회결과_*.xlsx' 파일이 없습니다.\n"
-                                 "먼저 [송장]로 송장 조회를 돌려주세요.")
+                                 "먼저 [송장]으로 송장 조회를 돌려주세요.")
             return
         to_post = sum(len(v) for v in by_site.values())
         site_lines = "\n".join(f"   · {site} {len(items)}건" for site, items in by_site.items())
