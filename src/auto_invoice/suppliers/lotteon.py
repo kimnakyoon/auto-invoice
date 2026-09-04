@@ -703,6 +703,34 @@ def _scrape_tracking_from_page(page, od_no: str, order_option: str | None = None
     return TrackingResult(tracking_no=tracking_no, courier=courier)
 
 
+def _goto_logged_in(page, url: str, headless: bool) -> None:
+    """url로 가되, 로그인 페이지로 튕기면 로그인하고 다시 간다.
+
+    송장조회(get_tracking)와 문의 남기기(post_inquiry)가 같은 로그인 처리를
+    쓴다. 비밀번호가 .env에 있으면 자동 로그인, 없으면 창을 띄운 채 사람이
+    로그인하기를 기다린다(headless면 그럴 수 없어 바로 실패).
+    """
+    page.goto(url, wait_until="domcontentloaded")
+    if not _looks_like_login_page(page):
+        return
+    if _auto_login(page):
+        common.safe_print("[lotteon] 로그인 세션이 없어 자동 로그인했습니다.")
+    elif headless:
+        raise BlockedError(
+            "롯데온 로그인이 필요합니다. .env에 LOTTEON_PW를 넣으면 자동 로그인하고, "
+            "비밀번호를 저장하지 않으려면 --headless 없이 실행해 직접 로그인해주세요."
+        )
+    else:
+        _prefill_login_id(page)
+        common.safe_print("[lotteon] 아이디는 자동으로 입력했습니다. 뜬 브라우저 창에서 비밀번호를 입력하고 로그인해주세요.")
+        common.safe_print("[lotteon] 로그인이 완료되면 자동으로 이어서 진행합니다 (최대 5분 대기).")
+        if not _wait_for_manual_login(page):
+            raise BlockedError("로그인 대기 시간(5분)이 지났습니다. 로그인 후 다시 실행해주세요.")
+    page.goto(url, wait_until="domcontentloaded")
+    if _looks_like_login_page(page):
+        raise BlockedError("로그인 후에도 여전히 로그인 페이지입니다.")
+
+
 def get_tracking(
     context: BrowserContext, product_url: str, headless: bool = True, order_option: str | None = None
 ) -> TrackingResult:
@@ -718,29 +746,124 @@ def get_tracking(
 
     page = context.new_page()
     try:
-        page.goto(product_url, wait_until="domcontentloaded")
-
-        if _looks_like_login_page(page):
-            if _auto_login(page):
-                common.safe_print("[lotteon] 로그인 세션이 없어 자동 로그인했습니다.")
-            elif headless:
-                raise BlockedError(
-                    "롯데온 로그인이 필요합니다. .env에 LOTTEON_PW를 넣으면 자동 로그인하고, "
-                    "비밀번호를 저장하지 않으려면 --headless 없이 실행해 직접 로그인해주세요."
-                )
-            else:
-                _prefill_login_id(page)
-                common.safe_print("[lotteon] 아이디는 자동으로 입력했습니다. 뜬 브라우저 창에서 비밀번호를 입력하고 로그인해주세요.")
-                common.safe_print("[lotteon] 로그인이 완료되면 자동으로 이어서 진행합니다 (최대 5분 대기).")
-                if not _wait_for_manual_login(page):
-                    raise BlockedError("로그인 대기 시간(5분)이 지났습니다. 로그인 후 다시 실행해주세요.")
-            page.goto(product_url, wait_until="domcontentloaded")
-            if _looks_like_login_page(page):
-                raise BlockedError("로그인 후에도 여전히 로그인 페이지입니다.")
-
+        _goto_logged_in(page, product_url, headless)
         # 주문상세는 자바스크립트로 그려진다 - 주문번호가 화면에 뜨면 다 그려진 것이다.
         common.wait_for_text(page, od_no)
         # 주문상세 화면을 떠나기 전에 주문일부터 읽어둔다 (오래된 주문을 결과에 따로 모으는 데 쓴다).
         return with_order_date(page, lambda: _scrape_tracking_from_page(page, od_no, order_option))
     finally:
+        page.close()
+
+
+# --------------------------------------------------------------------------
+# 1:1 문의 남기기 (post_inquiry) - 2026-09-04 실측
+# --------------------------------------------------------------------------
+# 주문일이 이틀 지나도록 안 나간 주문에 "○○○ 배송 언제 시작하나요?"를 남긴다
+# (inquiry.py). 사람이 누르는 순서 그대로다:
+#   주문상세 [문의하기](button.btnInquiry) -> 툴팁의 [고객센터 1:1문의]
+#     -> 새 탭 /p/customer/customerCenter/customerOneTone?odNo=...&trNo=...
+#        (주문정보가 이 odNo로 미리 채워져 온다 - 화면에 주문번호가 보인다)
+#   문의유형 [문의유형 선택](button.btnSelProduct) -> 모달 .inquiryTypeList의 [배송]
+#     -> 곧바로 '상세유형 선택' 모달이 열린다 -> [배송일정]
+#   문의내용 textarea -> 답변알림 [문자/알림톡](#checkbox1, 기본 해제) -> [등록하기]
+#     -> confirm("1대1 문의를 등록하시겠습니까?") 확인
+#     -> alert("문의가 등록되었습니다. ...") -> 문의내역(customerOneToneHistory)으로 이동
+# 확인/완료가 둘 다 자바스크립트 dialog라 핸들러로 받는다(로그인과 같은 사정).
+INQUIRY_BUTTON = "button.btnInquiry"
+INQUIRY_TOOLTIP_LINK = "고객센터 1:1문의"
+INQUIRY_FORM_MARK = "문의유형 선택"
+INQUIRY_TYPE_BUTTON = "button.btnSelProduct"
+INQUIRY_TYPE_LIST = ".inquiryTypeList"
+INQUIRY_TYPE = "배송"
+INQUIRY_SUBTYPE_MODAL = "상세유형 선택"
+INQUIRY_SUBTYPE = "배송일정"
+INQUIRY_NOTIFY_LABEL = "label[for=checkbox1]"   # 문자/알림톡
+INQUIRY_NOTIFY_CHECKBOX = "#checkbox1"
+INQUIRY_SUBMIT = "등록하기"
+INQUIRY_DONE_TEXT = "등록되었습니다"
+INQUIRY_DONE_URL = "customerOneToneHistory"
+INQUIRY_MESSAGE = "{name} 배송 언제 시작하나요?"
+INQUIRY_STEP_WAIT_MS = 5000   # 클릭 뒤 다음 화면 요소가 나타나기까지 최대
+
+
+def inquiry_message(recipient_name: str) -> str:
+    return INQUIRY_MESSAGE.format(name=recipient_name.strip())
+
+
+def post_inquiry(context: BrowserContext, product_url: str, recipient_name: str,
+                 headless: bool = False) -> str:
+    """주문상세에서 1:1 문의(배송 > 배송일정)를 남기고 완료 문구를 돌려준다.
+
+    어디서든 어긋나면(버튼이 없다, 확인 창이 안 뜬다, 완료 문구가 다르다)
+    ParseError/BlockedError로 올린다 - 남겼는지 불확실한 채로 성공이라고
+    하지 않는다. 남긴 뒤 문의내역 화면으로 넘어간 것까지 확인한다.
+    """
+    od_no = extract_od_no(product_url)
+    message = inquiry_message(recipient_name)
+    page = context.new_page()
+    form = None
+    try:
+        _goto_logged_in(page, product_url, headless)
+        if not common.wait_for_text(page, od_no):
+            raise ParseError(f"주문상세가 그려지지 않았습니다 (odNo={od_no}).")
+        _raise_if_detail_cancelled(page, od_no)
+
+        button = page.locator(INQUIRY_BUTTON)
+        if button.count() == 0:
+            raise ParseError(f"주문상세에 [문의하기] 버튼이 없습니다 (odNo={od_no}).")
+        button.first.click()
+        link = page.get_by_text(INQUIRY_TOOLTIP_LINK, exact=True)
+        link.first.wait_for(state="visible", timeout=INQUIRY_STEP_WAIT_MS)
+        with context.expect_page(timeout=INQUIRY_STEP_WAIT_MS) as opened:
+            link.first.click()
+        form = opened.value
+        form.wait_for_load_state("domcontentloaded")
+        if not common.wait_for_text(form, INQUIRY_FORM_MARK, timeout_ms=INQUIRY_STEP_WAIT_MS):
+            raise ParseError(f"1:1 문의 화면이 뜨지 않았습니다 (odNo={od_no}, url={form.url}).")
+        # 문의가 이 주문에 붙는지 - 주문정보 칸에 주문번호가 미리 채워져 있어야 한다.
+        if od_no not in form.url and not common.wait_for_text(form, od_no, timeout_ms=INQUIRY_STEP_WAIT_MS):
+            raise ParseError(f"1:1 문의 화면에 주문번호가 연결되지 않았습니다 (odNo={od_no}).")
+
+        dialogs: list[tuple[str, str]] = []
+
+        def _on_dialog(dialog) -> None:
+            dialogs.append((dialog.type, dialog.message))
+            # 등록 확인(confirm)은 승인, 완료 안내(alert)는 닫는다 - 둘 다 accept.
+            dialog.accept()
+
+        form.on("dialog", _on_dialog)
+
+        form.locator(INQUIRY_TYPE_BUTTON).first.click()
+        type_item = form.locator(INQUIRY_TYPE_LIST).get_by_text(INQUIRY_TYPE, exact=True)
+        type_item.first.wait_for(state="visible", timeout=INQUIRY_STEP_WAIT_MS)
+        type_item.first.click()
+        if not common.wait_for_text(form, INQUIRY_SUBTYPE_MODAL, timeout_ms=INQUIRY_STEP_WAIT_MS):
+            raise ParseError("문의유형 [배송]을 골랐는데 상세유형 선택 창이 뜨지 않았습니다.")
+        form.get_by_role("button", name=INQUIRY_SUBTYPE, exact=True).first.click()
+        chosen = [t.strip() for t in form.locator(INQUIRY_TYPE_BUTTON).all_inner_texts()]
+        if INQUIRY_TYPE not in chosen or INQUIRY_SUBTYPE not in chosen:
+            raise ParseError(f"문의유형이 배송/배송일정으로 잡히지 않았습니다 (화면: {chosen}).")
+
+        form.locator("textarea").first.fill(message)
+        if not form.locator(INQUIRY_NOTIFY_CHECKBOX).is_checked():
+            form.locator(INQUIRY_NOTIFY_LABEL).click()
+        if not form.locator(INQUIRY_NOTIFY_CHECKBOX).is_checked():
+            raise ParseError("답변알림 [문자/알림톡]이 체크되지 않았습니다.")
+        if form.locator("textarea").first.input_value().strip() != message:
+            raise ParseError("문의내용이 입력되지 않았습니다.")
+
+        form.get_by_role("button", name=INQUIRY_SUBMIT, exact=True).first.click()
+        # 확인 -> 완료 alert -> 문의내역 이동. 주소가 바뀔 때까지만 기다린다.
+        common.wait_for_url(form, lambda url: INQUIRY_DONE_URL in url, INQUIRY_STEP_WAIT_MS)
+        done = [m for t, m in dialogs if INQUIRY_DONE_TEXT in m]
+        if not done:
+            seen = " / ".join(f"{t}: {m}" for t, m in dialogs) or "(뜬 창 없음)"
+            if INQUIRY_DONE_URL in form.url:
+                raise ParseError(f"문의내역 화면으로 넘어갔지만 완료 문구를 받지 못했습니다 ({seen}).")
+            raise ParseError(f"[등록하기]를 눌렀는데 완료 문구가 오지 않았습니다 ({seen}).")
+        return done[0].strip()
+    finally:
+        if form is not None:
+            with contextlib.suppress(Exception):
+                form.close()
         page.close()

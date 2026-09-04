@@ -24,7 +24,7 @@ if sys.platform == "win32" and sys.stdout is not None:
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
 
-from auto_invoice import checkpoint, pipeline, result_excel  # noqa: E402
+from auto_invoice import checkpoint, inquiry, pipeline, result_excel  # noqa: E402
 from auto_invoice.orchestrator import run as run_orchestrator  # noqa: E402
 
 DESKTOP = Path.home() / "Desktop"
@@ -71,8 +71,12 @@ class App:
             anchor="w",
         ).pack(fill="x", padx=14, pady=(14, 4))
 
+        # [전부 자동] 옆에 [문의] - 송장조회 결과 엑셀의 '2일 지남' 주문에
+        # 공급사 사이트로 "○○○ 배송 언제 시작하나요?"를 남긴다 (inquiry.py).
+        top_row = tk.Frame(root)
+        top_row.pack(pady=(0, 2))
         self.auto_button = tk.Button(
-            root,
+            top_row,
             text="⚡  전부 자동으로 처리",
             font=("맑은 고딕", 14, "bold"),
             bg="#188038",
@@ -81,7 +85,18 @@ class App:
             activeforeground="white",
             command=self.start_full_auto,
         )
-        self.auto_button.pack(pady=(0, 2))
+        self.auto_button.pack(side="left")
+        self.inquiry_button = tk.Button(
+            top_row,
+            text="✉  문의",
+            font=("맑은 고딕", 12, "bold"),
+            bg="#1a73e8",
+            fg="white",
+            activebackground="#174ea6",
+            activeforeground="white",
+            command=self.start_inquiry,
+        )
+        self.inquiry_button.pack(side="left", padx=(10, 0), fill="y")
 
         limit_frame = tk.Frame(root)
         limit_frame.pack(pady=(0, 6))
@@ -227,6 +242,52 @@ class App:
         threading.Thread(target=self._full_auto_worker, args=(max_apply, True),
                          daemon=True).start()
 
+    def start_inquiry(self) -> None:
+        """결과 엑셀의 '2일 지남' 주문에 1:1 문의를 남긴다. 실제로 글이 올라가므로 확인받는다."""
+        try:
+            path, targets, by_site, skipped = inquiry.plan()
+        except Exception as e:  # noqa: BLE001 - 엑셀이 깨졌거나 시트가 다르면 여기서 알린다
+            messagebox.showerror("엑셀 읽기 실패", str(e))
+            return
+        if path is None:
+            messagebox.showerror("결과 엑셀 없음",
+                                 "바탕화면에 '송장조회결과_*.xlsx' 파일이 없습니다.\n"
+                                 "먼저 [전부 자동으로 처리]로 송장 조회를 돌려주세요.")
+            return
+        to_post = sum(len(v) for v in by_site.values())
+        site_lines = "\n".join(f"   · {site} {len(items)}건" for site, items in by_site.items())
+        if to_post == 0:
+            messagebox.showinfo(
+                "문의할 주문 없음",
+                f"{path.name}\n\n'{inquiry.STALE_SHEET_NAME}' 시트의 {inquiry.TARGET_DAYS_TEXT} 지남 "
+                f"{len(targets)}건 중 남길 건이 없습니다.\n"
+                f"(이미 남긴 주문이거나 아직 자동화하지 않은 사이트입니다 - {len(skipped)}건)")
+            return
+        if not messagebox.askokcancel(
+            "문의 남기기",
+            f"{path.name}\n\n"
+            f"'{inquiry.STALE_SHEET_NAME}' 시트의 {inquiry.TARGET_DAYS_TEXT} 지남 {len(targets)}건 중\n"
+            f"아래 {to_post}건에 \"(수령인) 배송 언제 시작하나요?\" 문의를 남깁니다.\n"
+            f"{site_lines}\n"
+            f"   · 넘김 {len(skipped)}건 (이미 남김 / 아직 지원하지 않는 사이트)\n\n"
+            "· 공급사 사이트에 실제로 문의 글이 올라갑니다\n"
+            "· 로그인이 필요하면 브라우저 창이 뜹니다\n\n"
+            "진행할까요?",
+        ):
+            return
+        self._set_busy(True, "문의 남기는 중...")
+        self._log("문의 남기기를 시작합니다.\n")
+        threading.Thread(target=self._inquiry_worker, args=(str(path),), daemon=True).start()
+
+    def _inquiry_worker(self, excel_path: str) -> None:
+        try:
+            result = inquiry.run(excel_path, headless=False,
+                                 log=lambda msg: self._queue.put(("log", msg)))
+            inquiry.save_run_log(result)
+            self._queue.put(("inquiry_done", result))
+        except Exception as e:  # noqa: BLE001
+            self._queue.put(("error", str(e)))
+
     def _full_auto_worker(self, max_apply: int, resume: bool) -> None:
         try:
             result = pipeline.run_full(
@@ -256,6 +317,7 @@ class App:
                                 text=text if busy else "⚡  전부 자동으로 처리")
         self.run_button.config(state=state,
                                text=text if busy else "▶  파일만 만들기")
+        self.inquiry_button.config(state=state)
         if busy:
             self.resume_button.config(state="disabled")
             self.open_button.config(state="disabled")
@@ -342,6 +404,15 @@ class App:
                         self.open_button.config(state="normal")
                     self._set_busy(False)
                     if result.stopped_reason and not result.applied:
+                        messagebox.showwarning("멈춤", result.stopped_reason)
+                elif kind == "inquiry_done":
+                    result = payload
+                    self._log("")
+                    self._log("=" * 40)
+                    self._log(inquiry.summarize(result))
+                    self._log("=" * 40)
+                    self._set_busy(False)
+                    if result.stopped_reason:
                         messagebox.showwarning("멈춤", result.stopped_reason)
                 elif kind == "error":
                     self._log(f"\n오류가 발생했습니다: {payload}")
