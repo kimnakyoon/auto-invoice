@@ -71,13 +71,13 @@ class App:
             anchor="w",
         ).pack(fill="x", padx=14, pady=(14, 4))
 
-        # [전부 자동] 옆에 [문의] - 송장조회 결과 엑셀의 '2일 지남' 주문에
+        # [송장] 옆에 [문의] - 송장조회 결과 엑셀의 '2일 지남' 주문에
         # 공급사 사이트로 "○○○ 배송 언제 시작하나요?"를 남긴다 (inquiry.py).
         top_row = tk.Frame(root)
         top_row.pack(pady=(0, 2))
         self.auto_button = tk.Button(
             top_row,
-            text="⚡  전부 자동으로 처리",
+            text="⚡  송장",
             font=("맑은 고딕", 14, "bold"),
             bg="#188038",
             fg="white",
@@ -198,7 +198,7 @@ class App:
             return
 
         if not messagebox.askokcancel(
-            "전부 자동으로 처리",
+            "송장",
             "샵마인에서 주문 목록을 받아 송장을 조회하고, 쇼핑몰까지 반영합니다.\n\n"
             "· 먼저 쇼핑몰이 전부 연결돼 있는지 확인합니다 "
             "(끊긴 곳은 다시 연결합니다)\n"
@@ -223,7 +223,7 @@ class App:
         if state is None:
             messagebox.showinfo("이어서 할 작업 없음",
                                 "이어서 할 진행 상황이 없습니다.\n"
-                                "[전부 자동으로 처리]로 처음부터 실행해주세요.")
+                                "[송장]로 처음부터 실행해주세요.")
             self._refresh_resume()
             return
 
@@ -252,7 +252,7 @@ class App:
         if path is None:
             messagebox.showerror("결과 엑셀 없음",
                                  "바탕화면에 '송장조회결과_*.xlsx' 파일이 없습니다.\n"
-                                 "먼저 [전부 자동으로 처리]로 송장 조회를 돌려주세요.")
+                                 "먼저 [송장]로 송장 조회를 돌려주세요.")
             return
         to_post = sum(len(v) for v in by_site.values())
         site_lines = "\n".join(f"   · {site} {len(items)}건" for site, items in by_site.items())
@@ -316,7 +316,7 @@ class App:
     def _set_busy(self, busy: bool, text: str = "") -> None:
         state = "disabled" if busy else "normal"
         self.auto_button.config(state=state,
-                                text=text if busy else "⚡  전부 자동으로 처리")
+                                text=text if busy else "⚡  송장")
         self.run_button.config(state=state,
                                text=text if busy else "▶  파일만 만들기")
         self.inquiry_button.config(state=state)
