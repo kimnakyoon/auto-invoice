@@ -23,10 +23,50 @@ if sys.platform == "win32":
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
 
 from auto_invoice import pipeline  # noqa: E402
+from auto_invoice.report import LOG_DIR  # noqa: E402
 
 
 def log(msg=""):
     print(msg, flush=True)
+
+
+class _Tee:
+    """콘솔에 찍히는 것을 파일에도 그대로 남긴다.
+
+    조회 결과는 logs/run_*.json 에 남지만, 공급사 어댑터가 도중에 찍는 말
+    ("[lotteon] 주문목록 API를 읽지 못해 화면 목록으로 대신합니다" 같은 것)은
+    콘솔에만 나오고 사라졌다. 그래서 나중에 '왜 그 건은 예정 문구가 비었나'를
+    되짚을 수 없었다 (2026-09-04). 창을 닫아도 남도록 같은 내용을 파일로도 쓴다.
+    """
+
+    def __init__(self, stream, path: Path):
+        self._stream = stream
+        self._file = open(path, "a", encoding="utf-8")
+
+    def write(self, text):
+        self._stream.write(text)
+        try:
+            self._file.write(text)
+            self._file.flush()
+        except Exception:  # noqa: BLE001 - 로그 파일 때문에 실행이 깨지면 안 된다
+            pass
+
+    def flush(self):
+        self._stream.flush()
+
+    def __getattr__(self, name):
+        return getattr(self._stream, name)
+
+
+def _tee_console(started: datetime) -> Path | None:
+    try:
+        LOG_DIR.mkdir(exist_ok=True)
+        path = LOG_DIR / f"console_{started:%Y%m%d_%H%M%S}.log"
+        sys.stdout = _Tee(sys.stdout, path)
+        sys.stderr = _Tee(sys.stderr, path)
+        return path
+    except Exception:  # noqa: BLE001 - 로그 파일을 못 만들어도 실행은 계속한다
+        return None
 
 
 def main() -> int:
@@ -48,6 +88,7 @@ def main() -> int:
                    help="이미 만들어둔 업로드용 CSV로 6~8단계만 실행 "
                         "(상한 초과로 멈춘 뒤 확인하고 재실행할 때)")
     args = p.parse_args()
+    console_log = _tee_console(datetime.now())
 
     log("=" * 60)
     if args.csv:
@@ -71,6 +112,8 @@ def main() -> int:
     log("")
     log("=" * 60)
     log(pipeline.summarize(result))
+    if console_log:
+        log(f"실행 로그: {console_log}")
     log("=" * 60)
 
     if result.stopped_reason and not result.applied:

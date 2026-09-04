@@ -94,7 +94,25 @@ TRACKING_BUTTON_TEXTS = ["배송상세조회", "배송조회", "배송 조회", 
 
 COURIER_PATTERN = re.compile(r"택배사\n([^\n]{1,20})")
 TRACKING_NO_PATTERN = re.compile(r"(?:송장번호|운송장번호)\n([0-9][0-9\-]{5,})")
+# 주의: "결제완료"는 주문 상태가 아니라 결제정보 칸의 배지(.paymentStep
+# .statusBadge)라서 **결제한 주문이면 취소된 것까지 전부** 갖고 있다. 그래서
+# 이 판정은 송장이 없고 취소 표시도 없다는 걸 확인한 뒤에만 한다.
 NOT_YET_PATTERNS = ["상품준비중", "배송준비중", "결제완료"]
+
+# 주문상세에서 취소를 알아보는 자리 (2026-09-04 실측, 취소완료 주문 1건과 정상
+# 주문 1건 비교). 화면 전체 텍스트로는 못 가린다 - 왼쪽 메뉴의 "취소/교환/반품
+# 내역"과 정상 주문의 [취소하기] 버튼에도 '취소'가 들어 있어서다.
+#   - 상태 버튼 자리(.orderStatusInfoButtons): 취소된 주문은 "취소현황",
+#     아직 살아 있는 주문은 "취소하기".
+#   - 결제정보 배지(.paymentStep .statusBadge): 취소된 결제에 "결제취소"가 붙는다
+#     (정상 주문은 "결제완료"만).
+_DETAIL_STATUS_JS = """() => ({
+  buttons: [...document.querySelectorAll('.orderStatusInfoButtons')].map(el => el.innerText.trim()),
+  badges: [...document.querySelectorAll('.paymentStep .statusBadge')].map(el => el.innerText.trim()),
+})"""
+DETAIL_CANCELLED_BUTTON = "취소현황"
+DETAIL_CANCELLED_BADGE = "결제취소"
+DETAIL_ALIVE_BUTTON = "취소하기"
 
 # --------------------------------------------------------------------------
 # 주문내역 목록으로 먼저 걸러내기 (prepare_batch)
@@ -221,13 +239,29 @@ def prepare_batch(context: BrowserContext, orders, headless: bool = True) -> Non
         f" (송장까지 읽은 건 {shipped}건).")
 
 
+# API 한 번이 잠깐 실패했다고 목록 전체를 화면 방식으로 물리면, 화면 카드는
+# 지난 예정일을 숨기고 상태 글자도 비어 있는 경우가 있어 예정 문구가 통째로
+# 빠진다 (2026-09-04 09:25 실행: 롯데온 5건의 '출고/도착예정'이 빈칸이었고,
+# 화면 목록으로 다시 읽으니 그 기록과 똑같았다). 그래서 한 번은 다시 묻는다.
+API_RETRY_GAP_SEC = 1.0
+
+
 def _post_json(context: BrowserContext, url: str, payload: dict) -> dict | None:
-    """API 한 번. 200이 아니면 None - 호출한 쪽이 화면 방식으로 물러난다."""
-    response = context.request.post(url, data=json.dumps(payload), headers=API_HEADERS)
-    if response.status != 200:
-        common.safe_print(f"[lotteon] {url.rsplit('/', 1)[-1]} 응답이 {response.status}입니다.")
-        return None
-    return response.json()
+    """API 한 번 (잠깐 실패하면 한 번 더). 그래도 안 되면 None - 호출한 쪽이 화면 방식으로 물러난다."""
+    name = url.rsplit("/", 1)[-1]
+    for attempt in (1, 2):
+        try:
+            response = context.request.post(url, data=json.dumps(payload), headers=API_HEADERS)
+            if response.status == 200:
+                return response.json()
+            problem = f"응답이 {response.status}입니다"
+        except Exception as e:  # noqa: BLE001 - 네트워크 오류도 한 번은 다시 시도한다
+            problem = f"요청이 실패했습니다 ({e})"
+        if attempt == 1:
+            common.safe_print(f"[lotteon] {name} {problem} - 잠시 후 한 번 더 시도합니다.")
+            common.sleep(API_RETRY_GAP_SEC)
+    common.safe_print(f"[lotteon] {name} {problem}.")
+    return None
 
 
 def _prefetch_via_api(context: BrowserContext, wanted: set[str]) -> dict[str, dict] | None:
@@ -604,6 +638,28 @@ def _answer_from_listed(card: dict, od_no: str, order_option: str | None) -> Tra
     return result
 
 
+def _raise_if_detail_cancelled(page, od_no: str) -> None:
+    """주문상세의 상태 버튼/결제 배지로 취소된 주문이면 OrderCancelled를 던진다.
+
+    [취소하기] 버튼이 아직 있으면(일부만 취소된 주문) 살아 있는 상품이 남은
+    것이라 취소로 보지 않는다 - base.raise_if_cancelled의 '준비가 이긴다'
+    규칙과 같은 뜻이다.
+    """
+    try:
+        found = page.evaluate(_DETAIL_STATUS_JS) or {}
+    except Exception:  # noqa: BLE001 - 상태 요소를 못 읽으면 예전 판정으로 넘어간다
+        return
+    buttons = [t for t in found.get("buttons") or [] if t]
+    badges = [t for t in found.get("badges") or [] if t]
+    if any(DETAIL_ALIVE_BUTTON in t for t in buttons):
+        return
+    marker = next((t for t in buttons if DETAIL_CANCELLED_BUTTON in t), None)         or next((t for t in badges if DETAIL_CANCELLED_BADGE in t), None)
+    if marker:
+        raise OrderCancelled(
+            f"주문상세에 '{marker}' 표시가 있습니다 (odNo={od_no}) - 취소/품절 주문인지 확인해주세요."
+        )
+
+
 def _scrape_tracking_from_page(page, od_no: str, order_option: str | None = None) -> TrackingResult:
     # 버튼을 눌렀으면 송장번호가 화면에 뜰 때까지만 기다린다 - 예전에는 여기서
     # 무조건 1.5초를 잤는데, 실측(실주문 3건) 0.06~0.17초면 떠서 그 차이가
@@ -616,6 +672,10 @@ def _scrape_tracking_from_page(page, od_no: str, order_option: str | None = None
 
     tracking_matches = list(TRACKING_NO_PATTERN.finditer(body_text))
     if not tracking_matches:
+        # 취소를 먼저 본다. 미발급 판정의 "결제완료"는 취소된 주문에도 있어서
+        # (결제정보 배지) 순서를 바꾸면 취소 건이 매번 '미발급'으로 넘어간다 -
+        # 2026-09-04 취소완료 주문이 그렇게 스킵에 묻혔다.
+        _raise_if_detail_cancelled(page, od_no)
         if any(p in body_text for p in NOT_YET_PATTERNS):
             raise TrackingNotAvailableYet(f"아직 송장번호가 발급되지 않았습니다 (odNo={od_no}).")
         raise_if_cancelled(body_text, od_no)
