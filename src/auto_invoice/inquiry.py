@@ -212,7 +212,8 @@ def _append_ledger(entry: dict, path: Path = LEDGER_PATH) -> None:
 # 실행
 # --------------------------------------------------------------------------
 
-def plan(excel_path: str | Path | None = None) -> tuple[Path | None, list[InquiryTarget], dict[str, list[InquiryTarget]], list[InquiryResult]]:
+def plan(excel_path: str | Path | None = None
+         ) -> tuple[Path | None, list[InquiryTarget], dict[str, list[InquiryTarget]], list[InquiryResult]]:
     """무엇을 문의할지 정한다 (실제로 남기기 전에 GUI가 확인창에 보여주는 용도).
 
     돌려주는 것: (엑셀 경로, 2일 지남 전체, 사이트별 문의할 건, 문의하지 않고
@@ -227,17 +228,20 @@ def plan(excel_path: str | Path | None = None) -> tuple[Path | None, list[Inquir
     by_site: dict[str, list[InquiryTarget]] = {}
     skipped: list[InquiryResult] = []
     for t in targets:
-        site = t.site_key
+        adapter = get_adapter(t.product_url) if t.product_url else None
+        site = getattr(adapter, "SITE_KEY", None)
         if t.order_id in already:
-            skipped.append(InquiryResult.of(t, site or "", "skip", "이미 문의를 남긴 주문"))
-        elif not t.product_url or site is None:
-            skipped.append(InquiryResult.of(t, site or "", "skip", "상품URL이 없거나 모르는 사이트"))
-        elif getattr(get_adapter(t.product_url), "post_inquiry", None) is None:
-            skipped.append(InquiryResult.of(t, site, "skip", f"{site}는 아직 문의 자동화를 지원하지 않음 - 직접 남겨주세요"))
+            why = "이미 문의를 남긴 주문"
+        elif adapter is None or site is None:
+            why = "상품URL이 없거나 모르는 사이트"
+        elif getattr(adapter, "post_inquiry", None) is None:
+            why = f"{site}는 아직 문의 자동화를 지원하지 않음 - 직접 남겨주세요"
         elif not t.recipient_name:
-            skipped.append(InquiryResult.of(t, site, "skip", "수령인 이름이 비어 있어 문의 문구를 만들 수 없음"))
+            why = "수령인 이름이 비어 있어 문의 문구를 만들 수 없음"
         else:
             by_site.setdefault(site, []).append(t)
+            continue
+        skipped.append(InquiryResult.of(t, site, "skip", why))
     return path, targets, by_site, skipped
 
 
@@ -257,7 +261,6 @@ def run(excel_path: str | Path | None = None, *, limit: int | None = None,
     result.results.extend(skipped)
     if path is None:
         result.stopped_reason = f"바탕화면에 '{RESULT_GLOB}' 파일이 없습니다. 먼저 송장 조회를 돌려주세요."
-        log(result.stopped_reason)
         return result
 
     log(f"결과 엑셀: {path.name}")
@@ -277,10 +280,9 @@ def run(excel_path: str | Path | None = None, *, limit: int | None = None,
     if dry_run:
         for site, items in by_site.items():
             for t in items:
-                log(f"  [{site}] {t.order_id} {t.recipient_name}: "
-                    f"'{_message_for(site, t)}' (미리보기 - 남기지 않음)")
-                result.results.append(InquiryResult.of(t, site, "skip", "미리보기 (dry-run)",
-                                                        _message_for(site, t)))
+                message = _message_for(t)
+                log(f"  [{site}] {t.order_id} {t.recipient_name}: '{message}' (미리보기 - 남기지 않음)")
+                result.results.append(InquiryResult.of(t, site, "skip", "미리보기 (dry-run)", message))
         return result
 
     settings = load_settings()
@@ -291,65 +293,72 @@ def run(excel_path: str | Path | None = None, *, limit: int | None = None,
     return result
 
 
-def _message_for(site: str, target: InquiryTarget) -> str:
-    adapter = get_adapter(target.product_url)
-    make = getattr(adapter, "inquiry_message", None)
+def _message_for(target: InquiryTarget) -> str:
+    """어댑터가 문구를 정하면 그것을, 없으면 기본 문구를."""
+    make = getattr(get_adapter(target.product_url), "inquiry_message", None)
     return make(target.recipient_name) if make else f"{target.recipient_name} 배송 언제 시작하나요?"
 
 
 def _post_site(site: str, items: list[InquiryTarget], *, settings, headless: bool,
                result: InquiryRun, log: LogFn) -> None:
+    """한 사이트의 주문들을 브라우저 하나로 한 건씩 남긴다.
+
+    요청 간격은 송장조회와 같은 방식이다 - '앞 건을 시작한 시각 + 간격' 전에는
+    다음 건을 시작하지 않는다(간격에 조회 시간이 포함된다). 로그인이 막히면
+    (BlockedError) 남은 건은 시도하지 않고 바로 넘긴다 - 주문마다 몇 분씩
+    로그인 대기를 반복하지 않도록.
+    """
     adapter = get_adapter(items[0].product_url)
     started = time.monotonic()
+    total = len(items)
+
+    def record(i: int, t: InquiryTarget, status: str, reason: str, message: str) -> None:
+        result.results.append(InquiryResult.of(t, site, status, reason, message))
+        verb = {"success": f"남김 - '{message}'", "fail": f"실패 - {reason}"}.get(status, reason)
+        log(f"[{site}] {i}/{total} {t.order_id} {t.recipient_name}: {verb}")
+
     with sync_playwright() as p, contextlib.ExitStack() as stack:
         browser, context = browser_mod.get_context(
             p, site, headless=headless,
             context_kwargs=getattr(adapter, "CONTEXT_KWARGS", None))
         stack.callback(browser.close)
-        blocked_reason: str | None = None
-        next_allowed = 0.0
-        try:
-            for i, t in enumerate(items, start=1):
-                if blocked_reason is not None:
-                    result.results.append(InquiryResult.of(t, site, "skip", f"앞 주문에서 막혀 건너뜀: {blocked_reason}"))
-                    continue
-                wait = next_allowed - time.monotonic()
-                if wait > 0:
-                    common.sleep(wait)
-                next_allowed = time.monotonic() + rate_limit.request_gap(
-                    settings.delay_min, settings.delay_max)
-                message = _message_for(site, t)
-                try:
-                    done = adapter.post_inquiry(context, t.product_url, t.recipient_name,
-                                                headless=headless)
-                except BlockedError as e:
-                    blocked_reason = str(e)
-                    result.results.append(InquiryResult.of(t, site, "fail", blocked_reason, message))
-                    log(f"[{site}] {i}/{len(items)} {t.order_id} {t.recipient_name}: 실패 - {e}")
-                    continue
-                except AdapterError as e:
-                    result.results.append(InquiryResult.of(t, site, "fail", str(e), message))
-                    log(f"[{site}] {i}/{len(items)} {t.order_id} {t.recipient_name}: 실패 - {e}")
-                    continue
-                except Exception as e:  # noqa: BLE001 - 한 건의 예상 못 한 오류가 나머지를 막으면 안 된다
-                    result.results.append(InquiryResult.of(t, site, "fail", f"{type(e).__name__}: {e}", message))
-                    log(f"[{site}] {i}/{len(items)} {t.order_id} {t.recipient_name}: 실패 - {e}")
-                    continue
-                _append_ledger({
-                    "order_id": t.order_id,
-                    "site": site,
-                    "recipient_name": t.recipient_name,
-                    "product_url": t.product_url,
-                    "order_date": t.order_date,
-                    "message": message,
-                    "posted_at": datetime.now().isoformat(timespec="seconds"),
-                })
-                result.results.append(InquiryResult.of(t, site, "success", done, message))
-                log(f"[{site}] {i}/{len(items)} {t.order_id} {t.recipient_name}: 남김 - '{message}'")
-        finally:
+        # 세션 저장은 브라우저를 닫기 전에 - ExitStack은 나중에 넣은 것을 먼저 푼다.
+
+        def _save_state() -> None:
             with contextlib.suppress(Exception):
                 browser_mod.save_state(context, site)
-            log(f"[{site}] {len(items)}건에 {time.monotonic() - started:.1f}초 걸렸습니다.")
+
+        stack.callback(_save_state)
+        blocked_reason: str | None = None
+        next_allowed = 0.0
+        for i, t in enumerate(items, start=1):
+            message = _message_for(t)
+            if blocked_reason is not None:
+                record(i, t, "skip", f"앞 주문에서 막혀 건너뜀: {blocked_reason}", message)
+                continue
+            common.sleep(next_allowed - time.monotonic())
+            next_allowed = time.monotonic() + rate_limit.request_gap(
+                settings.delay_min, settings.delay_max)
+            try:
+                done = adapter.post_inquiry(context, t.product_url, t.recipient_name,
+                                            headless=headless)
+            except Exception as e:  # noqa: BLE001 - 한 건의 오류가 나머지를 막으면 안 된다
+                reason = str(e) if isinstance(e, AdapterError) else f"{type(e).__name__}: {e}"
+                if isinstance(e, BlockedError):
+                    blocked_reason = reason
+                record(i, t, "fail", reason, message)
+                continue
+            _append_ledger({
+                "order_id": t.order_id,
+                "site": site,
+                "recipient_name": t.recipient_name,
+                "product_url": t.product_url,
+                "order_date": t.order_date,
+                "message": message,
+                "posted_at": datetime.now().isoformat(timespec="seconds"),
+            })
+            record(i, t, "success", done, message)
+    log(f"[{site}] {total}건에 {time.monotonic() - started:.1f}초 걸렸습니다.")
 
 
 def summarize(run_result: InquiryRun) -> str:
