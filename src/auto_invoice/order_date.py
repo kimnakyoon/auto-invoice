@@ -5,7 +5,9 @@
 챙겨봐야 한다(예: 주문상세 8월 26일 / 오늘 8월 28일). 그래서 조회하는 김에
 주문상세의 날짜를 같이 읽어두고, 마지막 결과 요약과 결과 엑셀에 따로 모아
 보여준다. 어떤 건을 그 목록에 넣을지는 report.py의 is_stale_entry가
-정한다 - 이 모듈은 날짜만 다룬다.
+정한다 - 이 모듈은 날짜만 다룬다. '며칠 지났나'는 주말(토·일)을 빼고 센다
+(days_since) - 공급사가 주말에는 출고하지 않으니 금요일 주문을 월요일에 봐도
+하루 기다린 셈이다.
 
 날짜를 잘못 읽어 멀쩡한 주문을 '오래됨'으로 올리면 목록 전체를 못 믿게 되므로,
 화면에 있는 아무 날짜나 줍지 않는다. 아래 세 규칙 중 하나에 걸리는 날짜만
@@ -30,8 +32,13 @@ import re
 from datetime import date, timedelta
 
 # 오늘과 이만큼(일) 이상 벌어진 주문일이면 따로 모아 보여준다.
-# 사용자 기준: 주문상세 8월 26일 / 오늘 8월 28일 = 2일 -> 해당됨.
+# 사용자 기준: 주문상세 8월 26일(수) / 오늘 8월 28일(금) = 2일 -> 해당됨.
+# 일수는 주말을 빼고 센다(days_since) - 금요일 주문을 월요일에 보면 1일.
 STALE_DAYS = 2
+
+# 지난 일수를 셀 때 건너뛰는 요일 (date.weekday(): 월=0 ... 토=5, 일=6).
+# 공급사가 주말에는 출고하지 않으니 토·일은 '기다린 날'로 치지 않는다.
+_WEEKEND = (5, 6)
 
 # 주문상세 화면에서 주문일 앞에 붙는 라벨. 앞에 있는 것부터 찾아서 먼저
 # 걸리는 쪽을 쓴다("주문일자"가 "주문일"보다 앞에 있어야 하는 이유).
@@ -212,11 +219,30 @@ def from_json(data) -> date | None:
     return None
 
 
-def days_since(order_date: date | None) -> int | None:
-    """주문일로부터 오늘까지 며칠 지났는지 (미래 날짜면 음수)."""
+def days_since(order_date: date | None, today: date | None = None) -> int | None:
+    """주문일로부터 오늘까지 며칠 지났는지 - 주말(토·일)은 빼고 센다.
+
+    주문일 다음 날부터 오늘까지 하루씩 보며 토·일이 아닌 날만 센다. 그래서
+    금요일(1일) 주문을 월요일(4일)에 보면 달력으로는 3일이지만 토·일을 빼고
+    1일이다(사용자 기준). 주말이 끼지 않으면 달력 일수와 같다.
+
+    토·일에 조회하면 그 날은 세지 않으므로 금요일에 본 값과 같다 - 공급사가
+    주말에 출고하지 않는 이상 '더 기다린' 게 아니어서다.
+
+    미래 날짜면 음수(오늘 다음 날부터 그 날짜까지의 평일 수에 -를 붙인 것).
+    today는 시험용 - 안 주면 오늘이다.
+    """
     if order_date is None:
         return None
-    return (date.today() - order_date).days
+    if today is None:
+        today = date.today()
+    start, end, sign = order_date, today, 1
+    if today < order_date:
+        start, end, sign = today, order_date, -1
+    # (start, end] 구간의 평일 수. 하루씩 세어도 길어야 며칠짜리 구간이라 충분하다.
+    weekdays = sum(1 for n in range(1, (end - start).days + 1)
+                   if (start + timedelta(days=n)).weekday() not in _WEEKEND)
+    return sign * weekdays
 
 
 def is_stale(order_date: date | None) -> bool:
@@ -225,7 +251,7 @@ def is_stale(order_date: date | None) -> bool:
 
 
 def describe(order_date: date | None) -> str:
-    """'2026-08-26 (2일 지남)' - 요약과 엑셀에서 같은 문구를 쓴다."""
+    """'2026-08-26 (2일 지남)' - 요약과 엑셀에서 같은 문구를 쓴다 (주말 제외 일수)."""
     if order_date is None:
         return ""
     days = days_since(order_date)

@@ -63,6 +63,8 @@ COL_APPLIED = HEADERS.index("샵마인 반영")
 COL_REASON = HEADERS.index("사유")
 COL_URL = HEADERS.index("상품URL")
 
+# '지난 일수'는 주말(토·일)을 뺀 일수다(order_date.days_since). inquiry.py가 이
+# 칸을 그대로 읽어 '2일'인 건만 문의하므로 머리글 이름은 그대로 둔다.
 STALE_HEADERS = ["마켓 주문번호", "수령인", "주문일", "지난 일수", "출고/도착예정",
                  "상품URL", "조회 결과", "사유"]
 STALE_WIDTHS = [22, 10, 14, 10, 24, 46, 16, 62]
@@ -249,7 +251,7 @@ def _write_title(ws, title: str, rows: list[ReportEntry], last_col: int) -> None
     # 같은 줄 끝에 덧붙인다 - 파일을 열자마자 몇 건인지 보이게.
     stale = stale_entries(rows)
     if stale:
-        counts += (f"          주문일 {order_date_mod.STALE_DAYS}일 이상 지남 "
+        counts += (f"          주문일 {order_date_mod.STALE_DAYS}일 이상 지남(주말 제외) "
                    f"{len(stale)}건 ('{STALE_SHEET_NAME}' 시트 참고)")
     line = ws.cell(row=2, column=1, value=counts)
     line.font = Font(bold=True, size=11, color="3C4043")
@@ -293,7 +295,7 @@ def _write_stale_sheet(ws, stale: list[ReportEntry]) -> None:
     수 있다.
     """
     _write_summary_band(ws, 1, f"주문일이 {order_date_mod.STALE_DAYS}일 이상 지난 주문 "
-                               f"{len(stale)}건 (발송이 늦어지는지 확인해주세요)",
+                               f"{len(stale)}건 (주말 제외 - 발송이 늦어지는지 확인해주세요)",
                         last_col=len(STALE_HEADERS))
 
     ws.append(STALE_HEADERS)
