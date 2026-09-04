@@ -25,6 +25,7 @@
 사람이 공급사 화면을 직접 열어 확인하게 되는데, 주문번호만으로 그 화면을 다시
 찾아가는 게 번거로워서다. 나머지 건은 빈칸으로 둔다 - 모든 줄에 URL이 있으면
 정작 봐야 할 줄이 묻힌다. '출고/도착예정'(eta.py)은 읽힌 건이면 어디든 적는다.
+둘은 같이 보는 값이라(예정일을 보고 화면을 열어 확인) 나란히 붙여 둔다.
 """
 
 from __future__ import annotations
@@ -48,9 +49,9 @@ SUMMARY_SHEET_NAME = "요약"
 # 주문일이 오래된 건만 모아 보여주는 시트 (해당 건이 있을 때만 만든다).
 STALE_SHEET_NAME = "주문일지연"
 
-HEADERS = ["결과", "마켓 주문번호", "수령인", "주문일", "출고/도착예정", "택배사",
-           "송장번호", "샵마인 반영", "사유", "상품URL"]
-COLUMN_WIDTHS = [16, 22, 10, 22, 24, 12, 22, 16, 62, 46]
+HEADERS = ["결과", "마켓 주문번호", "수령인", "주문일", "출고/도착예정", "상품URL",
+           "택배사", "송장번호", "샵마인 반영", "사유"]
+COLUMN_WIDTHS = [16, 22, 10, 22, 24, 46, 12, 22, 16, 62]
 
 # 칸 위치를 숫자로 세지 않고 헤더 이름으로 잡는다 (컬럼을 넣고 빼도 안 깨진다).
 COL_RESULT = HEADERS.index("결과")
@@ -63,8 +64,8 @@ COL_REASON = HEADERS.index("사유")
 COL_URL = HEADERS.index("상품URL")
 
 STALE_HEADERS = ["마켓 주문번호", "수령인", "주문일", "지난 일수", "출고/도착예정",
-                 "조회 결과", "사유", "상품URL"]
-STALE_WIDTHS = [22, 10, 14, 10, 24, 16, 62, 46]
+                 "상품URL", "조회 결과", "사유"]
+STALE_WIDTHS = [22, 10, 14, 10, 24, 46, 16, 62]
 STALE_COL_DAYS = STALE_HEADERS.index("지난 일수")
 STALE_COL_RESULT = STALE_HEADERS.index("조회 결과")
 STALE_COL_REASON = STALE_HEADERS.index("사유")
@@ -196,11 +197,11 @@ def _write_entries_sheet(ws, entries: list[ReportEntry], applied_label: str,
             entry.recipient_name or "",
             order_date_mod.describe(entry.order_date),
             entry.delivery_note or "",
+            (entry.product_url or "") if _order_is_old(entry) else "",
             entry.courier or "",
             entry.tracking_no or "",
             _applied_cell(entry, applied_label),
             entry.reason or "",
-            (entry.product_url or "") if _order_is_old(entry) else "",
         ])
         # 덩어리가 바뀌는 자리(그룹 끝)에는 굵은 선을 그어 나눈다. 결과
         # 이름이 아니라 정렬 자리로 비교해야 '주문일지연으로 끌어올린 성공
@@ -311,9 +312,9 @@ def _write_stale_sheet(ws, stale: list[ReportEntry]) -> None:
             f"{entry.order_date:%Y-%m-%d}",
             f"{order_date_mod.days_since(entry.order_date)}일",
             entry.delivery_note or "",
+            entry.product_url or "",
             label,
             entry.reason or "",
-            entry.product_url or "",
         ])
         row = ws[ws.max_row]
         badge_fill, badge_font, row_fill = _COLORS.get(label, _DEFAULT_COLOR)
