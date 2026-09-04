@@ -58,6 +58,7 @@ from urllib.parse import parse_qs, urlparse
 
 from dotenv import load_dotenv
 from playwright.sync_api import BrowserContext
+from playwright.sync_api import TimeoutError as PlaywrightTimeoutError
 
 from .. import eta as eta_mod
 from .. import order_date as order_date_mod
@@ -765,6 +766,11 @@ def get_tracking(
 #        (주문정보가 이 odNo로 미리 채워져 온다 - 화면에 주문번호가 보인다)
 #   문의유형 [문의유형 선택](button.btnSelProduct) -> 모달 .inquiryTypeList의 [배송]
 #     -> 곧바로 '상세유형 선택' 모달이 열린다 -> [배송일정]
+#     * 유형 목록은 화면이 그려진 뒤 API(largeCategoryInquiryTypeList)로 따로
+#       받아온다 - '문의유형 선택' 글자가 보인 뒤 0.2초쯤 더 걸린다(2026-09-04 실측
+#       0.32초 vs 0.52초). 그 전에 버튼을 누르면 목록이 비어 있어 모달이 안 열리고
+#       클릭은 그냥 무시된다(아무 오류 없이). 그래서 새 탭을 열 때부터 이 응답을
+#       같이 기다린 뒤에 누른다.
 #   문의내용 textarea -> 답변알림 [문자/알림톡](#checkbox1, 기본 해제) -> [등록하기]
 #     -> confirm("1대1 문의를 등록하시겠습니까?") 확인
 #     -> alert("문의가 등록되었습니다. ...") -> 문의내역(customerOneToneHistory)으로 이동
@@ -774,6 +780,7 @@ INQUIRY_TOOLTIP_LINK = "고객센터 1:1문의"
 INQUIRY_FORM_MARK = "문의유형 선택"
 INQUIRY_TYPE_BUTTON = "button.btnSelProduct"
 INQUIRY_TYPE_LIST = ".inquiryTypeList"
+INQUIRY_TYPE_LIST_API = "largeCategoryInquiryTypeList"   # 유형 목록을 내려주는 응답 URL의 일부
 INQUIRY_TYPE = "배송"
 INQUIRY_SUBTYPE_MODAL = "상세유형 선택"
 INQUIRY_SUBTYPE = "배송일정"
@@ -814,7 +821,11 @@ def post_inquiry(context: BrowserContext, product_url: str, recipient_name: str,
         button.first.click()
         link = page.get_by_text(INQUIRY_TOOLTIP_LINK, exact=True)
         link.first.wait_for(state="visible", timeout=INQUIRY_STEP_WAIT_MS)
-        with context.expect_page(timeout=INQUIRY_STEP_WAIT_MS) as opened:
+        # 새 탭이 열리기 전부터 유형 목록 응답을 기다린다 - 탭이 생긴 뒤에 걸면
+        # 그 사이에 응답이 이미 지나가 영영 못 받을 수 있다.
+        type_list_loaded = context.expect_event(
+            "response", lambda r: INQUIRY_TYPE_LIST_API in r.url, timeout=INQUIRY_STEP_WAIT_MS)
+        with type_list_loaded, context.expect_page(timeout=INQUIRY_STEP_WAIT_MS) as opened:
             link.first.click()
         form = opened.value
         form.wait_for_load_state("domcontentloaded")
@@ -835,7 +846,10 @@ def post_inquiry(context: BrowserContext, product_url: str, recipient_name: str,
 
         form.locator(INQUIRY_TYPE_BUTTON).first.click()
         type_item = form.locator(INQUIRY_TYPE_LIST).get_by_text(INQUIRY_TYPE, exact=True)
-        type_item.first.wait_for(state="visible", timeout=INQUIRY_STEP_WAIT_MS)
+        try:
+            type_item.first.wait_for(state="visible", timeout=INQUIRY_STEP_WAIT_MS)
+        except PlaywrightTimeoutError:
+            raise ParseError("[문의유형 선택]을 눌렀는데 유형 목록 창이 열리지 않았습니다.") from None
         type_item.first.click()
         if not common.wait_for_text(form, INQUIRY_SUBTYPE_MODAL, timeout_ms=INQUIRY_STEP_WAIT_MS):
             raise ParseError("문의유형 [배송]을 골랐는데 상세유형 선택 창이 뜨지 않았습니다.")
