@@ -283,6 +283,8 @@ class App:
         try:
             result = inquiry.run(excel_path, headless=False,
                                  log=lambda msg: self._queue.put(("log", msg)))
+            # 남겼는지/못 남겼는지를 사람이 바로 열어볼 엑셀로 (바탕화면).
+            inquiry.save_result_excel(result, log=lambda msg: self._queue.put(("log", msg)))
             inquiry.save_run_log(result)
             self._queue.put(("inquiry_done", result))
         except Exception as e:  # noqa: BLE001
@@ -411,6 +413,7 @@ class App:
                     self._log("=" * 40)
                     self._log(inquiry.summarize(result))
                     self._log("=" * 40)
+                    self._set_result_excel(result.result_excel_path, label="문의 결과 엑셀 열기")
                     self._set_busy(False)
                     if result.stopped_reason:
                         messagebox.showwarning("멈춤", result.stopped_reason)
@@ -422,10 +425,11 @@ class App:
             pass
         self.root.after(200, self._poll_queue)
 
-    def _set_result_excel(self, path) -> None:
+    def _set_result_excel(self, path, label: str = "조회 결과 엑셀 열기") -> None:
+        """[엑셀 열기] 버튼이 열 파일. 송장조회 결과와 문의 결과가 같은 버튼을 쓴다."""
         self._result_excel_path = Path(path) if path else None
         if self._result_excel_path and self._result_excel_path.exists():
-            self.excel_button.config(state="normal")
+            self.excel_button.config(state="normal", text=label)
 
     def open_output(self) -> None:
         if self._output_path and Path(self._output_path).exists():

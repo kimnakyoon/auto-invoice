@@ -32,6 +32,7 @@ def main() -> None:
     print()
     print(inquiry.summarize(result))
     if not args.dry_run:
+        inquiry.save_result_excel(result, log=print)
         saved = inquiry.save_run_log(result)
         if saved:
             print(f"상세 로그: {saved}")
