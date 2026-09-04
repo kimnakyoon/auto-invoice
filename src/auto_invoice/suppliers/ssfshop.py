@@ -65,6 +65,14 @@ load_dotenv()
 DOMAINS = {"ssfshop.com", "www.ssfshop.com"}
 SITE_KEY = "ssfshop"
 
+# 주문당 상세 화면 1개를 여는 사이트. 기본 간격(1.5~4초)은 봇 확인이 잘 뜨는
+# 사이트를 기준으로 잡은 값이라, 화면 하나 여는 데 1.2초쯤 걸리는 여기서는
+# 조회 시간의 절반이 그냥 쉬는 시간이었다 (2026-09-04 실측: 롯데아이몰 6건
+# 15.5초 중 순수 조회 7.5초). 네이버와 같은 간격으로 둔다 - 사람이 주문을
+# 하나씩 눌러 보는 속도다.
+REQUEST_GAP = (1.0, 2.0)
+
+
 LOGIN_PATH = "/public/member/login"
 LOGIN_ID_SELECTOR = "#userId"
 LOGIN_PW_SELECTOR = "#password"
