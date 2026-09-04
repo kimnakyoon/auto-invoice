@@ -19,6 +19,9 @@
 사이트마다 문의 화면이 달라서 어댑터에 post_inquiry(context, product_url,
 recipient_name, headless)가 있는 사이트만 처리하고(지금은 롯데온), 없는
 사이트는 '아직 지원 안 함'으로 결과에 남긴다 - 사람이 그 건은 직접 남긴다.
+어댑터에 prepare_inquiries(context, product_urls, headless)가 더 있으면 그
+사이트의 첫 문의 전에 한 번 불러 배치를 미리 훑게 한다(롯데온은 주문목록
+API로 문의 화면 주소를 읽어 주문마다 상세를 여는 일을 던다).
 """
 
 from __future__ import annotations
@@ -330,6 +333,11 @@ def _post_site(site: str, items: list[InquiryTarget], *, settings, headless: boo
                 browser_mod.save_state(context, site)
 
         stack.callback(_save_state)
+        # 어댑터가 배치를 미리 훑을 수 있으면 첫 문의 전에 한 번 (롯데온은 주문목록
+        # API로 문의 화면 주소를 읽어 주문마다 상세를 여는 일을 던다).
+        prepare = getattr(adapter, "prepare_inquiries", None)
+        if prepare is not None:
+            prepare(context, [t.product_url for t in items], headless=headless)
         blocked_reason: str | None = None
         next_allowed = 0.0
         for i, t in enumerate(items, start=1):

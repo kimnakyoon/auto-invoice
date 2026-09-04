@@ -265,8 +265,12 @@ def _post_json(context: BrowserContext, url: str, payload: dict) -> dict | None:
     return None
 
 
-def _prefetch_via_api(context: BrowserContext, wanted: set[str]) -> dict[str, dict] | None:
-    """주문목록 API로 wanted 주문들의 상태·송장·택배사를 읽는다 (docstring)."""
+def _fetch_list_rows(context: BrowserContext, wanted: set[str]) -> dict[str, list[dict]] | None:
+    """주문목록 API를 페이지 단위로 넘기며 wanted 주문의 줄(dataList 항목)을 모은다.
+
+    송장 선조회(_prefetch_via_api)와 문의 화면 주소 만들기(prepare_inquiries)가
+    같이 쓴다. API가 거부되면 None - 호출한 쪽이 화면 방식으로 물러난다.
+    """
     today = date.today()
     # 주문번호(odNo) 앞 8자리가 주문일(YYYYMMDD)이고 목록은 최신순이다. 한
     # 페이지의 주문이 전부 찾는 주문 중 가장 오래된 것보다 앞서면 더 넘겨봐야
@@ -296,10 +300,15 @@ def _prefetch_via_api(context: BrowserContext, wanted: set[str]) -> dict[str, di
         dates = [d for d in dates if d.isdigit()]
         if oldest_wanted and dates and max(dates) < oldest_wanted:
             break  # 이 페이지부터는 찾는 주문보다 오래된 것뿐이다
-    if not rows_by_od:
-        return {}
+    return rows_by_od
 
-    # 상태 글자(상품준비중/출고지시/배송중 ...)는 별도 API - 한 번에 다 묻는다.
+
+def _fetch_state_titles(context: BrowserContext,
+                        rows_by_od: dict[str, list[dict]]) -> dict[tuple[str, str, str], str] | None:
+    """상태 글자(상품준비중/출고지시/배송중 ...)는 별도 API - 한 번에 다 묻는다.
+
+    (odNo, odSeq, procSeq) -> 상태 글자. API가 거부되면 None.
+    """
     req = [{"odNo": r["odNo"], "odSeq": int(r["odSeq"]), "procSeq": int(r["procSeq"])}
            for rows in rows_by_od.values() for r in rows]
     states = _post_json(context, STATES_API_URL, {"orderReqList": req, "withDvInfo": "N"})
@@ -309,6 +318,19 @@ def _prefetch_via_api(context: BrowserContext, wanted: set[str]) -> dict[str, di
     for d in states.get("data") or []:
         title = ((d.get("stateText") or {}).get("title") or "").strip()
         title_by_key[(str(d.get("odNo")), str(d.get("odSeq")), str(d.get("procSeq")))] = title
+    return title_by_key
+
+
+def _prefetch_via_api(context: BrowserContext, wanted: set[str]) -> dict[str, dict] | None:
+    """주문목록 API로 wanted 주문들의 상태·송장·택배사를 읽는다 (docstring)."""
+    rows_by_od = _fetch_list_rows(context, wanted)
+    if rows_by_od is None:
+        return None
+    if not rows_by_od:
+        return {}
+    title_by_key = _fetch_state_titles(context, rows_by_od)
+    if title_by_key is None:
+        return None
 
     found: dict[str, dict] = {}
     for od_no, rows in rows_by_od.items():
@@ -763,7 +785,12 @@ def get_tracking(
 # (inquiry.py). 사람이 누르는 순서 그대로다:
 #   주문상세 [문의하기](button.btnInquiry) -> 툴팁의 [고객센터 1:1문의]
 #     -> 새 탭 /p/customer/customerCenter/customerOneTone?odNo=...&trNo=...
-#        (주문정보가 이 odNo로 미리 채워져 온다 - 화면에 주문번호가 보인다)
+#        &lrtrNo=...&cmbnDvGrpNo=...  (문의가 붙을 주문은 이 주소로 정해진다)
+#     * 이 세 값은 주문목록 API(getOrderList) 줄에도 그대로 있다(trNo/lrtrNo/
+#       cmbnDvGrpNo). 그래서 문의 배치를 시작할 때 목록을 한 번 읽어두고
+#       (prepare_inquiries) 주문마다 상세 화면·툴팁·새 탭 없이 이 주소로 바로
+#       간다 - 상세 열기 1.3초 + 툴팁/새 탭 0.7초가 문의 화면 한 번(0.7초)으로
+#       준다 (2026-09-04 실측). 목록에 없거나 줄마다 값이 다르면 예전대로 상세를 연다.
 #   문의유형 [문의유형 선택](button.btnSelProduct) -> 모달 .inquiryTypeList의 [배송]
 #     -> 곧바로 '상세유형 선택' 모달이 열린다 -> [배송일정]
 #     * 유형 목록은 화면이 그려진 뒤 API(largeCategoryInquiryTypeList)로 따로
@@ -775,6 +802,8 @@ def get_tracking(
 #     -> confirm("1대1 문의를 등록하시겠습니까?") 확인
 #     -> alert("문의가 등록되었습니다. ...") -> 문의내역(customerOneToneHistory)으로 이동
 # 확인/완료가 둘 다 자바스크립트 dialog라 핸들러로 받는다(로그인과 같은 사정).
+INQUIRY_FORM_URL = ("https://www.lotteon.com/p/customer/customerCenter/customerOneTone"
+                    "?odNo={od_no}&trNo={tr_no}&lrtrNo={lrtr_no}&cmbnDvGrpNo={grp_no}")
 INQUIRY_BUTTON = "button.btnInquiry"
 INQUIRY_TOOLTIP_LINK = "고객센터 1:1문의"
 INQUIRY_FORM_MARK = "문의유형 선택"
@@ -797,41 +826,128 @@ def inquiry_message(recipient_name: str) -> str:
     return INQUIRY_MESSAGE.format(name=recipient_name.strip())
 
 
+# 문의 배치 시작 때 주문목록에서 미리 읽어둔 것: id(context) -> odNo -> {form_url, statuses}
+_inquiry_prefetch: dict[int, dict[str, dict]] = {}
+
+
+def prepare_inquiries(context: BrowserContext, product_urls, headless: bool = False) -> None:
+    """이번에 문의할 주문들의 문의 화면 주소와 상태를 주문목록 API로 미리 읽어둔다.
+
+    inquiry.py가 이 공급사의 첫 문의 전에 한 번 불러준다. 여기서 못 읽은
+    주문(목록에 없음, API 거부, 줄마다 거래번호가 다름)은 post_inquiry가
+    예전처럼 주문상세를 열어 처리하므로, 어떤 예외도 밖으로 내보내지 않는다.
+
+    API는 브라우저 쿠키로 보낸다. 세션이 없으면(첫 실행, 다른 데서 로그인해
+    토큰이 밀림) 거부되므로 그때만 화면을 한 번 열어 로그인하고 다시 묻는다.
+    """
+    wanted: set[str] = set()
+    for url in product_urls:
+        with contextlib.suppress(ParseError):
+            wanted.add(extract_od_no(url))
+    if not wanted:
+        return
+    try:
+        rows_by_od = _fetch_list_rows(context, wanted)
+        if rows_by_od is None:
+            page = context.new_page()
+            try:
+                _goto_logged_in(page, ORDER_LIST_URL, headless)
+            finally:
+                page.close()
+            rows_by_od = _fetch_list_rows(context, wanted)
+        if not rows_by_od:
+            return
+        title_by_key = _fetch_state_titles(context, rows_by_od) or {}
+    except Exception as e:  # noqa: BLE001 - 선조회는 거들 뿐, 안 되면 상세 경로로
+        common.safe_print(f"[lotteon] 주문목록을 미리 읽지 못해 주문마다 상세를 엽니다 ({e}).")
+        return
+
+    found: dict[str, dict] = {}
+    for od_no, rows in rows_by_od.items():
+        keys = {(str(r.get("trNo") or ""), str(r.get("lrtrNo") or ""), str(r.get("cmbnDvGrpNo") or ""))
+                for r in rows}
+        if len(keys) != 1 or not all(next(iter(keys))):
+            continue  # 어느 거래에 문의를 붙일지 목록만으로는 정할 수 없다
+        tr_no, lrtr_no, grp_no = keys.pop()
+        found[od_no] = {
+            "form_url": INQUIRY_FORM_URL.format(od_no=od_no, tr_no=tr_no, lrtr_no=lrtr_no, grp_no=grp_no),
+            "statuses": [title_by_key.get((od_no, str(r.get("odSeq")), str(r.get("procSeq"))), "")
+                         for r in rows],
+        }
+    _inquiry_prefetch[id(context)] = found
+    common.safe_print(f"[lotteon] 주문목록에서 {len(found)}/{len(wanted)}건의 문의 화면 주소를 미리 읽었습니다.")
+
+
+def _raise_if_prefetched_cancelled(prefetched: dict, od_no: str) -> None:
+    """목록 상태가 취소/품절이면 문의를 남기지 않는다 (상세 화면의 판정과 같은 뜻).
+
+    '아직 준비 중'(TrackingNotAvailableYet)은 문의 대상 그 자체라 그냥 지나간다.
+    """
+    with contextlib.suppress(TrackingNotAvailableYet):
+        raise_if_cancelled_any(prefetched.get("statuses") or [], od_no)
+
+
+def _open_inquiry_form_from_detail(context: BrowserContext, page, product_url: str,
+                                   od_no: str, headless: bool):
+    """예전 경로 - 주문상세 [문의하기] 툴팁으로 문의 화면을 새 탭에 연다."""
+    _goto_logged_in(page, product_url, headless)
+    if not common.wait_for_text(page, od_no):
+        raise ParseError(f"주문상세가 그려지지 않았습니다 (odNo={od_no}).")
+    _raise_if_detail_cancelled(page, od_no)
+
+    button = page.locator(INQUIRY_BUTTON)
+    if button.count() == 0:
+        raise ParseError(f"주문상세에 [문의하기] 버튼이 없습니다 (odNo={od_no}).")
+    button.first.click()
+    link = page.get_by_text(INQUIRY_TOOLTIP_LINK, exact=True)
+    link.first.wait_for(state="visible", timeout=INQUIRY_STEP_WAIT_MS)
+    # 새 탭이 열리기 전부터 유형 목록 응답을 기다린다 - 탭이 생긴 뒤에 걸면
+    # 그 사이에 응답이 이미 지나가 영영 못 받을 수 있다.
+    type_list_loaded = context.expect_event(
+        "response", lambda r: INQUIRY_TYPE_LIST_API in r.url, timeout=INQUIRY_STEP_WAIT_MS)
+    with type_list_loaded, context.expect_page(timeout=INQUIRY_STEP_WAIT_MS) as opened:
+        link.first.click()
+    form = opened.value
+    form.wait_for_load_state("domcontentloaded")
+    return form
+
+
 def post_inquiry(context: BrowserContext, product_url: str, recipient_name: str,
                  headless: bool = False) -> str:
-    """주문상세에서 1:1 문의(배송 > 배송일정)를 남기고 완료 문구를 돌려준다.
+    """1:1 문의(배송 > 배송일정)를 남기고 완료 문구를 돌려준다.
 
-    어디서든 어긋나면(버튼이 없다, 확인 창이 안 뜬다, 완료 문구가 다르다)
-    ParseError/BlockedError로 올린다 - 남겼는지 불확실한 채로 성공이라고
-    하지 않는다. 남긴 뒤 문의내역 화면으로 넘어간 것까지 확인한다.
+    prepare_inquiries가 주소를 읽어둔 주문은 문의 화면으로 바로 가고, 아니면
+    주문상세의 [문의하기]를 거친다. 어디서든 어긋나면(버튼이 없다, 확인 창이
+    안 뜬다, 완료 문구가 다르다) ParseError/BlockedError로 올린다 - 남겼는지
+    불확실한 채로 성공이라고 하지 않는다. 남긴 뒤 문의내역 화면으로 넘어간
+    것까지 확인한다.
     """
     od_no = extract_od_no(product_url)
     message = inquiry_message(recipient_name)
+    prefetched = _inquiry_prefetch.get(id(context), {}).get(od_no)
+    if prefetched is not None:
+        _raise_if_prefetched_cancelled(prefetched, od_no)
     page = context.new_page()
     form = None
     try:
-        _goto_logged_in(page, product_url, headless)
-        if not common.wait_for_text(page, od_no):
-            raise ParseError(f"주문상세가 그려지지 않았습니다 (odNo={od_no}).")
-        _raise_if_detail_cancelled(page, od_no)
-
-        button = page.locator(INQUIRY_BUTTON)
-        if button.count() == 0:
-            raise ParseError(f"주문상세에 [문의하기] 버튼이 없습니다 (odNo={od_no}).")
-        button.first.click()
-        link = page.get_by_text(INQUIRY_TOOLTIP_LINK, exact=True)
-        link.first.wait_for(state="visible", timeout=INQUIRY_STEP_WAIT_MS)
-        # 새 탭이 열리기 전부터 유형 목록 응답을 기다린다 - 탭이 생긴 뒤에 걸면
-        # 그 사이에 응답이 이미 지나가 영영 못 받을 수 있다.
-        type_list_loaded = context.expect_event(
-            "response", lambda r: INQUIRY_TYPE_LIST_API in r.url, timeout=INQUIRY_STEP_WAIT_MS)
-        with type_list_loaded, context.expect_page(timeout=INQUIRY_STEP_WAIT_MS) as opened:
-            link.first.click()
-        form = opened.value
-        form.wait_for_load_state("domcontentloaded")
+        if prefetched is not None:
+            form = page
+            # 유형 목록 응답은 가기 전부터 받아둔다(놓치면 영영 못 받는다). 로그인이
+            # 끼어들 수 있어 expect_response의 시한 안에 두지 않고 따로 센다.
+            type_list_seen: list[str] = []
+            page.on("response", lambda r: type_list_seen.append(r.url) if INQUIRY_TYPE_LIST_API in r.url else None)
+            _goto_logged_in(page, prefetched["form_url"], headless)
+            waited_ms = 0
+            while not type_list_seen and waited_ms < INQUIRY_STEP_WAIT_MS:
+                page.wait_for_timeout(100)
+                waited_ms += 100
+            if not type_list_seen:
+                raise ParseError(f"1:1 문의 화면의 유형 목록이 오지 않았습니다 (odNo={od_no}, url={page.url}).")
+        else:
+            form = _open_inquiry_form_from_detail(context, page, product_url, od_no, headless)
         if not common.wait_for_text(form, INQUIRY_FORM_MARK, timeout_ms=INQUIRY_STEP_WAIT_MS):
             raise ParseError(f"1:1 문의 화면이 뜨지 않았습니다 (odNo={od_no}, url={form.url}).")
-        # 문의가 이 주문에 붙는지 - 주문정보 칸에 주문번호가 미리 채워져 있어야 한다.
+        # 문의가 이 주문에 붙는지 - 주소의 odNo가 그 근거다.
         if od_no not in form.url and not common.wait_for_text(form, od_no, timeout_ms=INQUIRY_STEP_WAIT_MS):
             raise ParseError(f"1:1 문의 화면에 주문번호가 연결되지 않았습니다 (odNo={od_no}).")
 
@@ -877,7 +993,7 @@ def post_inquiry(context: BrowserContext, product_url: str, recipient_name: str,
             raise ParseError(f"[등록하기]를 눌렀는데 완료 문구가 오지 않았습니다 ({seen}).")
         return done[0].strip()
     finally:
-        if form is not None:
+        if form is not None and form is not page:
             with contextlib.suppress(Exception):
                 form.close()
         page.close()
