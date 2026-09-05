@@ -71,7 +71,6 @@ from .base import (
     OrderNotFound,
     ParseError,
     TrackingNotAvailableYet,
-    raise_if_delayed,
     raise_if_delayed_any,
     attach_order_date,
     normalize_option,
@@ -486,7 +485,6 @@ def _scrape_tracking_from_page(page, order_no: str, order_option: str | None = N
         body_text = page.inner_text("body")
         if any(p in body_text for p in NOT_YET_PATTERNS):
             raise TrackingNotAvailableYet(f"아직 송장번호가 발급되지 않았습니다 (주문번호={order_no}).")
-        raise_if_delayed(body_text, order_no)
         raise_if_cancelled(body_text, order_no)
         raise ParseError(f"배송조회 버튼을 찾지 못했습니다 (주문번호={order_no}).")
 

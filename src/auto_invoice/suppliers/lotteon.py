@@ -70,8 +70,8 @@ from .base import (
     OrderCancelled,
     ParseError,
     TrackingNotAvailableYet,
-    raise_if_delayed,
-    raise_if_delayed_any,
+    ShipmentDelayed,
+    find_delay_keyword,
     normalize_option,
     raise_if_cancelled,
     raise_if_cancelled_any,
@@ -167,7 +167,7 @@ COURIER_NAME_PATTERN = re.compile(r'dvcNm\\*"\s*:\s*\\*"([^"\\]+)')
 # 간격이 붙는다. 송장이 이미 있는 주문은 이 판정에 오지 않으므로(아래
 # _raise_if_listed_settled) 예정일 문구를 미발급으로 봐도 안전하다.
 LIST_NOT_YET_STATUSES = ("상품준비중", "배송준비중", "결제완료", "입금대기",
-                         "주문접수", "출고지시", "도착예정", "발송예정")
+                         "주문접수", "출고지시", "도착예정", "발송예정", "지연")
 
 _LIST_CARDS_JS = """() => [...document.querySelectorAll('.orderGroupWrap')].map(card => ({
   odNo: ((card.querySelector('span.orderNumber') || {}).innerText || '').trim(),
@@ -486,8 +486,6 @@ def _raise_if_listed_settled(card: dict, od_no: str) -> None:
     # 있으면 준비 쪽이 이겨 미발급으로 넘어간다 (base.raise_if_cancelled_any).
     try:
         raise_if_cancelled_any(statuses, od_no)
-        if not any(it.get("invcNo") for it in card.get("items") or []):
-            raise_if_delayed_any(statuses, od_no)  # 지연 줄이면 상세를 열 것 없이 스킵
     except (OrderCancelled, TrackingNotAvailableYet) as e:
         e.order_date, e.delivery_note = order_date, note
         e.sent_request = False  # 미리 읽어둔 목록으로 답했다 - 새 요청 없음
@@ -510,9 +508,13 @@ def _raise_if_listed_settled(card: dict, od_no: str) -> None:
     if note is None and (order_date is None or order_date_mod.is_stale(order_date)):
         return
 
-    error = TrackingNotAvailableYet(
-        f"아직 송장번호가 발급되지 않았습니다 (odNo={od_no}, 주문내역 '{statuses[0]}')."
-    )
+    delayed = find_delay_keyword(" / ".join(statuses))
+    if delayed:
+        error = ShipmentDelayed(
+            f"공급사가 '{delayed}'을(를) 알린 주문이라 아직 발송 전으로 봅니다 (odNo={od_no}).")
+    else:
+        error = TrackingNotAvailableYet(
+            f"아직 송장번호가 발급되지 않았습니다 (odNo={od_no}, 주문내역 '{statuses[0]}').")
     error.order_date, error.delivery_note = order_date, note
     error.sent_request = False  # 미리 읽어둔 목록으로 답했다 - 새 요청 없음
     raise error
@@ -705,7 +707,6 @@ def _scrape_tracking_from_page(page, od_no: str, order_option: str | None = None
         _raise_if_detail_cancelled(page, od_no)
         if any(p in body_text for p in NOT_YET_PATTERNS):
             raise TrackingNotAvailableYet(f"아직 송장번호가 발급되지 않았습니다 (odNo={od_no}).")
-        raise_if_delayed(body_text, od_no)
         raise_if_cancelled(body_text, od_no)
         raise ParseError(f"화면에서 송장번호 텍스트를 찾지 못했습니다 (odNo={od_no}).")
 

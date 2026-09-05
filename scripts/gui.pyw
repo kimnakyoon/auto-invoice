@@ -13,7 +13,7 @@ import queue
 import sys
 import threading
 import tkinter as tk
-from datetime import date, datetime
+from datetime import date
 from pathlib import Path
 from tkinter import filedialog, messagebox
 
@@ -24,10 +24,8 @@ if sys.platform == "win32" and sys.stdout is not None:
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
 
-from auto_invoice import checkpoint, inquiry, pipeline, result_excel  # noqa: E402
+from auto_invoice import checkpoint, console_log, inquiry, pipeline, result_excel  # noqa: E402
 from auto_invoice.orchestrator import run as run_orchestrator  # noqa: E402
-from auto_invoice.report import LOG_DIR  # noqa: E402
-from auto_invoice.suppliers import common as supplier_common  # noqa: E402
 
 DESKTOP = Path.home() / "Desktop"
 
@@ -65,13 +63,12 @@ class App:
         self._output_path: Path | None = None
         self._result_excel_path: Path | None = None
         self._queue: "queue.Queue" = queue.Queue()
-        # 로그창에 찍히는 글을 그대로 남기는 파일 (run_all.py의 console_*.log와
-        # 같은 자리). 창을 닫으면 로그가 사라져서, 2026-09-05 GS샵 로그인이 왜
-        # 사람 손을 탔는지 되짚을 수 없었다. 작업을 시작할 때마다 새로 연다.
+        # 로그창 내용을 그대로 남기는 파일 (logs/console_*.log, console_log.py).
+        # 작업을 시작할 때마다 새로 연다 (_set_busy).
         self._console_log = None
-        # 어댑터 안내문("[gsshop] ...")은 print로 나오는데 pythonw에는 콘솔이
-        # 없어 사라진다 - 로그창으로 돌린다. 작업 스레드에서 불리므로 큐를 거친다.
-        supplier_common.set_log_sink(lambda msg: self._queue.put(("log", msg)))
+        # 어댑터 안내문과 트레이스백은 print/stderr로 나오는데 pythonw에는
+        # 콘솔이 없어 사라진다 - 줄 단위로 로그창에 보낸다.
+        sys.stdout = sys.stderr = console_log.LineWriter(self._worker_log, passthrough=sys.stdout)
 
         # --- 전자동: 샵마인에서 받아서 반영까지 ---
         tk.Label(
@@ -199,17 +196,17 @@ class App:
             except Exception:  # noqa: BLE001 - 로그 파일 때문에 화면이 멈추면 안 된다
                 pass
 
+    def _worker_log(self, msg: str) -> None:
+        """작업 스레드에서 로그창에 한 줄 (Tk는 메인 스레드에서만 만져야 해서 큐를 거친다)."""
+        self._queue.put(("log", msg))
+
     def _start_console_log(self) -> None:
         """이번 작업의 로그 파일을 연다 (logs/console_<시작시각>.log)."""
-        try:
-            if self._console_log is not None:
-                self._console_log.close()
-            LOG_DIR.mkdir(exist_ok=True)
-            path = LOG_DIR / f"console_{datetime.now():%Y%m%d_%H%M%S}.log"
-            self._console_log = open(path, "a", encoding="utf-8")
-            self._log(f"실행 로그: {path}")
-        except Exception:  # noqa: BLE001 - 로그 파일을 못 만들어도 실행은 계속한다
-            self._console_log = None
+        if self._console_log is not None:
+            self._console_log.close()
+        self._console_log = console_log.open_log()
+        if self._console_log is not None:
+            self._log(f"실행 로그: {self._console_log.name}")
 
     def _read_max_apply(self) -> int | None:
         try:
@@ -237,7 +234,6 @@ class App:
             return
 
         self._set_busy(True, "처리 중...")
-        self._start_console_log()
         self._log("전부 자동 처리를 시작합니다. 마우스를 건드리지 말아주세요.\n")
         threading.Thread(target=self._full_auto_worker, args=(max_apply, False),
                          daemon=True).start()
@@ -266,7 +262,6 @@ class App:
             return
 
         self._set_busy(True, "이어서 처리 중...")
-        self._start_console_log()
         self._log(f"멈춘 지점부터 이어서 시작합니다 ({state.describe()}).\n")
         threading.Thread(target=self._full_auto_worker, args=(max_apply, True),
                          daemon=True).start()
@@ -305,16 +300,15 @@ class App:
         ):
             return
         self._set_busy(True, "문의 남기는 중...")
-        self._start_console_log()
         self._log("문의 남기기를 시작합니다.\n")
         threading.Thread(target=self._inquiry_worker, args=(str(path),), daemon=True).start()
 
     def _inquiry_worker(self, excel_path: str) -> None:
         try:
             result = inquiry.run(excel_path, headless=False,
-                                 log=lambda msg: self._queue.put(("log", msg)))
+                                 log=self._worker_log)
             # 남겼는지/못 남겼는지를 사람이 바로 열어볼 엑셀로 (바탕화면).
-            inquiry.save_result_excel(result, log=lambda msg: self._queue.put(("log", msg)))
+            inquiry.save_result_excel(result, log=self._worker_log)
             inquiry.save_run_log(result)
             self._queue.put(("inquiry_done", result))
         except Exception as e:  # noqa: BLE001
@@ -325,7 +319,7 @@ class App:
             result = pipeline.run_full(
                 max_apply=max_apply,
                 resume=resume,
-                log=lambda msg: self._queue.put(("log", msg)),
+                log=self._worker_log,
             )
             self._output_path = result.csv_path
             self._queue.put(("auto_done", result))
@@ -344,6 +338,8 @@ class App:
                                  fg="#d93025")
 
     def _set_busy(self, busy: bool, text: str = "") -> None:
+        if busy:
+            self._start_console_log()  # 작업이 시작되는 자리는 여기뿐이다
         state = "disabled" if busy else "normal"
         self.auto_button.config(state=state,
                                 text=text if busy else "⚡  송장")
@@ -367,7 +363,6 @@ class App:
             return
 
         self._set_busy(True, "처리 중...")
-        self._start_console_log()
         self._log(f"입력 파일: {self.selected_file.name}")
         self._log("처리를 시작합니다. 롯데온 로그인이 필요하면 별도 브라우저 창이 뜹니다...\n")
 
@@ -394,7 +389,7 @@ class App:
                 paths=(("입력 엑셀", self.selected_file),
                        ("업로드용 파일", output_path if counts["success"] else None),
                        ("상세 로그", report_path)),
-                log=lambda msg: self._queue.put(("log", msg)))
+                log=self._worker_log)
             self._queue.put(
                 ("done", (counts, failure_lines, attention_blocks, output_path, excel_path)))
         except Exception as e:  # noqa: BLE001

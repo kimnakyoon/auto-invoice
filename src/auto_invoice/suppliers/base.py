@@ -69,11 +69,9 @@ class TrackingNotAvailableYet(AdapterError):
 class ShipmentDelayed(TrackingNotAvailableYet):
     """공급사가 '발송지연/배송지연/출고지연'을 알린 주문.
 
-    송장은 아직 없지만 기다리면 나오는 건이라 미발급과 같은 스킵이다. 예전에는
-    지연 상태를 아는 어댑터가 없어 '배송조회 버튼을 찾지 못했습니다' 같은
-    실패로 올라갔고(2026-09-05 네이버 '발송지연' 실측), 사람이 매 실행마다
-    같은 주문을 다시 열어봐야 했다. 결과 정리에서 사유가 '발송지연'으로 보이게
-    미발급과 구분만 해둔다.
+    기다리면 송장이 나오는 건이라 미발급과 같은 스킵이다 - 결과 정리에서
+    사유만 '발송지연'으로 구분해 보여준다 (2026-09-05 네이버 실측 전에는
+    '배송조회 버튼을 찾지 못했습니다' 실패로 올라갔다).
     """
 
     skip_reason = "발송지연 (송장 미발급)"
@@ -109,12 +107,10 @@ CANCELLED_KEYWORDS = ("취소", "품절", "불가")
 # 올라가는 데다, 정작 다음 실행에서 다시 조회되지도 않는다.
 PREPARING_KEYWORD = "준비"
 
-# 공급사가 지연을 알리는 표기. 화면 전체 텍스트에서는 '지연' 한 글자만으로
-# 잡으면 "배송이 지연될 수 있습니다" 같은 안내문에도 걸리므로 '발송지연 /
-# 배송 지연 / 출고지연 / 지연발송' 꼴만 본다. 주문상태 값(옥션/지마켓 API
-# 처럼 상태만 정확히 읽는 곳)은 '지연' 한 글자로도 충분하다 - raise_if_delayed_any.
+# 공급사가 지연을 알리는 표기. '지연' 한 글자만으로 잡으면 화면의 "배송이
+# 지연될 수 있습니다" 같은 안내문에도 걸리므로 '발송지연 / 배송 지연 / 출고지연 /
+# 지연발송' 꼴만 본다 (실측한 상태값 '발송지연'도 이 꼴이다).
 DELAY_PATTERN = re.compile(r"(?:발송|배송|출고|입고|출하)\s*지연|지연\s*(?:발송|배송|출고)")
-DELAY_KEYWORD = "지연"
 
 
 def find_cancelled_keyword(text: str | None) -> str | None:
@@ -137,10 +133,11 @@ def find_delay_keyword(text: str | None) -> str | None:
 
 
 def raise_if_delayed(text: str | None, order_no: str) -> None:
-    """화면(또는 상태) 텍스트에 지연 표기가 있으면 ShipmentDelayed를 던진다.
+    """지연 표기가 있으면 ShipmentDelayed를 던진다.
 
-    송장을 못 찾은 뒤, NOT_YET(준비중 등) 판정과 같은 자리에서 부른다 - 지연
-    주문은 준비중 문구가 없어서 그대로 두면 파싱 실패로 떨어진다.
+    raise_if_cancelled가 먼저 부르므로 어댑터가 따로 부를 일은 드물다 - 송장
+    유무를 보기 전에 raise_if_cancelled_any를 부르는 곳(지마켓/네이버 API처럼
+    상태가 여러 줄인 곳)만 송장이 없음을 확인한 뒤 raise_if_delayed_any를 쓴다.
     """
     keyword = find_delay_keyword(text)
     if keyword:
@@ -149,15 +146,16 @@ def raise_if_delayed(text: str | None, order_no: str) -> None:
 
 
 def raise_if_delayed_any(texts: Iterable[str | None], order_no: str) -> None:
-    """주문상태 값이 여러 줄인 곳용. 상태값은 정확하니 '지연' 한 글자로도 본다."""
-    values = [t for t in texts if t]
-    if any(DELAY_KEYWORD in v for v in values):
-        raise ShipmentDelayed(
-            f"공급사가 지연을 알린 주문이라 아직 발송 전으로 봅니다 (주문번호={order_no}, 상태={' / '.join(values)}).")
+    """주문상태 값이 여러 줄인 곳용 - 한 줄이라도 지연이면 던진다."""
+    raise_if_delayed(" / ".join(t for t in texts if t), order_no)
 
 
-def raise_if_cancelled(text: str | None, order_no: str) -> None:
+def raise_if_cancelled(text: str | None, order_no: str, *, delayed: bool = True) -> None:
     """취소/품절 표시가 있으면 OrderCancelled를 던진다.
+
+    지연 표기('발송지연' 등)가 있으면 그쪽을 먼저 본다(ShipmentDelayed) - 지연
+    주문은 준비중 문구가 없어 그대로 두면 파싱 실패로 떨어진다. delayed=False면
+    이 판정을 건너뛴다 (raise_if_cancelled_any가 쓴다 - 아래 참고).
 
     '준비'가 함께 있으면 그쪽이 이긴다 - 취소가 아니라 TrackingNotAvailableYet
     ('아직 미발급')으로 넘어가서, 다음 실행에서 다시 조회된다.
@@ -174,6 +172,8 @@ def raise_if_cancelled(text: str | None, order_no: str) -> None:
 
     한 주문이 여러 줄(옵션별)로 나뉜 화면은 raise_if_cancelled_any 를 쓴다.
     """
+    if delayed:
+        raise_if_delayed(text, order_no)
     keyword = find_cancelled_keyword(text)
     if not keyword:
         return
@@ -195,6 +195,11 @@ def raise_if_cancelled_any(texts: Iterable[str | None], order_no: str) -> None:
     raise_if_cancelled 에 넘기면 '취소' 줄을 먼저 만나는 순간 거기서 끝나버려
     뒤에 있는 '배송준비중' 줄을 못 본다. 그래서 준비 여부는 줄을 다 모아서
     먼저 본다.
+
+    지연은 여기서 보지 않는다. 여러 줄 화면은 대개 송장 유무를 보기 **전에**
+    이 함수를 부르는데(지마켓/네이버 API), 한 줄이 지연이고 다른 줄은 이미
+    나갔으면 그 송장을 써야지 지연으로 넘기면 안 된다. 호출한 쪽이 송장이
+    없음을 확인한 뒤 raise_if_delayed_any를 따로 부른다.
     """
     values = [t for t in texts if t]
     joined = " / ".join(values)
@@ -205,7 +210,7 @@ def raise_if_cancelled_any(texts: Iterable[str | None], order_no: str) -> None:
             f"아직 준비 중인 주문으로 봅니다 (주문번호={order_no}, 상태={joined})."
         )
     for value in values:
-        raise_if_cancelled(value, order_no)
+        raise_if_cancelled(value, order_no, delayed=False)
 
 
 def with_order_date(page, fetch: Callable[[], TrackingResult], *, data=None) -> TrackingResult:

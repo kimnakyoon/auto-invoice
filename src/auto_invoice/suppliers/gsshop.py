@@ -422,13 +422,8 @@ def _login_in_window(
         return True
 
     if not _wait_for_login_form(page):
-        title = ""
-        try:
-            title = page.title()
-        except Exception:  # noqa: BLE001 - 안내문에 쓰는 값이라 못 읽어도 된다
-            pass
         common.safe_print(
-            f"[gsshop] 로그인 페이지에서 아이디 입력창을 찾지 못했습니다(주소={page.url}, 제목={title!r}) "
+            f"[gsshop] 로그인 페이지에서 아이디 입력창을 찾지 못했습니다(주소={page.url}) "
             "- 직접 로그인으로 넘어갑니다."
         )
         return False
