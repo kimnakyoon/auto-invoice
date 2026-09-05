@@ -71,6 +71,8 @@ from .base import (
     OrderNotFound,
     ParseError,
     TrackingNotAvailableYet,
+    raise_if_delayed,
+    raise_if_delayed_any,
     attach_order_date,
     normalize_option,
     raise_if_cancelled,
@@ -231,6 +233,9 @@ def _answer_from_api(context: BrowserContext, detail: dict, order_no: str, order
         if not targets:
             if any(p in status_text for status_text in statuses for p in NOT_YET_PATTERNS):
                 raise TrackingNotAvailableYet(f"아직 송장번호가 발급되지 않았습니다 (주문번호={order_no}).")
+            # 판매자가 발송지연을 알린 주문은 상태가 '발송지연'이고 배송조회
+            # 버튼이 없다 (2026-09-05 실측) - 실패가 아니라 스킵이다.
+            raise_if_delayed_any(statuses, order_no)
             raise ParseError(f"배송조회 버튼을 찾지 못했습니다 (주문번호={order_no}).")
         found = []  # (productOrderNo, 송장번호, 택배사)
         for product_order_no, delivery_no in targets.items():
@@ -481,6 +486,7 @@ def _scrape_tracking_from_page(page, order_no: str, order_option: str | None = N
         body_text = page.inner_text("body")
         if any(p in body_text for p in NOT_YET_PATTERNS):
             raise TrackingNotAvailableYet(f"아직 송장번호가 발급되지 않았습니다 (주문번호={order_no}).")
+        raise_if_delayed(body_text, order_no)
         raise_if_cancelled(body_text, order_no)
         raise ParseError(f"배송조회 버튼을 찾지 못했습니다 (주문번호={order_no}).")
 

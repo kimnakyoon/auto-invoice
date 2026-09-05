@@ -70,6 +70,8 @@ from .base import (
     OrderCancelled,
     ParseError,
     TrackingNotAvailableYet,
+    raise_if_delayed,
+    raise_if_delayed_any,
     normalize_option,
     raise_if_cancelled,
     raise_if_cancelled_any,
@@ -484,6 +486,8 @@ def _raise_if_listed_settled(card: dict, od_no: str) -> None:
     # 있으면 준비 쪽이 이겨 미발급으로 넘어간다 (base.raise_if_cancelled_any).
     try:
         raise_if_cancelled_any(statuses, od_no)
+        if not any(it.get("invcNo") for it in card.get("items") or []):
+            raise_if_delayed_any(statuses, od_no)  # 지연 줄이면 상세를 열 것 없이 스킵
     except (OrderCancelled, TrackingNotAvailableYet) as e:
         e.order_date, e.delivery_note = order_date, note
         e.sent_request = False  # 미리 읽어둔 목록으로 답했다 - 새 요청 없음
@@ -701,6 +705,7 @@ def _scrape_tracking_from_page(page, od_no: str, order_option: str | None = None
         _raise_if_detail_cancelled(page, od_no)
         if any(p in body_text for p in NOT_YET_PATTERNS):
             raise TrackingNotAvailableYet(f"아직 송장번호가 발급되지 않았습니다 (odNo={od_no}).")
+        raise_if_delayed(body_text, od_no)
         raise_if_cancelled(body_text, od_no)
         raise ParseError(f"화면에서 송장번호 텍스트를 찾지 못했습니다 (odNo={od_no}).")
 

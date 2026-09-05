@@ -74,6 +74,8 @@ from .base import (
     BlockedError,
     ParseError,
     TrackingNotAvailableYet,
+    raise_if_delayed,
+    raise_if_delayed_any,
     attach_order_date,
     normalize_option,
     raise_if_cancelled,
@@ -328,6 +330,7 @@ def _scrape_tracking_from_page(page, order_id: str, order_option: str | None = N
             )
         if any(p in body_text for p in NOT_YET_PATTERNS):
             raise TrackingNotAvailableYet(f"아직 송장번호가 발급되지 않았습니다 (orderId={order_id}).")
+        raise_if_delayed(body_text, order_id)
         raise_if_cancelled(body_text, order_id)
         raise ParseError(f"배송조회 버튼을 찾지 못했습니다 (orderId={order_id}).")
 
@@ -348,6 +351,7 @@ def _scrape_tracking_from_page(page, order_id: str, order_option: str | None = N
     if not tracking_matches:
         if any(p in frame_text for p in NOT_YET_PATTERNS):
             raise TrackingNotAvailableYet(f"아직 송장번호가 발급되지 않았습니다 (orderId={order_id}).")
+        raise_if_delayed(frame_text, order_id)
         raise_if_cancelled(frame_text, order_id)
         raise ParseError(f"모달에서 송장번호 텍스트를 찾지 못했습니다 (orderId={order_id}).")
 
@@ -435,6 +439,7 @@ def _answer_from_pay_detail(data: dict, order_id: str, order_option: str | None)
         if not shipped:
             if any(p in status for status in statuses for p in NOT_YET_STATUSES):
                 raise TrackingNotAvailableYet(f"아직 발송 전입니다 (orderId={order_id}, 상태={', '.join(statuses)}).")
+            raise_if_delayed_any(statuses, order_id)
             raise ParseError(f"주문 응답에 송장번호가 없습니다 (orderId={order_id}, 상태={', '.join(statuses)}).")
         if len({number for _, number, _ in shipped}) > 1:
             target = normalize_option(order_option) if order_option else ""

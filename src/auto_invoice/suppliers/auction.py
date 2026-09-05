@@ -89,6 +89,7 @@ from .base import (
     BlockedError,
     ParseError,
     TrackingNotAvailableYet,
+    raise_if_delayed_any,
     attach_order_date,
     raise_if_cancelled,
 )
@@ -737,6 +738,7 @@ def _fetch_tracking(context: BrowserContext, order_no: str,
             raise TrackingNotAvailableYet(
                 f"아직 발송 전입니다 (주문번호={order_no}, 주문상태={status})."
             )
+        raise_if_delayed_any([status], order_no)
 
     # 발송 전도 아닌데 송장이 안 나왔었다 - 아까는 로그인이 풀려 있었던 것일 수
     # 있으므로(위 docstring), 로그인이 확실한 지금 배송조회를 한 번 더 연다.
@@ -758,6 +760,7 @@ def _tracking_for_listed_order(context: BrowserContext, order: ListedOrder) -> T
             raise TrackingNotAvailableYet(
                 f"아직 발송 전입니다 (주문번호={order.order_no}, 주문상태={order.status})."
             )
+        raise_if_delayed_any([order.status], order.order_no)
         raise ParseError(
             f"배송조회를 할 수 없는 주문입니다 (주문번호={order.order_no}, 주문상태={order.status})."
         )

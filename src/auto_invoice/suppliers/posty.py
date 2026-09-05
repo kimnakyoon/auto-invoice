@@ -57,6 +57,7 @@ from .base import (
     OrderNotFound,
     ParseError,
     TrackingNotAvailableYet,
+    raise_if_delayed_any,
     attach_order_date,
     normalize_option,
 )
@@ -456,6 +457,9 @@ def _raise_not_shipped(items: list[dict], order_no: str) -> None:
     if any(s in NOT_YET_STATUSES for s in statuses):
         raise TrackingNotAvailableYet(
             f"아직 송장번호가 발급되지 않았습니다 (주문번호={order_no}, 상태={labels}).")
+    # 지연 상태 코드는 실측한 적이 없어 이름만으로 잡는다 (예: SHIPMENT_DELAYED).
+    if any("DELAY" in s for s in statuses):
+        raise_if_delayed_any(["지연"], order_no)
     if any(s in CANCELLED_STATUSES for s in statuses):
         raise OrderCancelled(
             f"주문 상태가 {labels} 입니다 (주문번호={order_no}) - 취소/반품 주문인지 확인해주세요.")

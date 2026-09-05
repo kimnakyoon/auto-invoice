@@ -55,6 +55,7 @@ from .base import (
     BlockedError,
     ParseError,
     TrackingNotAvailableYet,
+    raise_if_delayed_any,
     normalize_option,
     raise_if_cancelled_any,
     with_order_date,
@@ -236,6 +237,7 @@ def _raise_not_shipped(rows: list[dict], order_no: str) -> None:
     normalized = [normalize_option(s) for s in statuses]
     if any(normalize_option(p) in n for p in NOT_YET_STATUSES for n in normalized):
         raise TrackingNotAvailableYet(f"아직 송장번호가 발급되지 않았습니다 (주문번호={order_no}).")
+    raise_if_delayed_any(statuses, order_no)
     raise ParseError(
         f"화면에서 배송조회 정보를 찾지 못했습니다 (주문번호={order_no}, 주문상태={' / '.join(statuses) or '읽지 못함'})."
     )

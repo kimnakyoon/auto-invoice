@@ -459,6 +459,61 @@ def _path_edit(upload_hwnd):
     return winui.find_child(upload_hwnd, "EDIT", hit)
 
 
+def _dialog_filename_typed(dlg_hwnd, csv_str) -> bool:
+    """'열기' 대화상자의 파일 이름 칸에 우리가 친 경로가 들어갔는가.
+
+    파일 이름 칸은 ComboBoxEx32 안의 Edit 라 직계 자식으로는 안 잡힌다 -
+    하위 전체에서 Edit 를 찾아 그 글자를 본다. 대화상자에는 검색칸 같은 다른
+    Edit 도 있어서, 어느 하나라도 경로를 담고 있으면 된다.
+    """
+    for k in winui.find_descendants(dlg_hwnd, class_name="Edit"):
+        try:
+            if csv_str in winui.ctrl_text(k):
+                return True
+        except Exception:  # noqa: BLE001 - 읽기 실패는 '아직 안 들어감'과 같다
+            continue
+    return False
+
+
+def _type_into_dialog(dlg_hwnd, csv_str, log=print) -> bool:
+    """대화상자 파일 이름 칸에 경로를 치고, 실제로 들어갔는지 확인한다.
+
+    타이핑은 '지금 포커스를 가진 창'으로 간다. 사람이 그 사이 다른 창을
+    누르면 글자가 엉뚱한 데로 새고 Enter 만 대화상자에 남는다 - 그래서 치고
+    나서 반드시 읽어보고, 안 들어갔으면 앞으로 다시 가져와 한 번 더 친다.
+    """
+    for attempt in (1, 2, 3):
+        if not winui.bring_to_front(dlg_hwnd):
+            log(f"  파일 선택 대화상자를 앞으로 가져오지 못했습니다 ({attempt}/3)")
+            time.sleep(0.5)
+            continue
+        time.sleep(0.25)
+        winui.ctrl_key(VK_A)
+        time.sleep(0.15)
+        winui.type_text(csv_str)
+        time.sleep(0.3)
+        if _dialog_filename_typed(dlg_hwnd, csv_str):
+            return True
+        log(f"  경로가 파일 이름 칸에 안 들어갔습니다 - 다시 칩니다 ({attempt}/3)")
+    return False
+
+
+def _wait_path_shown(upload_hwnd, csv_str, timeout: float = 3.0) -> tuple[object, str]:
+    """대화상자가 닫힌 뒤 경로칸이 채워질 때까지 잠깐 기다린다.
+
+    샵마인은 대화상자가 닫힌 다음 자기 UI 스레드에서 경로칸을 채운다 -
+    닫히자마자 읽으면 아직 빈 칸일 수 있다. (edit, 보인 글자)를 돌려준다.
+    """
+    end = time.time() + timeout
+    edit, shown = None, ""
+    while True:
+        edit = _path_edit(upload_hwnd)
+        shown = winui.ctrl_text(edit) if edit is not None else ""
+        if csv_str in shown or time.time() >= end:
+            return edit, shown
+        time.sleep(0.2)
+
+
 def _pick_csv_file(upload_hwnd, csv_str, log=print) -> None:
     """[찾아보기]로 CSV 파일을 고른다.
 
@@ -467,36 +522,53 @@ def _pick_csv_file(upload_hwnd, csv_str, log=print) -> None:
     고른 파일'을 쓰기 때문이다. 결과 창도 빈 채로 "준비."만 뜨고 오류조차
     알려주지 않아서, 3건이 조용히 반영되지 않은 걸 그리드를 보고서야 알았다.
     그래서 반드시 대화상자를 거친다.
+
+    2026-09-05 두 번 연속 "고른 파일이 경로칸에 반영되지 않았습니다 (화면: '')"
+    로 멈췄다. 대화상자는 닫혔는데 경로칸이 비어 있었다는 뜻인데, 사람이 그
+    순간 키보드/마우스를 쓰고 있었다(직전에 GS샵 로그인을 직접 하던 참이었다).
+    타이핑이 다른 창으로 새거나 사람이 대화상자를 닫아버리면 정확히 이렇게
+    된다. 그래서 (1) 친 글자가 파일 이름 칸에 들어갔는지 확인하고 나서 Enter,
+    (2) 닫힌 뒤 경로칸이 채워질 때까지 잠깐 기다리고, (3) 그래도 비어 있으면
+    처음부터 한 번 더 한다.
     """
     browse = winui.find_child(upload_hwnd, "BUTTON",
                               lambda k: winui.ctrl_text(k).startswith("찾아보기"))
     if browse is None:
         raise UploadError("[찾아보기] 버튼을 찾지 못했습니다.")
-    winui.bring_to_front(upload_hwnd)
-    time.sleep(0.2)
-    winui.press_button(browse)
 
-    dlg = winui.wait_for_window(title_equals=OPEN_DIALOG_TITLE, timeout=15.0)
-    if dlg is None:
-        raise UploadError(f"[찾아보기] 후 '{OPEN_DIALOG_TITLE}' 대화상자가 뜨지 않았습니다.")
-    if not winui.bring_to_front(dlg[0]):
-        raise UploadError("파일 선택 대화상자를 앞으로 가져오지 못했습니다.")
-    time.sleep(0.25)
-    winui.ctrl_key(VK_A)
-    time.sleep(0.15)
-    winui.type_text(csv_str)
-    time.sleep(0.3)
-    winui.key(VK_RETURN)
+    last_error = ""
+    for attempt in (1, 2):
+        if attempt > 1:
+            log(f"  {last_error} - 파일 선택을 한 번 더 시도합니다 (2/2)")
+        winui.bring_to_front(upload_hwnd)
+        time.sleep(0.2)
+        winui.press_button(browse)
 
-    if not winui.wait_for_window_gone(title_equals=OPEN_DIALOG_TITLE, timeout=15.0):
-        raise UploadError(
-            f"파일 선택 대화상자가 닫히지 않았습니다 - 경로가 거부됐을 수 있습니다: {csv_str}")
+        dlg = winui.wait_for_window(title_equals=OPEN_DIALOG_TITLE, timeout=15.0)
+        if dlg is None:
+            raise UploadError(f"[찾아보기] 후 '{OPEN_DIALOG_TITLE}' 대화상자가 뜨지 않았습니다.")
+        if not _type_into_dialog(dlg[0], csv_str, log=log):
+            raise UploadError(
+                "파일 선택 대화상자에 경로를 입력하지 못했습니다 - 실행 중에 다른 창을 "
+                "누르거나 키보드를 쓰면 이렇게 됩니다. 손을 떼고 다시 실행해주세요.")
+        winui.key(VK_RETURN)
 
-    edit = _path_edit(upload_hwnd)
-    shown = winui.ctrl_text(edit) if edit is not None else ""
-    if csv_str not in shown:
-        raise UploadError(f"고른 파일이 경로칸에 반영되지 않았습니다 (화면: {shown!r}).")
-    log(f"  파일 선택: {csv_str}")
+        if not winui.wait_for_window_gone(title_equals=OPEN_DIALOG_TITLE, timeout=15.0):
+            raise UploadError(
+                f"파일 선택 대화상자가 닫히지 않았습니다 - 경로가 거부됐을 수 있습니다: {csv_str}")
+
+        edit, shown = _wait_path_shown(upload_hwnd, csv_str)
+        if csv_str in shown:
+            log(f"  파일 선택: {csv_str}")
+            return
+        if edit is None:
+            last_error = "발송정보일괄등록 창에서 경로칸을 찾지 못했습니다"
+        else:
+            last_error = f"고른 파일이 경로칸에 반영되지 않았습니다 (화면: {shown!r})"
+
+    raise UploadError(
+        f"{last_error}. 실행 중에 대화상자를 직접 닫거나 다른 창을 누르면 이렇게 "
+        "됩니다 - 손을 떼고 [멈춘 지점부터 다시 시작]을 눌러주세요.")
 
 
 def bulk_register(csv_path, log=print) -> None:

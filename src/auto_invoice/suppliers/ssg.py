@@ -48,6 +48,7 @@ from .base import (
     OrderCancelled,
     ParseError,
     TrackingNotAvailableYet,
+    raise_if_delayed,
     attach_order_date,
     raise_if_cancelled,
     normalize_option,
@@ -256,6 +257,7 @@ def _tracking_from_text(body_text: str, order_no: str, order_option: str | None 
         combined = "\n".join(windows)
         if any(p in combined for p in NOT_YET_PATTERNS):
             raise TrackingNotAvailableYet(f"아직 송장번호가 발급되지 않았습니다 (orordNo={order_no}).")
+        raise_if_delayed(combined, order_no)
         # 취소/품절은 "배송상세현황 보기" 주변 구간(combined)이 아니라 화면
         # 전체에 표시되므로 body_text를 본다.
         raise_if_cancelled(body_text, order_no)

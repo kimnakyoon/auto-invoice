@@ -237,10 +237,13 @@ def prepare_batch(context: BrowserContext, orders, headless: bool = True) -> Non
             list_url = origin + ORDER_LIST_PATH.format(page=page_no)
             final_url, entry = _fetch_entry_data(context, list_url)
             if page_no == 1 and _is_login_url(final_url):
-                # 세션이 만료됐으면 여기서 한 번 로그인해둔다 - 실패하면 조용히
-                # 물러나고, 사유는 상세 경로의 로그인 시도가 주문별로 남긴다.
+                # 세션이 만료됐으면 여기서 한 번 로그인해둔다 - 실패하면 물러나고,
+                # 상세 경로가 주문마다 다시 시도한다(그쪽은 사람 로그인까지 기다린다).
+                common.safe_print("[gsshop] 로그인 세션이 없어 자동 로그인을 시도합니다 (로그인용 크롬 창이 잠깐 뜹니다).")
                 if not _auto_login(context, sample_url, headless=headless):
+                    common.safe_print("[gsshop] 자동 로그인이 안 돼 주문마다 상세 화면에서 다시 시도합니다.")
                     return
+                common.safe_print("[gsshop] 자동 로그인 완료.")
                 final_url, entry = _fetch_entry_data(context, list_url)
             listed = (entry or {}).get("ordList") or []
             if not listed:
@@ -377,7 +380,10 @@ def _auto_login(context: BrowserContext, product_url: str, headless: bool = True
                 login_context, context, product_url, headless, login_id, login_pw
             )
     except Exception as exc:
-        common.safe_print(f"[gsshop] 로그인 중 오류({exc}) - 직접 로그인으로 넘어갑니다.")
+        common.safe_print(
+            f"[gsshop] 자동 로그인 중 오류({type(exc).__name__}: {exc}) - 직접 로그인으로 넘어갑니다. "
+            "(로그인용 크롬이 이미 다른 창으로 떠 있으면 이렇게 됩니다 - 그 창을 닫고 다시 실행해보세요.)"
+        )
         return False
 
 
@@ -416,8 +422,13 @@ def _login_in_window(
         return True
 
     if not _wait_for_login_form(page):
+        title = ""
+        try:
+            title = page.title()
+        except Exception:  # noqa: BLE001 - 안내문에 쓰는 값이라 못 읽어도 된다
+            pass
         common.safe_print(
-            f"[gsshop] 로그인 페이지에서 아이디 입력창을 찾지 못했습니다({page.url}) "
+            f"[gsshop] 로그인 페이지에서 아이디 입력창을 찾지 못했습니다(주소={page.url}, 제목={title!r}) "
             "- 직접 로그인으로 넘어갑니다."
         )
         return False
@@ -490,7 +501,10 @@ def _login_in_window(
     if asked_for_checkbox:
         common.safe_print("[gsshop] 체크박스 대기 시간(5분)이 지났습니다 - 수동 로그인으로 넘어갑니다.")
     else:
-        common.safe_print("[gsshop] 로그인이 시간 안에 끝나지 않아 수동 로그인으로 넘어갑니다.")
+        common.safe_print(
+            f"[gsshop] 로그인이 {AUTO_LOGIN_WAIT_TIMEOUT_MS // 1000}초 안에 끝나지 않아 수동 로그인으로 "
+            f"넘어갑니다 (reCAPTCHA 평가={assess_results or '응답 없음'}, 주소={page.url})."
+        )
     return False
 
 

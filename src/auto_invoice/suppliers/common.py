@@ -14,10 +14,32 @@ from typing import Callable
 from .. import browser as browser_mod
 
 
+# 어댑터 안내문을 받을 곳. GUI가 자기 로그창으로 보내려고 set_log_sink로 건다.
+# 없으면 print - 터미널(run_all.py)은 그걸 콘솔과 logs/console_*.log에 남긴다.
+_log_sink = None
+
+
+def set_log_sink(sink) -> None:
+    """어댑터 안내문("[gsshop] 체크박스를 눌러주세요" 같은 것)을 받을 함수.
+
+    GUI(pythonw)는 stdout이 없어서 이 안내문이 전부 사라졌다 - 2026-09-05 GS샵
+    자동 로그인이 사람 손을 요구했는데 사용자는 왜 멈춰 있는지 볼 수 없었다.
+    None을 주면 print로 돌아간다.
+    """
+    global _log_sink
+    _log_sink = sink
+
+
 def safe_print(message: str) -> None:
-    """GUI(pythonw)로 실행하면 콘솔이 없어 stdout이 없을 수 있다 - 그 경우 조용히 무시한다."""
+    """어댑터 안내문 한 줄. 싱크가 걸려 있으면 그리로, 아니면 print.
+
+    GUI(pythonw)로 실행하면 콘솔이 없어 stdout이 없을 수 있다 - 그 경우 조용히 무시한다.
+    """
     try:
-        print(message)
+        if _log_sink is not None:
+            _log_sink(message)
+        else:
+            print(message)
     except Exception:  # noqa: BLE001 - 로그 한 줄 때문에 조회가 깨지면 안 된다
         pass
 
