@@ -678,8 +678,10 @@ def _submit_via_form(context: BrowserContext, order: dict, message: str, headles
     page.route("**/*", _abort_third_party)
     dialogs: list[tuple[str, str]] = []
     posted: list[str] = []
+    navigated: list[str] = []
     page.on("dialog", lambda d: (dialogs.append((d.type, d.message)), d.accept()))
     page.on("request", lambda r: posted.append(r.url) if INQUIRY_POST_PATH in r.url and r.method == "POST" else None)
+    page.on("framenavigated", lambda f: navigated.append(f.url) if f == page.main_frame and posted else None)
     try:
         _goto_logged_in(context, page, INQUIRY_FORM_URL.format(**order), headless)
         if INQUIRY_FORM_MARKER not in page.url:
@@ -687,30 +689,26 @@ def _submit_via_form(context: BrowserContext, order: dict, message: str, headles
         _fill_inquiry_form(page, order, message)
 
         page.locator(INQUIRY_SUBMIT).first.click()
-        # 사이트 JS: 상품번호 확인 -> 중복 문의 확인 -> 폼 POST(화면 이동). 화면이
-        # 바뀌거나 '중복 문의 알림'이 뜨거나 안내 alert이 오면 멈춘다 - 어느
-        # 것도 안 오면 시한 뒤 아래에서 사유를 가려 올린다.
+        # 사이트 JS: 상품번호 확인 -> 중복 문의 확인 -> 폼 POST -> 서버가 다시
+        # 문의 폼 화면을 준다(2026-09-08 첫 정식 실등록 실측 - 주소가 같은
+        # getinquireForm이라 주소 변화로는 이동을 알 수 없다). 그래서 등록 POST가
+        # 나간 뒤 첫 화면 이동(framenavigated)까지, 또는 '중복 문의 알림'이나
+        # 안내 alert이 오면 멈춘다 - 어느 것도 안 오면 시한 뒤 사유를 가려 올린다.
         deadline = time.monotonic() + INQUIRY_STEP_WAIT_MS / 1000
         while time.monotonic() < deadline:
-            if (INQUIRY_FORM_MARKER not in page.url or posted or dialogs
-                    or page.locator(INQUIRY_DUP_POPUP).count() > 0):
+            if navigated or dialogs or page.locator(INQUIRY_DUP_POPUP).count() > 0:
                 break
             page.wait_for_timeout(100)
-        if INQUIRY_FORM_MARKER in page.url and not posted:
+        if not posted:
             if page.locator(INQUIRY_DUP_POPUP).count() > 0:
                 raise AlreadyInquired(
                     "롯데아이몰이 '중복 문의 알림'을 띄웠습니다 - 같은 주문·상품·유형의 문의를 상담사가 확인 중입니다.")
             seen = " / ".join(f"{t}: {m}" for t, m in dialogs) or "(뜬 창 없음)"
             raise ParseError(f"[등록]을 눌렀는데 등록되지 않았습니다 ({seen}).")
         with contextlib.suppress(PlaywrightTimeoutError):
-            page.wait_for_url(lambda url: INQUIRY_FORM_MARKER not in url,
-                              wait_until="commit", timeout=INQUIRY_STEP_WAIT_MS)
-        with contextlib.suppress(PlaywrightTimeoutError):
             page.wait_for_load_state("domcontentloaded", timeout=INQUIRY_STEP_WAIT_MS)
         notes = " / ".join(m for _, m in dialogs)
         landed = urlparse(page.url).path
-        if not posted:
-            raise ParseError(f"[등록] 뒤 화면이 {landed}로 바뀌었지만 등록 요청은 나가지 않았습니다 ({notes or '뜬 창 없음'}).")
         return f"등록 요청 보냄 (화면 {landed}{' · ' + notes if notes else ''})"
     finally:
         page.close()
