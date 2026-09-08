@@ -54,6 +54,7 @@
 
 from __future__ import annotations
 
+import contextlib
 import json
 import os
 import re
@@ -62,11 +63,13 @@ from urllib.parse import urlparse
 
 from dotenv import load_dotenv
 from playwright.sync_api import BrowserContext
+from playwright.sync_api import TimeoutError as PlaywrightTimeoutError
 
 from .. import browser as browser_mod
 from ..models import TrackingResult
 from . import common
 from .base import (
+    AlreadyInquired,
     BlockedError,
     OrderNotFound,
     ParseError,
@@ -601,3 +604,308 @@ def get_tracking(
 
     second_context = _get_second_context(context, headless)
     return _get_tracking_from_account(second_context, order_no, headless, "NAVER_ID2", "2", order_option)
+
+
+# ---------------------------------------------------------------------------
+# 1:1 문의 (2026-09-08 실측)
+# ---------------------------------------------------------------------------
+# 화면 순서: 주문상세 [문의하기] → 모달 [1:1 문의] → 새 창
+#   https://m.pay.naver.com/mobile/shoppingInquiry/form?fromPC=Y&merchantNo=<판매자>&orderNo=<주문번호>
+# 이 주소는 주문번호와 판매자번호만으로 만들 수 있고, 판매자번호는 주문상세
+# API(productOrders[].merchantNo)에 있어서 주문상세 화면과 모달은 열지 않고 폼을
+# 바로 연다. 폼은 서버가 그려주는 단순한 페이지다(jindo + form.js):
+#   #productOrderNo(숨은 값, 상품이 하나면 서버가 채워둔다) / #inquiryCategory
+#   (PRODUCT·DELIVERY·RETURN·EXCHANGE·REFUNDMENT·ETC) / #titleTextArea(35자) /
+#   #contentTextArea(1,000자) / [확인](#confirmButton)
+# [확인]은 JSON POST /mobile/shoppingInquiry {orderNo, merchantNo, productOrderNo,
+# inquiryCategory, title, inquiryContent, contractNo} 를 보내고 응답의 apiSuccess가
+# 참이면 alert("문의를 등록했습니다.") 뒤 창을 닫는다. 확인/거부가 전부 alert라
+# dialog 핸들러로 받는다. 입력 검증 실패도 alert("문의유형 항목은 반드시 ...")다.
+# 문의내역은 모달 [문의내역] → https://m.pay.naver.com/mobile/shoppingInquiry/list
+# (기본 1개월·15건, [더보기]는 POST /mobile/shoppingInquiry/page {searchPeriod,
+# treatmentStatus, currentPage}로 같은 HTML 조각을 받아 붙인다). 항목마다
+# 판매자·상태(답변완료/답변대기)·주문번호·제목([배송] ...)·작성일·문의번호(삭제
+# 버튼 value)가 있어 주문번호로 바로 맞출 수 있다 - 다른 사이트처럼 상세를 열
+# 필요가 없다. 어느 계정 주문인지는 조회와 같이 상세 API의 not_mine으로 가른다.
+INQUIRY_FORM_URL = ("https://m.pay.naver.com/mobile/shoppingInquiry/form"
+                    "?fromPC=Y&merchantNo={merchant_no}&orderNo={order_no}")
+INQUIRY_LIST_URL = ("https://m.pay.naver.com/mobile/shoppingInquiry/list"
+                    "?fromPC=Y&searchPeriod=MONTH1&treatmentStatus=ALL")
+INQUIRY_PAGE_API_URL = "https://m.pay.naver.com/mobile/shoppingInquiry/page"
+INQUIRY_POST_PATH = "/mobile/shoppingInquiry"
+INQUIRY_CATEGORY_SELECT = "#inquiryCategory"
+INQUIRY_CATEGORY_VALUE = "DELIVERY"          # 문의유형 [배송]
+INQUIRY_CATEGORY_LABEL = "배송"
+INQUIRY_PRODUCT_SELECT = "#productNo"        # 상품이 여럿인 주문에만 있는 상품 선택
+INQUIRY_PRODUCT_ORDER = "#productOrderNo"    # 상품주문번호 (숨은 값 또는 옵션 select)
+INQUIRY_TITLE = "#titleTextArea"
+INQUIRY_TITLE_MAX = 35
+INQUIRY_CONTENT = "#contentTextArea"
+INQUIRY_SUBMIT = "#confirmButton"
+INQUIRY_DONE_TEXT = "문의를 등록했습니다"
+INQUIRY_MESSAGE = "{name} 배송 언제 시작하나요?"
+INQUIRY_STEP_WAIT_MS = 10000    # 폼이 그려지고, [확인] 뒤 응답·완료 alert가 오기까지 최대
+INQUIRY_HISTORY_TRIES = 3       # 등록 뒤 문의내역에 아직 안 보이면 이만큼 다시 본다
+INQUIRY_HISTORY_RETRY_GAP_SEC = 1.0
+INQUIRY_HISTORY_MAX_PAGES = 5   # '이미 남겼는지' 훑는 문의내역 페이지 수 (15건씩)
+INQUIRY_ROW_SPLIT = '<dt class="seller_info">'
+INQUIRY_ROW_STATUS = re.compile(r'<strong class="status[^"]*">\s*(.*?)\s*</strong>', re.S)
+INQUIRY_ROW_ORDER_NO = re.compile(r"주문번호\s*(\d+)")
+INQUIRY_ROW_SUBJECT = re.compile(r'<span class="subject">\s*(.*?)\s*</span>', re.S)
+INQUIRY_ROW_DATE = re.compile(r"작성일\s*<em>(\d{4}\.\d{2}\.\d{2})</em>")
+INQUIRY_ROW_ID = re.compile(r'_delete_inquiry_btn[^>]*value="(\d+)"')
+INQUIRY_TOTAL_COUNT = re.compile(r"totalCount\s*:\s*(\d+)")
+INQUIRY_ROW_PER_PAGE = re.compile(r"rowPerPage\s*:\s*(\d+)")
+INQUIRY_LIST_HEADERS = {"referer": "https://orders.pay.naver.com/"}
+
+
+def inquiry_message(recipient_name: str) -> str:
+    """제목·내용에 똑같이 넣는 문구. 제목은 35자 제한이라 넘치면 자른다."""
+    return INQUIRY_MESSAGE.format(name=recipient_name.strip())
+
+
+def _detail_logged_in(context: BrowserContext, order_no: str, headless: bool,
+                      naver_id_env: str, account_label: str) -> tuple[str, dict | None]:
+    """주문상세 API 답("ok"/"not_mine"/"login"/"error", result). 세션이 없으면
+    조회(_get_tracking_from_account)와 같은 경로로 로그인부터 하고 다시 부른다."""
+    kind, detail = _fetch_detail(context, order_no)
+    if kind != "login":
+        return kind, detail
+    page = context.new_page()
+    try:
+        page.goto(ORDER_STATUS_URL.format(order_no=order_no), wait_until="domcontentloaded")
+        if _ensure_logged_in(page, context, headless, naver_id_env, account_label):
+            state_key = SITE_KEY if account_label == "1" else SECOND_ACCOUNT_STATE_KEY
+            context.storage_state(path=str(browser_mod.state_path(state_key)))
+    finally:
+        page.close()
+    return _fetch_detail(context, order_no)
+
+
+def _account_for_order(context: BrowserContext, order_no: str, headless: bool
+                       ) -> tuple[BrowserContext, str, dict]:
+    """(그 주문이 있는 계정의 context, 계정 표시, 주문상세 result).
+
+    조회(get_tracking)와 같다 - 첫째 계정에서 not_mine이면 둘째 계정을 본다.
+    """
+    kind, detail = _detail_logged_in(context, order_no, headless, "NAVER_ID", "1")
+    if kind == "ok":
+        return context, "1", detail
+    if kind != "not_mine":
+        raise ParseError(f"주문상세를 읽지 못했습니다 (주문번호={order_no}, 계정 1, {kind}).")
+    second = _get_second_context(context, headless)
+    kind, detail = _detail_logged_in(second, order_no, headless, "NAVER_ID2", "2")
+    if kind == "ok":
+        return second, "2", detail
+    if kind == "not_mine":
+        raise OrderNotFound(f"두 계정 어디에도 이 주문이 없습니다 (주문번호={order_no}).")
+    raise ParseError(f"주문상세를 읽지 못했습니다 (주문번호={order_no}, 계정 2, {kind}).")
+
+
+def _inquiry_product_order(detail: dict, order_no: str) -> dict:
+    """문의를 붙일 상품주문 - 취소되지 않은 첫 상품. 취소/품절뿐이면 OrderCancelled.
+
+    한 주문번호에 판매자가 다른 상품이 섞여 있을 수 있는데(장바구니 합주문)
+    폼은 판매자별이라 하나만 고른다. 배송 문의는 주문 단위로 한 번이면 된다.
+    """
+    product_orders = detail.get("productOrders") or []
+    statuses = [str(po.get("exposureStatusType") or "") for po in product_orders]
+    statuses += ["취소" for po in product_orders if "CANCEL" in str(po.get("productOrderStatusType") or "")]
+    raise_if_cancelled_any(statuses, order_no)
+    for po in product_orders:
+        if "CANCEL" in str(po.get("productOrderStatusType") or ""):
+            continue
+        if not po.get("merchantNo") or not po.get("productOrderNo"):
+            continue
+        return po
+    raise ParseError(f"문의를 붙일 상품주문(판매자번호)이 없습니다 (주문번호={order_no}).")
+
+
+def _parse_inquiry_rows(fragment: str) -> list[dict]:
+    """문의내역 HTML(목록 페이지 또는 [더보기] 조각)을 항목 목록으로."""
+    rows: list[dict] = []
+    for chunk in fragment.split(INQUIRY_ROW_SPLIT)[1:]:
+        order_no = INQUIRY_ROW_ORDER_NO.search(chunk)
+        subject = INQUIRY_ROW_SUBJECT.search(chunk)
+        written = INQUIRY_ROW_DATE.search(chunk)
+        if not (order_no and subject and written):
+            continue
+        status = INQUIRY_ROW_STATUS.search(chunk)
+        inquiry_id = INQUIRY_ROW_ID.search(chunk)
+        rows.append({
+            "order_no": order_no.group(1),
+            "subject": re.sub(r"\s+", " ", subject.group(1)).strip(),
+            "date": written.group(1),
+            "status": re.sub(r"\s+", " ", status.group(1)).strip() if status else "",
+            "id": inquiry_id.group(1) if inquiry_id else "",
+        })
+    return rows
+
+
+def _describe_listed(entry: dict) -> str:
+    return f"{entry['status'] or '접수'} {entry['date']} (문의번호 {entry['id'] or '?'}, {entry['subject']})"
+
+
+def _row_date(entry: dict) -> date | None:
+    try:
+        return datetime.strptime(entry["date"], "%Y.%m.%d").date()
+    except ValueError:
+        return None
+
+
+def _find_listed_inquiry(context: BrowserContext, order_no: str, message: str,
+                         since: date | None, *, max_pages: int = INQUIRY_HISTORY_MAX_PAGES
+                         ) -> dict | None:
+    """문의내역(최신순)에서 이 주문번호에 같은 문구의 배송 문의가 since 이후로 있으면 그 항목.
+
+    목록이 최신순이라 since보다 오래된 항목이 나오면 더 넘기지 않는다. 목록을
+    못 읽으면(세션 만료 등) 모르는 채로 등록하지 않도록 BlockedError.
+    """
+    try:
+        response = context.request.get(INQUIRY_LIST_URL, headers=INQUIRY_LIST_HEADERS)
+        html = response.text() if response.status == 200 else ""
+    except Exception as e:  # noqa: BLE001
+        raise BlockedError(f"문의내역을 읽지 못했습니다 ({e}).") from e
+    if "nid.naver.com" in response.url or "_inquiry_list" not in html:
+        raise BlockedError(f"문의내역을 읽지 못했습니다 (HTTP {response.status}, {response.url[:60]}).")
+    total_match = INQUIRY_TOTAL_COUNT.search(html)
+    per_page_match = INQUIRY_ROW_PER_PAGE.search(html)
+    total = int(total_match.group(1)) if total_match else 0
+    per_page = int(per_page_match.group(1)) if per_page_match else 15
+    page_no = 1
+    while True:
+        for entry in _parse_inquiry_rows(html):
+            written = _row_date(entry)
+            if since and written and written < since:
+                return None
+            if (entry["order_no"] == order_no and message in entry["subject"]
+                    and entry["subject"].startswith(f"[{INQUIRY_CATEGORY_LABEL}]")):
+                return entry
+        page_no += 1
+        if page_no > max_pages or total <= (page_no - 1) * per_page:
+            return None
+        status, body = 0, ""
+        try:
+            response = context.request.post(
+                INQUIRY_PAGE_API_URL,
+                data=json.dumps({"searchPeriod": "MONTH1", "treatmentStatus": "ALL", "currentPage": page_no}),
+                headers={**INQUIRY_LIST_HEADERS, "content-type": "application/json"})
+            status, body = response.status, response.text()
+        except Exception:  # noqa: BLE001
+            pass
+        if status != 200 or INQUIRY_ROW_SPLIT not in body:
+            return None
+        html = body
+
+
+def _confirm_inquiry_listed(context: BrowserContext, order_no: str, message: str) -> str:
+    """등록 뒤 문의내역에 오늘 자로 올라갔는지 본다. 목록이 늦게 갱신될 수 있어 몇 번 다시 본다."""
+    today = datetime.now(KST).date()
+    for attempt in range(1, INQUIRY_HISTORY_TRIES + 1):
+        found = _find_listed_inquiry(context, order_no, message, today, max_pages=1)
+        if found is not None:
+            return _describe_listed(found)
+        if attempt < INQUIRY_HISTORY_TRIES:
+            common.sleep(INQUIRY_HISTORY_RETRY_GAP_SEC)
+    raise ParseError(
+        f"완료 문구는 받았지만 문의내역에서 확인되지 않았습니다. "
+        f"다시 남기기 전에 네이버페이 문의내역에서 '{message}'가 있는지 직접 확인해주세요.")
+
+
+def _pick_product_in_form(page, product_order_no: str) -> None:
+    """상품이 여럿인 주문의 폼은 상품·옵션을 고르게 한다(#productNo → #productOrderNo select).
+    우리가 정한 상품주문번호를 고르고, 숨은 값이면 그 값이 맞는지 본다."""
+    product_select = page.locator(INQUIRY_PRODUCT_SELECT)
+    if product_select.count() and product_select.first.evaluate("e => e.tagName") == "SELECT":
+        values = product_select.first.evaluate("e => [...e.options].map(o => o.value).filter(Boolean)")
+        for value in values:
+            product_select.first.select_option(value)
+            page.wait_for_timeout(200)
+            option_values = page.locator(INQUIRY_PRODUCT_ORDER).first.evaluate(
+                "e => e.tagName === 'SELECT' ? [...e.options].map(o => o.value) : [e.value]")
+            if product_order_no in option_values:
+                break
+    target = page.locator(INQUIRY_PRODUCT_ORDER).first
+    if target.evaluate("e => e.tagName") == "SELECT":
+        target.select_option(product_order_no)
+    current = target.evaluate("e => e.value")
+    if current != product_order_no:
+        raise ParseError(f"폼의 상품주문번호({current or '비어 있음'})가 이 주문의 것({product_order_no})과 다릅니다.")
+
+
+def post_inquiry(context: BrowserContext, product_url: str, recipient_name: str,
+                 headless: bool = False) -> str:
+    """1:1 문의(문의유형 [배송])를 남기고 완료 문구를 돌려준다.
+
+    주문이 있는 계정을 고르고(조회와 같은 두 계정 판별), 취소/품절 주문은 남기지
+    않으며, 문의내역에 이 주문의 같은 문의가 주문일 이후에 이미 있으면
+    AlreadyInquired로 넘긴다. 완료 alert를 받은 뒤 문의내역에 오늘 자로 올라갔는지
+    까지 확인한다. 어디서든 어긋나면 ParseError/BlockedError - 남겼는지
+    불확실한 채로 성공이라 하지 않는다.
+    """
+    order_no = extract_order_no(product_url)
+    message = inquiry_message(recipient_name)
+    account_context, account_label, detail = _account_for_order(context, order_no, headless)
+    try:
+        product_order = _inquiry_product_order(detail, order_no)
+        order_date = _kst_date((detail.get("order") or {}).get("orderDateTime"))
+        existing = _find_listed_inquiry(account_context, order_no, message, order_date)
+        if existing is not None:
+            raise AlreadyInquired(f"문의내역에 이미 같은 문의가 있습니다 (계정 {account_label}): {_describe_listed(existing)}")
+
+        page = account_context.new_page()
+        try:
+            page.goto(INQUIRY_FORM_URL.format(merchant_no=product_order["merchantNo"], order_no=order_no),
+                      wait_until="domcontentloaded")
+            if _looks_like_login_page(page):
+                raise BlockedError(f"문의 폼이 로그인 화면으로 넘어갔습니다 (계정 {account_label}).")
+            try:
+                page.wait_for_selector(INQUIRY_CATEGORY_SELECT, timeout=INQUIRY_STEP_WAIT_MS)
+            except PlaywrightTimeoutError as e:
+                raise ParseError(f"문의 폼이 그려지지 않았습니다 (주문번호={order_no}).") from e
+            shown = page.locator("#orderNo").first.evaluate("e => e.value") if page.locator("#orderNo").count() else ""
+            if shown != order_no:
+                raise ParseError(f"폼의 주문번호({shown or '없음'})가 이 주문({order_no})이 아닙니다.")
+            _pick_product_in_form(page, str(product_order["productOrderNo"]))
+            page.locator(INQUIRY_CATEGORY_SELECT).select_option(INQUIRY_CATEGORY_VALUE)
+            page.locator(INQUIRY_TITLE).fill(message[:INQUIRY_TITLE_MAX])
+            page.locator(INQUIRY_CONTENT).fill(message)
+
+            dialogs: list[str] = []
+
+            def _on_dialog(dialog) -> None:
+                dialogs.append(dialog.message)
+                dialog.accept()
+
+            page.on("dialog", _on_dialog)
+            try:
+                with page.expect_response(lambda r: r.url.rstrip("/").endswith(INQUIRY_POST_PATH)
+                                          and r.request.method == "POST",
+                                          timeout=INQUIRY_STEP_WAIT_MS) as posted:
+                    page.locator(INQUIRY_SUBMIT).click()
+                response = posted.value
+            except PlaywrightTimeoutError as e:
+                seen = " / ".join(dialogs) or "(뜬 창 없음)"
+                raise ParseError(f"[확인]을 눌렀는데 등록 요청이 나가지 않았습니다 ({seen}).") from e
+            try:
+                api_ok = bool((response.json() or {}).get("apiSuccess"))
+            except Exception:  # noqa: BLE001
+                api_ok = False
+            waited = 0
+            while not any(INQUIRY_DONE_TEXT in m for m in dialogs) and waited < INQUIRY_STEP_WAIT_MS:
+                page.wait_for_timeout(100)
+                waited += 100
+            done = [m for m in dialogs if INQUIRY_DONE_TEXT in m]
+            if not done or not api_ok:
+                seen = " / ".join(dialogs) or "(뜬 창 없음)"
+                raise ParseError(f"등록 응답 HTTP {response.status}, apiSuccess={api_ok}, 완료 문구를 받지 못했습니다 ({seen}).")
+        finally:
+            page.close()
+        listed = _confirm_inquiry_listed(account_context, order_no, message)
+        return f"{done[0].strip().rstrip('.')} (계정 {account_label}) · 문의내역: {listed}"
+    finally:
+        # 둘째 계정 세션은 여기서 직접 저장한다 (조회의 finally와 같은 이유 - 이
+        # context는 오케스트레이터가 실행 끝에 저장해 주지 않는다).
+        if account_label == "2":
+            with contextlib.suppress(Exception):
+                account_context.storage_state(path=str(browser_mod.state_path(SECOND_ACCOUNT_STATE_KEY)))

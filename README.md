@@ -198,7 +198,7 @@ python scripts/run_all.py --stop-before-apply   # 일괄등록까지만, 마지�
 - **장부로 중복을 막는다.** 남긴 주문은 `logs/inquiries.json` 에 마켓
   주문번호로 적고, 다시 돌려도 그 주문은 넘긴다. 한 건 남길 때마다 바로
   적어서 도중에 멈춰도 남긴 건은 장부에 있다.
-- **어댑터에 `post_inquiry`가 있는 사이트만** 남긴다 (지금은 롯데온·지마켓·SSG). 나머지는
+- **어댑터에 `post_inquiry`가 있는 사이트만** 남긴다 (지금은 롯데온·지마켓·SSG·네이버). 나머지는
   '아직 지원하지 않음'으로 결과에 남겨 사람이 직접 하게 한다. 사이트별로
   브라우저 하나를 열어 한 건씩, 송장조회와 같은 요청 간격으로 남긴다.
   송장조회처럼 `WANTS_CDP_CHROME` 어댑터(지마켓)는 우리가 직접 띄운 진짜
@@ -278,6 +278,32 @@ python scripts/run_all.py --stop-before-apply   # 일괄등록까지만, 마지�
   후에는 오늘 자로 올라갔는지 1초 간격 3번까지 확인한다. 첫 실등록(2026-09-08 19:09, 주문
   202609088A2560)은 최적화 전 코드로 등록부터 확인까지 5.5초였고 상태는 '답변준비중'으로
   올라왔다(사람이 남긴 것은 '처리중'·'답변완료'로 보인다).
+- **네이버 화면 순서** (2026-09-08 실측): 주문상세 [문의하기] → 모달 [1:1 문의] → 새 창
+  `m.pay.naver.com/mobile/shoppingInquiry/form?fromPC=Y&merchantNo=<판매자>&orderNo=<주문번호>`.
+  이 주소는 주문번호와 판매자번호만으로 만들 수 있고 판매자번호는 조회가 쓰는 주문상세
+  API(`productOrders[].merchantNo`)에 있어서, 주문상세 화면과 모달을 건너뛰고 폼을 바로
+  연다. 계정이 둘이라 어느 계정 주문인지는 조회와 같이 상세 API의 `not_mine`으로 가른다
+  (`_account_for_order`, 로그인이 필요하면 조회와 같은 자동 로그인 경로). 폼은 서버가
+  그려주는 단순한 페이지: 숨은 `#productOrderNo`(상품이 하나면 채워져 있다, 여럿이면
+  `#productNo` 상품 선택 → 옵션 select)·문의유형 `#inquiryCategory`(**DELIVERY**=배송)·
+  제목 `#titleTextArea`(35자)·내용 `#contentTextArea` → [확인](`#confirmButton`) → JSON POST
+  `/mobile/shoppingInquiry` {orderNo, merchantNo, productOrderNo, inquiryCategory, title,
+  inquiryContent} → 응답 `apiSuccess` → `alert("문의를 등록했습니다.")` → 창 닫힘. 검증
+  실패도 alert라 dialog 핸들러로 다 받고, 응답의 `apiSuccess`와 완료 alert 둘 다 있어야
+  성공이다. 폼의 숨은 `#orderNo`·`#productOrderNo`가 API의 것과 같은지 본다. 취소/품절
+  (API 상태)에는 남기지 않는다. 폼 열기부터 문의내역 확인까지 0.8초.
+- **네이버도 문의내역을 본다 - 등록 전과 후에** (`_find_listed_inquiry`). 모달 [문의내역]이
+  여는 `m.pay.naver.com/mobile/shoppingInquiry/list`(1개월·15건, [더보기]는 POST
+  `shoppingInquiry/page` {searchPeriod, treatmentStatus, currentPage}로 같은 HTML 조각)는
+  항목마다 상태(답변대기/답변완료)·**주문번호**·제목(`[배송] ...`)·작성일·문의번호(삭제
+  버튼 value)가 다 있어 상세를 열 필요 없이 주문번호와 제목으로 바로 맞춘다. 최신순이라
+  주문일보다 오래된 항목이 나오면 더 넘기지 않는다(최대 5페이지). 등록 전에 주문일 이후
+  같은 문의가 있으면 `AlreadyInquired`(2026-09-08 예시 주문 2026090495571521이 그랬다 -
+  사용자가 그날 직접 남겨 답변까지 받은 상태, 0.5초에 넘김), 등록 후에는 오늘 자로 올라갔는지
+  1초 간격 3번까지 확인한다. 목록을 못 읽으면 모르는 채로 등록하지 않고 실패로 적는다.
+  첫 실등록은 아직이다 - 예시 주문은 이미 남긴 것이었고 그날 엑셀에 네이버 2일 지남이
+  없었다. 등록 POST를 가로채 `apiSuccess:true`로 답한 검증에서 본문이 화면 순서 그대로
+  나가는 것(유형 DELIVERY, 제목·내용 모두 우리 문구)까지 확인했다.
 - **결과는 바탕화면 `문의결과_*.xlsx`** 로도 남긴다 (`save_result_excel`). 송장조회
   결과 엑셀과 같은 생김새이고, 정렬은 실패 → 미지원 사이트 넘김 → 남김 →
   이미 남긴 주문 순 - 앞의 둘이 사람이 직접 남겨야 하는 건이다.
