@@ -397,6 +397,9 @@ INQUIRY_ITEM_BUTTON = "#btnOrdItemList"         # [주문상품 선택]
 INQUIRY_ITEM_LAYER = "#ccs_sel_prod1"
 INQUIRY_ITEM_TABLE = "#tbOrdItem"
 INQUIRY_ITEM_LIST_API = "ajaxOrdListForMyssgCs.ssg"
+ORD_ITEM_DAY_URL = ("https://www.ssg.com/customer/ajaxOrdListForMyssgCs.ssg"
+                    "?searchDtType=0&startDate={day}&endDate={day}&page=1")   # 주문일 하루치
+ORD_ITEM_MONTH_URL = "https://www.ssg.com/customer/ajaxOrdListForMyssgCs.ssg?searchDtType=2&page=1"   # 레이어 기본(1개월)
 INQUIRY_ITEM_CONFIRM = f"{INQUIRY_ITEM_LAYER} .btn_submit"   # 레이어의 [확인]
 INQUIRY_ITEM_SELECTED = "#itemSelected"
 INQUIRY_TITLE = "#cnslDemndTitleNm"
@@ -479,9 +482,9 @@ def _choose_type(page, select: str, label: str, *, loads: str | None) -> None:
 
     loads: 이 선택이 불러오는 응답 URL의 일부 - 오기를 기다린다. 유형을 고르면
     내용 칸이 비어 있을 때만 안내 템플릿을 받아오므로(setCnslClsTempl) 그때는
-    그 응답도 같이 기다린다 - 응답이 오는 대로 내용 칸을 덮어쓰기 때문이다.
-    응답은 트리거 전부터 센다(놓치면 영영 못 받는다) - 동기 API는 호출 중에만
-    이벤트를 넘겨주므로 센 것과 기다리는 것 사이에 응답이 새지 않는다.
+    그 응답도 같이 기다린다 - 응답이 오는 대로 내용 칸을 덮어쓰기 때문이다
+    (post_inquiry는 내용을 먼저 넣어 이 요청 자체가 안 나가게 한다). 기다림은
+    트리거 전에 건다(놓치면 영영 못 받는다).
     """
     value = _option_value(page, select, label)
     if not value:
@@ -492,60 +495,73 @@ def _choose_type(page, select: str, label: str, *, loads: str | None) -> None:
     wanted = [loads] if loads else []
     if page.locator(INQUIRY_CONTENT).input_value().strip() == "":
         wanted.append(INQUIRY_TEMPLATE_API)
-    seen: list[str] = []
-    page.on("response", lambda r: seen.append(r.url))
-    page.evaluate(
-        "([sel, value]) => { const $s = window.jQuery(sel); $s.val(value).trigger('change').trigger('sync'); }",
-        [select, value])
-    for mark in wanted:
-        if any(mark in u for u in seen):
-            continue
-        try:
-            page.wait_for_event("response", lambda r: mark in r.url, timeout=INQUIRY_STEP_WAIT_MS)
-        except PlaywrightTimeoutError:
-            raise ParseError(f"[{label}]을 골랐는데 {mark} 응답이 오지 않았습니다.") from None
+    with contextlib.ExitStack() as stack:
+        for mark in wanted:
+            stack.enter_context(page.expect_response(
+                lambda r, mark=mark: mark in r.url, timeout=INQUIRY_STEP_WAIT_MS))
+        page.evaluate(
+            "([sel, value]) => { const $s = window.jQuery(sel); $s.val(value).trigger('change').trigger('sync'); }",
+            [select, value])
     chosen = page.evaluate("sel => window.jQuery(sel).val()", select)
     if chosen != value:
         raise ParseError(f"문의유형 [{label}]이 잡히지 않았습니다 (select 값: {chosen}).")
 
 
-def _open_item_layer(page, order_no: str) -> list[str]:
-    """[주문상품 선택] 레이어를 열어 이 주문의 상품 줄(checkbox 값)들을 돌려준다.
+def _fetch_order_items(context: BrowserContext, order_no: str) -> tuple[str, list[str], set[str]]:
+    """[주문상품 선택] 목록을 주문일 하루짜리로 미리 받아 (HTML, 이 주문의 상품 줄 값들, itemId들)을 돌려준다.
 
-    기본 1개월 목록에 없으면 주문일 하루짜리 조회로 다시 채운다.
+    레이어가 기본으로 부르는 1개월 목록은 195줄(2026-09-08 실측)이라 그리는 데만
+    2.5초가 걸렸다. 주문일 하루치는 열 줄 안팎이다. 하루치에 없으면(주문일 표기가
+    다른 예외) 1개월 목록으로 한 번 더 본다. 여기서 읽은 itemId로 폼을 열기 전에
+    문의내역 중복을 걸러내고, HTML은 레이어의 요청에 그대로 돌려준다(_open_item_layer).
     """
-    keys_selector = f'{INQUIRY_ITEM_LAYER} input[name="ordItem"][value^="{order_no}_"]'
-    table = page.locator(f"{INQUIRY_ITEM_LAYER} {INQUIRY_ITEM_TABLE}")
-    with page.expect_response(lambda r: INQUIRY_ITEM_LIST_API in r.url, timeout=INQUIRY_STEP_WAIT_MS):
-        page.locator(INQUIRY_ITEM_BUTTON).click()
-    table.wait_for(state="attached", timeout=INQUIRY_STEP_WAIT_MS)
-    keys = page.locator(keys_selector).evaluate_all("els => els.map(e => e.value)")
     day = f"{_order_date_of(order_no):%Y.%m.%d}"
-    if not keys:
-        with page.expect_response(lambda r: INQUIRY_ITEM_LIST_API in r.url, timeout=INQUIRY_STEP_WAIT_MS):
-            page.evaluate("d => ordListForMyssgCs('0', d, d)", day)
-        table.wait_for(state="attached", timeout=INQUIRY_STEP_WAIT_MS)
-        keys = page.locator(keys_selector).evaluate_all("els => els.map(e => e.value)")
-    if not keys:
-        raise ParseError(f"[주문상품 선택] 목록에 이 주문이 없습니다 (orordNo={order_no}, 주문일 {day} 조회까지).")
-    return keys
-
-
-def _select_order_items(page, order_no: str) -> set[str]:
-    """레이어에서 이 주문의 상품을 전부 체크하고 [확인]을 눌러 폼에 붙인다. 상품 itemId들을 돌려준다."""
-    keys = _open_item_layer(page, order_no)
+    for url in (ORD_ITEM_DAY_URL.format(day=day), ORD_ITEM_MONTH_URL):
+        items_html = _get_html(context, url)
+        if items_html is None:
+            raise BlockedError("[주문상품 선택] 목록을 읽지 못했습니다 (로그인 세션이 없거나 화면이 바뀜).")
+        keys = re.findall(rf'name="ordItem"\s+value="({re.escape(order_no)}_\d+)"', items_html)
+        if keys:
+            break
+    else:
+        raise ParseError(f"[주문상품 선택] 목록에 이 주문이 없습니다 (orordNo={order_no}, 주문일 {day} 조회와 1개월 조회 모두).")
     item_ids: set[str] = set()
     for key in keys:
-        item_id = page.locator(f"#itemId{key}").get_attribute("value") or ""
-        if item_id:
-            item_ids.add(item_id)
+        m = re.search(rf'id="itemId{re.escape(key)}"\s+value="(\d+)"', items_html)
+        if m:
+            item_ids.add(m.group(1))
+    if not item_ids:
+        raise ParseError(f"[주문상품 선택] 목록에서 이 주문의 상품번호(itemId)를 읽지 못했습니다 (orordNo={order_no}).")
+    return items_html, keys, item_ids
+
+
+def _open_item_layer(page, order_no: str, items_html: str, keys: list[str]) -> None:
+    """[주문상품 선택] 레이어를 열되, 레이어가 부르는 1개월 목록 요청에 미리 받아둔 하루치 HTML을 돌려준다."""
+
+    def _serve_cached(route) -> None:
+        route.fulfill(status=200, content_type="text/html; charset=utf-8", body=items_html)
+
+    pattern = f"**/{INQUIRY_ITEM_LIST_API}*"
+    page.route(pattern, _serve_cached)
+    try:
+        page.locator(INQUIRY_ITEM_BUTTON).click()
+        try:
+            page.locator(f"#ordItem_{keys[0]}").wait_for(state="attached", timeout=INQUIRY_STEP_WAIT_MS)
+        except PlaywrightTimeoutError:
+            raise ParseError(f"[주문상품 선택] 레이어에 이 주문의 상품이 그려지지 않았습니다 (orordNo={order_no}).") from None
+    finally:
+        page.unroute(pattern, _serve_cached)
+
+
+def _select_order_items(page, order_no: str, items_html: str, keys: list[str]) -> None:
+    """레이어에서 이 주문의 상품을 전부 체크하고 [확인]을 눌러 폼에 붙인다."""
+    _open_item_layer(page, order_no, items_html, keys)
+    for key in keys:
         box = page.locator(f"#ordItem_{key}")
         if not box.is_checked():
             page.locator(f'label[for="ordItem_{key}"]').click()
         if not box.is_checked():
             raise ParseError(f"주문상품 {key}이(가) 체크되지 않았습니다.")
-    if not item_ids:
-        raise ParseError(f"[주문상품 선택] 목록에서 이 주문의 상품번호(itemId)를 읽지 못했습니다 (orordNo={order_no}).")
     page.locator(INQUIRY_ITEM_CONFIRM).click()
     selected = page.locator(f"{INQUIRY_ITEM_SELECTED} .product_info")
     try:
@@ -555,14 +571,14 @@ def _select_order_items(page, order_no: str) -> set[str]:
     attached = page.locator('input[name="cnslItemBaseDto.ordNo"]').evaluate_all("els => els.map(e => e.value)")
     if order_no not in attached:
         raise ParseError(f"폼에 붙은 주문번호가 이 주문이 아닙니다 (orordNo={order_no}, 폼: {attached}).")
-    return item_ids
 
 
-def _prepare_inquiry_form(page, order_no: str, message: str) -> set[str]:
-    """E-mail 상담 화면을 열어 유형·상품·제목·내용을 채운다 - [등록]은 누르지 않는다.
+def _prepare_inquiry_form(page, order_no: str, message: str, items_html: str, keys: list[str]) -> None:
+    """E-mail 상담 화면을 열어 제목·내용·유형·상품을 채운다 - [등록]은 누르지 않는다.
 
     post_inquiry가 부르고, 등록 없이 채우기까지만 재보는 검증 스크립트도 이것을 쓴다.
-    돌려주는 것은 이 주문의 상품 itemId들(문의내역 확인에 쓴다).
+    내용을 유형보다 먼저 넣는다 - 내용 칸이 비어 있으면 유형을 고를 때마다 안내
+    템플릿 요청이 나가 응답이 오는 대로 내용을 덮어쓰기 때문이다(_choose_type).
     """
     _goto_logged_in(page, COUNSEL_FORM_URL)
     page.wait_for_load_state("load")
@@ -570,11 +586,11 @@ def _prepare_inquiry_form(page, order_no: str, message: str) -> set[str]:
         page.locator(INQUIRY_SUBMIT).wait_for(state="visible", timeout=INQUIRY_STEP_WAIT_MS)
     except PlaywrightTimeoutError:
         raise ParseError(f"E-mail 상담 화면이 뜨지 않았습니다 (url={page.url}).") from None
-    _choose_type(page, INQUIRY_TYPE_SELECT, INQUIRY_TYPE, loads=INQUIRY_SUBTYPE_API)
-    _choose_type(page, INQUIRY_SUBTYPE_SELECT, INQUIRY_SUBTYPE, loads=None)
-    item_ids = _select_order_items(page, order_no)
     page.locator(INQUIRY_TITLE).fill(message[:INQUIRY_TITLE_MAX])
     page.locator(INQUIRY_CONTENT).fill(message)
+    _choose_type(page, INQUIRY_TYPE_SELECT, INQUIRY_TYPE, loads=INQUIRY_SUBTYPE_API)
+    _choose_type(page, INQUIRY_SUBTYPE_SELECT, INQUIRY_SUBTYPE, loads=None)
+    _select_order_items(page, order_no, items_html, keys)
     if page.locator(INQUIRY_TITLE).input_value().strip() != message[:INQUIRY_TITLE_MAX]:
         raise ParseError("제목이 입력되지 않았습니다.")
     if page.locator(INQUIRY_CONTENT).input_value().strip() != message:
@@ -584,7 +600,6 @@ def _prepare_inquiry_form(page, order_no: str, message: str) -> set[str]:
         [INQUIRY_TYPE_SELECT, INQUIRY_SUBTYPE_SELECT])
     if types != [INQUIRY_TYPE, INQUIRY_SUBTYPE]:
         raise ParseError(f"문의유형이 {INQUIRY_TYPE}/{INQUIRY_SUBTYPE}으로 잡히지 않았습니다 (화면: {types}).")
-    return item_ids
 
 
 def _get_html(context: BrowserContext, url: str) -> str | None:
@@ -718,10 +733,13 @@ def post_inquiry(context: BrowserContext, product_url: str, recipient_name: str,
                 raise ParseError(f"주문상세가 그려지지 않았습니다 (orordNo={order_no}).")
             _raise_if_cancelled_text(page.inner_text("body"), order_no)
 
-        item_ids = _prepare_inquiry_form(page, order_no, message)
+        # 폼을 열기 전에 상품 목록(itemId)을 받아 문의내역 중복부터 걸러낸다 - 넘길
+        # 주문에 폼을 채우는 4초를 쓰지 않는다. 받아둔 목록은 레이어에 그대로 준다.
+        items_html, keys, item_ids = _fetch_order_items(context, order_no)
         existing = _find_listed_inquiry(context, message, item_ids, order_date)
         if existing is not None:
             raise AlreadyInquired(f"E-mail 답변확인에 이미 같은 문의가 있습니다: {_describe_listed(existing)}")
+        _prepare_inquiry_form(page, order_no, message, items_html, keys)
 
         dialogs: list[tuple[str, str]] = []
 
