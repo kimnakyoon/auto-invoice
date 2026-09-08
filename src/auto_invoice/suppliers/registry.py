@@ -16,6 +16,7 @@ from . import (
     auction,
     cjonstyle,
     cm29,
+    elandmall,
     elevenst,
     fashionplus,
     gmarket,
@@ -66,6 +67,7 @@ register(cm29)
 register(kr4910)
 register(shinsegaetv)
 register(halfclub)
+register(elandmall)
 # 새 공급사 추가 예시:
 # from . import newsupplier
 # register(newsupplier)
