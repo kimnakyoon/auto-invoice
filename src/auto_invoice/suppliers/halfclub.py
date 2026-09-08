@@ -65,7 +65,6 @@ import re
 import time
 from dataclasses import dataclass, field
 from datetime import date, datetime
-from typing import Any
 from urllib.parse import parse_qs, urlparse
 
 from dotenv import load_dotenv
@@ -204,6 +203,11 @@ class ListedOrder:
 # prepare_batch가 읽어둔 주문목록. 컨텍스트(=이번 실행의 브라우저)별로 담는다.
 # 한 공급사는 스레드 하나가 맡으므로 잠금은 필요 없다 (29CM/신세계TV쇼핑과 동일).
 _listed_orders: dict[int, dict[str, ListedOrder]] = {}
+# 한 번 읽은 JWT 세션. 요청마다 브라우저에 쿠키를 물어보고 JWT를 다시 풀 이유가
+# 없다 - 갱신/재로그인한 쪽이 여기를 갈아 끼운다.
+_sessions: dict[int, Session] = {}
+# 굿스플로우에서 읽은 택배사 이름 (코드별). 같은 코드가 여러 주문에 나오면 한 번만 묻는다.
+_courier_names: dict[str, str] = {}
 
 
 def extract_order_no(product_url: str) -> str:
@@ -272,7 +276,8 @@ def _refresh_session(context: BrowserContext, session: Session) -> Session | Non
         return None
     _store_cookie(context, AUTH_COOKIE, new_jwt)
     common.safe_print("[halfclub] 만료된 토큰을 갱신했습니다.")
-    return Session(jwt=new_jwt, refresh=session.refresh, agent=session.agent)
+    _sessions[id(context)] = Session(jwt=new_jwt, refresh=session.refresh, agent=session.agent)
+    return _sessions[id(context)]
 
 
 def _login_with_chrome(context: BrowserContext) -> Session:
@@ -318,15 +323,17 @@ def _login_with_chrome(context: BrowserContext) -> Session:
     if session is None:
         raise BlockedError("하프클럽 로그인 쿠키에서 토큰을 읽지 못했습니다.")
     common.safe_print("[halfclub] 자동 로그인에 성공했습니다.")
+    _sessions[id(context)] = session
     return session
 
 
 def _ensure_session(context: BrowserContext) -> Session:
-    session = _load_session(context)
+    session = _sessions.get(id(context)) or _load_session(context)
     if session is None:
         return _login_with_chrome(context)
     if _jwt_expired(session.jwt):
         return _refresh_session(context, session) or _login_with_chrome(context)
+    _sessions[id(context)] = session
     return session
 
 
@@ -505,7 +512,12 @@ def _goodsflow_courier(context: BrowserContext, code: str, tracking_no: str) -> 
 
 
 def courier_name(context: BrowserContext, code: str, tracking_no: str) -> str:
-    name = COURIER_CODES.get(code) or _goodsflow_courier(context, code, tracking_no) or code
+    name = COURIER_CODES.get(code) or _courier_names.get(code)
+    if not name and code:
+        name = _goodsflow_courier(context, code, tracking_no)
+        if name:
+            _courier_names[code] = name
+    name = name or code
     return common.normalize_courier(name) if name else DEFAULT_COURIER
 
 
