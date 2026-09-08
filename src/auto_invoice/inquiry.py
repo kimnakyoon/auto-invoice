@@ -18,7 +18,7 @@
 버튼을 하루에 두 번 누르거나, 같은 엑셀로 다시 돌려도 이미 남긴 주문은 건너뛴다.
 
 사이트마다 문의 화면이 달라서 어댑터에 post_inquiry(context, product_url,
-recipient_name, headless)가 있는 사이트만 처리하고(지금은 롯데온·지마켓), 없는
+recipient_name, headless)가 있는 사이트만 처리하고(지금은 롯데온·지마켓·SSG), 없는
 사이트는 '아직 지원 안 함'으로 결과에 남긴다 - 사람이 그 건은 직접 남긴다.
 어댑터에 prepare_inquiries(context, product_urls, headless)가 더 있으면 그
 사이트의 첫 문의 전에 한 번 불러 배치를 미리 훑게 한다(롯데온은 주문목록
@@ -392,7 +392,7 @@ def _post_site(site: str, items: list[InquiryTarget], *, settings, headless: boo
                 "order_date": t.order_date,
                 "message": message,
                 "posted_at": datetime.now().isoformat(timespec="seconds"),
-                "confirmation": done,   # 어댑터가 확인한 완료 문구 (롯데온·지마켓: 문의내역의 접수 상태·문의번호)
+                "confirmation": done,   # 어댑터가 확인한 완료 문구 (롯데온·지마켓·SSG: 문의내역의 접수 상태·문의번호)
             })
             record(i, t, "success", done, message)
     log(f"[{site}] {total}건에 {time.monotonic() - started:.1f}초 걸렸습니다.")
