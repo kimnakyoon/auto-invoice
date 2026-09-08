@@ -48,22 +48,29 @@
 
 from __future__ import annotations
 
+import contextlib
+import html as html_mod
 import os
 import re
+import time
+from datetime import date, datetime
 from urllib.parse import parse_qs, urlparse
 
 from dotenv import load_dotenv
 from playwright.sync_api import BrowserContext
+from playwright.sync_api import TimeoutError as PlaywrightTimeoutError
 
 from .. import browser as browser_mod
 from ..models import TrackingResult
 from . import common
 from .base import (
+    AlreadyInquired,
     BlockedError,
     ParseError,
     TrackingNotAvailableYet,
     normalize_option,
     raise_if_cancelled,
+    raise_if_cancelled_any,
     with_order_date,
 )
 
@@ -358,37 +365,373 @@ def _scrape_tracking_from_page(
     return TrackingResult(tracking_no=tracking_no, courier=courier)
 
 
+def _goto_logged_in(context: BrowserContext, page, url: str, headless: bool) -> None:
+    """주소를 열고, 로그인이 끊겨 있으면 로그인한 뒤 다시 연다 (송장조회·문의 공용).
+
+    세션이 만료되면 로그인 폼이 아니라 메인 화면으로 튕기므로, 이 페이지에서는
+    로그인할 수 없다 - 별도 컨텍스트에서 로그인 화면을 직접 열어 로그인하고
+    쿠키만 받아온다 (_auto_login). 비밀번호가 없으면 창 모드에서만 사람이 직접
+    로그인한다.
+    """
+    page.goto(url, wait_until="domcontentloaded")
+    if not _looks_like_login_page(page):
+        return
+    if _auto_login(context):
+        common.safe_print("[lotteimall] 로그인 세션이 없어 자동 로그인했습니다.")
+    elif headless:
+        raise BlockedError(
+            "롯데아이몰 로그인이 필요하지만 LOTTEIMALL_ID/LOTTEIMALL_PW가 없습니다. "
+            ".env에 추가하거나 --headless 없이 실행해 직접 로그인해주세요."
+        )
+    else:
+        page.goto(LOGIN_URL, wait_until="domcontentloaded")
+        _prefill_login_id(page)
+        common.safe_print("[lotteimall] 아이디는 자동으로 입력했습니다. 뜬 브라우저 창에서 비밀번호를 입력하고 로그인해주세요.")
+        common.safe_print("[lotteimall] 로그인이 완료되면 자동으로 이어서 진행합니다 (최대 5분 대기).")
+        if not _wait_for_manual_login(page):
+            raise BlockedError("로그인 대기 시간(5분)이 지났습니다. 로그인 후 다시 실행해주세요.")
+    page.goto(url, wait_until="domcontentloaded")
+    if _looks_like_login_page(page):
+        raise BlockedError("로그인 후에도 여전히 로그인 페이지입니다.")
+
+
 def get_tracking(
     context: BrowserContext, product_url: str, headless: bool = True, order_option: str | None = None
 ) -> TrackingResult:
     order_no = extract_order_no(product_url)
     page = context.new_page()
     try:
-        page.goto(product_url, wait_until="domcontentloaded")
-
-        if _looks_like_login_page(page):
-            # 세션이 만료되면 로그인 폼이 아니라 메인 화면으로 튕기므로, 이
-            # 페이지에서는 로그인할 수 없다 - 별도 컨텍스트에서 로그인 화면을
-            # 직접 열어 로그인하고 쿠키만 받아온다 (_auto_login).
-            if _auto_login(context):
-                common.safe_print("[lotteimall] 로그인 세션이 없어 자동 로그인했습니다.")
-            elif headless:
-                raise BlockedError(
-                    "롯데아이몰 로그인이 필요하지만 LOTTEIMALL_ID/LOTTEIMALL_PW가 없습니다. "
-                    ".env에 추가하거나 --headless 없이 실행해 직접 로그인해주세요."
-                )
-            else:
-                page.goto(LOGIN_URL, wait_until="domcontentloaded")
-                _prefill_login_id(page)
-                common.safe_print("[lotteimall] 아이디는 자동으로 입력했습니다. 뜬 브라우저 창에서 비밀번호를 입력하고 로그인해주세요.")
-                common.safe_print("[lotteimall] 로그인이 완료되면 자동으로 이어서 진행합니다 (최대 5분 대기).")
-                if not _wait_for_manual_login(page):
-                    raise BlockedError("로그인 대기 시간(5분)이 지났습니다. 로그인 후 다시 실행해주세요.")
-            page.goto(product_url, wait_until="domcontentloaded")
-            if _looks_like_login_page(page):
-                raise BlockedError("로그인 후에도 여전히 로그인 페이지입니다.")
+        _goto_logged_in(context, page, product_url, headless)
 
         # 주문상세 화면을 떠나기 전에 주문일부터 읽어둔다 (오래된 주문을 결과에 따로 모으는 데 쓴다).
         return with_order_date(page, lambda: _scrape_tracking_from_page(context, page, order_no, order_option))
     finally:
         page.close()
+
+
+# ---------------------------------------------------------------------------
+# 1:1 문의 (배송/회수 > 배송문의) - 2026-09-08 실측
+#
+# 사용자가 정한 화면 순서: 주문상세 [1:1문의] > 문의 유형 분류 [배송/회수] >
+# [배송문의] > 문의 제목·문의 내용에 "<수령인> 배송 언제 시작하나요?" > [등록].
+#
+# - 주문상세의 [1:1문의]는 onclick="fn_goInquireForm({ord_no, goods_no, ord_dtl_sn})"
+#   이고, 그 함수는 location.href로 아래 INQUIRY_FORM_URL로 간다(새 탭 아님).
+#   주문상세는 서버가 그려주므로 화면을 열지 않고 HTML만 받아 그 세 값과
+#   상품별 진행상태(<div class="wrap_ing2 ...">상품준비중</div>)를 읽는다.
+# - 문의 화면: 대분류 #cust_inq_mdl_tp_cd(1401=배송/회수)를 고르면
+#   selectFaqSmallMenuAjaxList.lotte 로 소분류를 받아 #cust_inq_sml_tp_cd 에
+#   채운다(140101=배송문의, 140102=회수문의). 주소에 ty_up_cd/ty_sub_cd를 주면
+#   서버가 골라 놓기도 하지만 그때는 숨은 select(외부고객게시글사유코드)가
+#   비어 사람이 고른 것과 달라지므로 사람처럼 change로 고른다.
+# - [등록](#inquire_add, <img>)을 누르면 사이트 JS가 상품번호 확인
+#   (getGoodsNoYn) -> 중복 문의 확인(getOrdDupInquireAjax: 같은 주문·상품·유형의
+#   처리 중인 문의가 있으면 '중복 문의 알림' 레이어 #inquireDup_lypopup.open) ->
+#   폼 POST insertInquire.lotte 순으로 간다. 확인창(confirm)은 없다. 중복 알림이
+#   뜨면 등록하지 않고 AlreadyInquired로 넘긴다.
+# - 상담내역(searchinquirePagingList.lotte?pageIdx=n, 기본 최근 1개월)은 줄마다
+#   fn_goDetailLayer('문의번호','NEC','n','주문번호','상품번호') 링크에 제목이
+#   붙어 있어(제목=우리 문구) 상세를 열 필요가 없다. 등록 전에 이 주문의
+#   '배송 언제' 문의가 주문일 이후에 있으면 넘기고, 등록 뒤 오늘 자로 올라갔는지
+#   확인한다. 이 주문의 주문일은 주문번호 앞 8자리(20260904H20839 -> 2026-09-04)다.
+# ---------------------------------------------------------------------------
+INQUIRY_LINK_PATTERN = re.compile(
+    r"fn_goInquireForm\(\{ord_no:'([^']*)',\s*goods_no:'([^']*)',\s*ord_dtl_sn:'([^']*)'\}\)")
+INQUIRY_STATUS_PATTERN = re.compile(r'<div class="wrap_ing2[^"]*">\s*([^<]*?)\s*<', re.S)
+INQUIRY_FORM_URL = ("https://www.lotteimall.com/custcenter/getinquireForm.lotte"
+                    "?ty_up_cd=&ty_sub_cd=&ord_no={ord_no}&goods_no={goods_no}&ord_dtl_sn={ord_dtl_sn}")
+INQUIRY_FORM_MARKER = "/custcenter/getinquireForm"
+INQUIRY_TYPE_SELECT = "#cust_inq_mdl_tp_cd"
+INQUIRY_TYPE_CODE = "1401"            # 문의 유형 분류 [배송/회수]
+INQUIRY_TYPE_LABEL = "배송/회수"
+INQUIRY_SUBTYPE_SELECT = "#cust_inq_sml_tp_cd"
+INQUIRY_SUBTYPE_CODE = "140101"       # [배송문의]
+INQUIRY_SUBTYPE_LABEL = "배송문의"
+INQUIRY_SUBTYPE_API = "selectFaqSmallMenuAjaxList"
+INQUIRY_TITLE = "#accp_tit_nm"
+INQUIRY_CONTENT = "#accp_cont"
+INQUIRY_SUBMIT = "#inquire_add"
+INQUIRY_DUP_POPUP = "#inquireDup_lypopup.open"
+INQUIRY_POST_PATH = "/custcenter/insertInquire.lotte"
+INQUIRY_TITLE_MAX = 200
+INQUIRY_CONTENT_MAX = 2000
+INQUIRY_STEP_WAIT_MS = 10000          # 화면 요소·소분류 응답·등록 뒤 화면 이동까지 최대
+INQUIRY_ALLOWED_HOSTS = ("lotteimall.com",)
+
+INQUIRY_LIST_URL = "https://www.lotteimall.com/mypage/searchinquirePagingList.lotte?pageIdx={page}"
+INQUIRY_LIST_MARKER = "일대일 답변 목록"
+INQUIRY_ROW_PATTERN = re.compile(r'<tr id="eventBBSQ_\d+">(.*?)</tr>', re.S)
+INQUIRY_ROW_LINK = re.compile(
+    r"fn_goDetailLayer\('(\d+)',\s*'[^']*',\s*'[^']*',\s*'([^']*)',\s*'([^']*)'\);?\"[^>]*>(.*?)</a>", re.S)
+INQUIRY_ROW_CELL = re.compile(r"<td[^>]*>(.*?)</td>", re.S)
+INQUIRY_PAGE_ON = re.compile(r'class="on">\s*(\d+)\s*<')
+INQUIRY_PAGE_LINK = re.compile(r"pageIdx=(\d+)")
+INQUIRY_SAME_MARK = "배송 언제"       # 상담내역에서 '같은 문의'로 보는 표식 (주문번호와 함께)
+INQUIRY_HISTORY_TRIES = 3             # 등록 뒤 목록에 아직 안 보이면 이만큼 다시 본다
+INQUIRY_HISTORY_RETRY_GAP_SEC = 1.0
+INQUIRY_HISTORY_MAX_PAGES = 5         # '이미 남겼는지' 훑는 상담내역 페이지 수
+
+# 이 실행(컨텍스트)에서 이미 읽어둔 상담내역 {"rows": [...최신순], "pages": n, "last": n}.
+# 한 배치의 주문들이 같은 목록을 보므로 주문마다 다시 받지 않는다(prepare_inquiries가 비운다).
+_inquiry_rows_cache: dict[int, dict] = {}
+
+
+def prepare_inquiries(context: BrowserContext, product_urls, headless: bool = False) -> None:
+    """새 배치 - 앞 배치에서 읽어둔 상담내역 캐시를 비운다."""
+    _inquiry_rows_cache.pop(id(context), None)
+
+
+def _order_date_of(ord_no: str) -> date | None:
+    """주문번호 앞 8자리가 주문일이다 (20260904H20839 -> 2026-09-04). 형식이 다르면 None."""
+    try:
+        return datetime.strptime(ord_no[:8], "%Y%m%d").date()
+    except ValueError:
+        return None
+
+
+def _get_html(context: BrowserContext, url: str) -> str | None:
+    """브라우저 쿠키로 GET - 메인/로그인 화면으로 튕기거나 실패하면 None."""
+    try:
+        response = context.request.get(url)
+    except Exception:  # noqa: BLE001 - 통신 실패는 '못 읽음'
+        return None
+    if not response.ok or _url_needs_login(response.url):
+        return None
+    return response.text()
+
+
+def _abort_third_party(route) -> None:
+    """문의 화면 전용 라우팅 - 롯데아이몰 밖 호스트(태그매니저·광고·픽셀)는 끊는다.
+
+    페이지 라우팅이 걸리면 컨텍스트 공용 이미지 차단은 이 페이지에 적용되지
+    않아 [등록] 버튼 이미지(image.lotteimall.com)가 열린다 - 일부러 그렇게 둔다.
+    <img>가 안 뜨면 크기가 0이라 클릭할 수 없다.
+    """
+    host = urlparse(route.request.url).netloc.lower()
+    if any(host == h or host.endswith("." + h) for h in INQUIRY_ALLOWED_HOSTS):
+        route.continue_()
+    else:
+        route.abort()
+
+
+def _order_for_inquiry(context: BrowserContext, product_url: str, ord_no: str,
+                       headless: bool) -> dict:
+    """주문상세 HTML에서 [1:1문의] 링크의 값(goods_no·ord_dtl_sn)을 읽고 취소/품절이면 올린다.
+
+    화면 없이 HTML만 받는다(로그인이 끊겨 있으면 그때만 화면을 열어 로그인하고
+    다시 받는다). '아직 준비 중'(TrackingNotAvailableYet)은 문의 대상 그 자체라
+    지나간다. 페이지 전체 글자로 취소를 판정하지 않는다 - [주문취소] 버튼 글자가
+    늘 있어서다 - 상품별 진행상태 칸만 본다.
+    """
+    html = _get_html(context, product_url)
+    if html is None:
+        page = context.new_page()
+        try:
+            _goto_logged_in(context, page, product_url, headless)
+            html = page.content()
+        finally:
+            page.close()
+    links = [m.groups() for m in INQUIRY_LINK_PATTERN.finditer(html)
+             if m.group(1).replace("-", "") == ord_no]
+    if not links:
+        if ord_no not in html and ord_no[:8] not in html:
+            raise ParseError(f"주문상세가 열리지 않았습니다 (주문번호={ord_no}).")
+        raise ParseError(f"주문상세에 [1:1문의] 버튼이 없습니다 (주문번호={ord_no}).")
+    statuses = [html_mod.unescape(s).strip() for s in INQUIRY_STATUS_PATTERN.findall(html)]
+    with contextlib.suppress(TrackingNotAvailableYet):
+        raise_if_cancelled_any(statuses, ord_no)
+    _, goods_no, ord_dtl_sn = links[0]
+    return {"ord_no": ord_no, "goods_no": goods_no, "ord_dtl_sn": ord_dtl_sn, "statuses": statuses}
+
+
+def _parse_inquiry_rows(html: str) -> list[dict]:
+    """상담내역 HTML에서 줄마다 문의번호·주문번호·상품번호·제목·문의일·상태 (최신순)."""
+    rows: list[dict] = []
+    for m in INQUIRY_ROW_PATTERN.finditer(html):
+        chunk = m.group(1)
+        link = INQUIRY_ROW_LINK.search(chunk)
+        cells = INQUIRY_ROW_CELL.findall(chunk)
+        if not link or len(cells) < 5:
+            continue
+        written = re.search(r"\d{4}\.\d{2}\.\d{2}", cells[2])
+        if not written:
+            continue
+        rows.append({
+            "inquiry_id": link.group(1),
+            "ord_no": link.group(2).replace("-", ""),
+            "goods_no": link.group(3),
+            "text": html_mod.unescape(re.sub(r"\s+", " ", re.sub(r"<[^>]+>", " ", link.group(4)))).strip(),
+            "written_on": datetime.strptime(written.group(0), "%Y.%m.%d").date(),
+            "state": _cell_state(cells[4]),
+        })
+    return rows
+
+
+def _cell_state(cell: str) -> str:
+    """진행상태 칸의 <strong> 글자만 (접수 줄에는 [문의취소] 버튼 글자가 같이 있다)."""
+    strong = re.search(r"<strong[^>]*>(.*?)</strong>", cell, re.S)
+    text = strong.group(1) if strong else re.sub(r"<button.*?</button>", " ", cell, flags=re.S)
+    return html_mod.unescape(re.sub(r"\s+", " ", re.sub(r"<[^>]+>", " ", text))).strip()
+
+
+def _fetch_inquiry_page(context: BrowserContext, page_no: int) -> tuple[list[dict], int]:
+    """상담내역 한 페이지 (줄들, 마지막 페이지 번호). 목록을 못 읽으면 ParseError - 모르는 채로 등록하지 않는다."""
+    html = _get_html(context, INQUIRY_LIST_URL.format(page=page_no))
+    if html is None or INQUIRY_LIST_MARKER not in html:
+        raise ParseError("상담내역을 읽지 못했습니다 (로그인 세션이 없거나 화면이 바뀜).")
+    pages = [int(n) for n in INQUIRY_PAGE_LINK.findall(html)] + [int(n) for n in INQUIRY_PAGE_ON.findall(html)]
+    return _parse_inquiry_rows(html), max(pages or [page_no])
+
+
+def _load_inquiry_rows(context: BrowserContext, since: date | None, *, refresh: bool = False,
+                       max_pages: int = INQUIRY_HISTORY_MAX_PAGES) -> list[dict]:
+    """since 이후 줄이 다 들어올 때까지 상담내역을 읽어둔 캐시(최신순). refresh면 1페이지부터 새로."""
+    cache = _inquiry_rows_cache.get(id(context))
+    if cache is None or refresh:
+        rows, last = _fetch_inquiry_page(context, 1)
+        cache = {"rows": rows, "pages": 1, "last": last}
+        _inquiry_rows_cache[id(context)] = cache
+    while (since is not None and cache["rows"] and cache["pages"] < min(max_pages, cache["last"])
+           and cache["rows"][-1]["written_on"] >= since):
+        more, _ = _fetch_inquiry_page(context, cache["pages"] + 1)
+        if not more:
+            break
+        cache["rows"].extend(more)
+        cache["pages"] += 1
+    return cache["rows"]
+
+
+def _describe_listed(entry: dict) -> str:
+    return (f"{entry.get('state') or '상태 모름'} {entry['written_on']:%Y.%m.%d} "
+            f"(문의번호 {entry['inquiry_id']}, 제목 '{entry['text']}')")
+
+
+def _find_listed_inquiry(context: BrowserContext, ord_no: str, since: date | None, *,
+                         refresh: bool = False, max_pages: int = INQUIRY_HISTORY_MAX_PAGES) -> dict | None:
+    """상담내역에서 since 이후에 쓴, 이 주문번호의 '배송 언제' 문의를 찾는다 (사람이 직접 남긴 것 포함)."""
+    for entry in _load_inquiry_rows(context, since, refresh=refresh, max_pages=max_pages):
+        if since is not None and entry["written_on"] < since:
+            return None   # 최신순이라 여기부터는 전부 더 오래된 것
+        if entry["ord_no"] == ord_no and INQUIRY_SAME_MARK in entry["text"]:
+            return entry
+    return None
+
+
+def _confirm_inquiry_listed(context: BrowserContext, ord_no: str, message: str) -> str:
+    """등록 뒤 상담내역을 새로 받아 오늘 자로 올라갔는지 본다. 목록이 늦게 갱신될 수 있어 몇 번 다시 본다."""
+    today = date.today()
+    for attempt in range(1, INQUIRY_HISTORY_TRIES + 1):
+        found = _find_listed_inquiry(context, ord_no, today, refresh=True, max_pages=1)
+        if found is not None:
+            return _describe_listed(found)
+        if attempt < INQUIRY_HISTORY_TRIES:
+            common.sleep(INQUIRY_HISTORY_RETRY_GAP_SEC)
+    raise ParseError(
+        f"[등록]은 눌렀지만 상담내역에서 확인되지 않았습니다. "
+        f"다시 남기기 전에 롯데아이몰 마이롯데 > 상담내역에서 '{message}'가 있는지 직접 확인해주세요.")
+
+
+def _select_inquiry_types(form, ord_no: str) -> None:
+    """문의 유형 분류 [배송/회수] > [배송문의]를 사람처럼 change로 고른다 (등록은 하지 않는다)."""
+    if form.locator(INQUIRY_SUBMIT).count() == 0:
+        raise ParseError(f"1:1 문의 화면이 뜨지 않았습니다 (주문번호={ord_no}, url={form.url}).")
+    if form.locator("#ord_no").input_value().replace("-", "") != ord_no:
+        raise ParseError(f"1:1 문의 화면에 이 주문이 연결되지 않았습니다 (주문번호={ord_no}).")
+    options = [o.strip() for o in form.locator(f"{INQUIRY_TYPE_SELECT} option").all_inner_texts()]
+    if INQUIRY_TYPE_LABEL not in options:
+        raise ParseError(f"문의 유형 분류에 [{INQUIRY_TYPE_LABEL}]이 없습니다 (화면: {options}).")
+    with form.expect_response(lambda r: INQUIRY_SUBTYPE_API in r.url, timeout=INQUIRY_STEP_WAIT_MS):
+        form.select_option(INQUIRY_TYPE_SELECT, INQUIRY_TYPE_CODE)
+    subtype = form.locator(f"{INQUIRY_SUBTYPE_SELECT} option[value='{INQUIRY_SUBTYPE_CODE}']")
+    try:
+        subtype.wait_for(state="attached", timeout=INQUIRY_STEP_WAIT_MS)
+    except PlaywrightTimeoutError:
+        seen = form.locator(f"{INQUIRY_SUBTYPE_SELECT} option").all_inner_texts()
+        raise ParseError(
+            f"[{INQUIRY_TYPE_LABEL}]을 골랐는데 소분류에 [{INQUIRY_SUBTYPE_LABEL}]이 없습니다 (화면: {seen}).") from None
+    label = subtype.inner_text().strip()
+    if label != INQUIRY_SUBTYPE_LABEL:
+        raise ParseError(f"소분류 코드 {INQUIRY_SUBTYPE_CODE}의 이름이 '{label}'입니다 - [{INQUIRY_SUBTYPE_LABEL}]이 아닙니다.")
+    form.select_option(INQUIRY_SUBTYPE_SELECT, INQUIRY_SUBTYPE_CODE)
+    chosen = (form.locator(INQUIRY_TYPE_SELECT).input_value(), form.locator(INQUIRY_SUBTYPE_SELECT).input_value())
+    if chosen != (INQUIRY_TYPE_CODE, INQUIRY_SUBTYPE_CODE):
+        raise ParseError(f"문의 유형이 {INQUIRY_TYPE_LABEL}/{INQUIRY_SUBTYPE_LABEL}로 잡히지 않았습니다 (화면: {chosen}).")
+
+
+def _fill_inquiry_form(form, order: dict, message: str) -> None:
+    """문의 화면에서 유형·제목·내용을 채운다 - [등록]은 누르지 않는다."""
+    _select_inquiry_types(form, order["ord_no"])
+    form.fill(INQUIRY_TITLE, message[:INQUIRY_TITLE_MAX])
+    form.fill(INQUIRY_CONTENT, message[:INQUIRY_CONTENT_MAX])
+    if form.locator(INQUIRY_TITLE).input_value().strip() != message:
+        raise ParseError("문의 제목이 입력되지 않았습니다.")
+    if form.locator(INQUIRY_CONTENT).input_value().strip() != message:
+        raise ParseError("문의 내용이 입력되지 않았습니다.")
+    if form.locator("#goods_no").input_value() != order["goods_no"]:
+        raise ParseError(f"문의할 상품이 주문상세의 상품(goods_no={order['goods_no']})과 다릅니다.")
+
+
+def _submit_via_form(context: BrowserContext, order: dict, message: str, headless: bool) -> str:
+    """문의 화면을 열어 유형·제목·내용을 채우고 [등록]을 눌러 등록 POST가 나간 것까지 본다."""
+    ord_no = order["ord_no"]
+    page = context.new_page()
+    page.route("**/*", _abort_third_party)
+    dialogs: list[tuple[str, str]] = []
+    posted: list[str] = []
+    page.on("dialog", lambda d: (dialogs.append((d.type, d.message)), d.accept()))
+    page.on("request", lambda r: posted.append(r.url) if INQUIRY_POST_PATH in r.url and r.method == "POST" else None)
+    try:
+        _goto_logged_in(context, page, INQUIRY_FORM_URL.format(**order), headless)
+        if INQUIRY_FORM_MARKER not in page.url:
+            raise ParseError(f"1:1 문의 화면 대신 다른 화면이 열렸습니다 (주문번호={ord_no}, url={page.url}).")
+        _fill_inquiry_form(page, order, message)
+
+        page.locator(INQUIRY_SUBMIT).first.click()
+        # 사이트 JS: 상품번호 확인 -> 중복 문의 확인 -> 폼 POST(화면 이동). 화면이
+        # 바뀌거나 '중복 문의 알림'이 뜨거나 안내 alert이 오면 멈춘다 - 어느
+        # 것도 안 오면 시한 뒤 아래에서 사유를 가려 올린다.
+        deadline = time.monotonic() + INQUIRY_STEP_WAIT_MS / 1000
+        while time.monotonic() < deadline:
+            if (INQUIRY_FORM_MARKER not in page.url or posted or dialogs
+                    or page.locator(INQUIRY_DUP_POPUP).count() > 0):
+                break
+            page.wait_for_timeout(100)
+        if INQUIRY_FORM_MARKER in page.url and not posted:
+            if page.locator(INQUIRY_DUP_POPUP).count() > 0:
+                raise AlreadyInquired(
+                    "롯데아이몰이 '중복 문의 알림'을 띄웠습니다 - 같은 주문·상품·유형의 문의를 상담사가 확인 중입니다.")
+            seen = " / ".join(f"{t}: {m}" for t, m in dialogs) or "(뜬 창 없음)"
+            raise ParseError(f"[등록]을 눌렀는데 등록되지 않았습니다 ({seen}).")
+        with contextlib.suppress(PlaywrightTimeoutError):
+            page.wait_for_url(lambda url: INQUIRY_FORM_MARKER not in url,
+                              wait_until="commit", timeout=INQUIRY_STEP_WAIT_MS)
+        with contextlib.suppress(PlaywrightTimeoutError):
+            page.wait_for_load_state("domcontentloaded", timeout=INQUIRY_STEP_WAIT_MS)
+        notes = " / ".join(m for _, m in dialogs)
+        landed = urlparse(page.url).path
+        if not posted:
+            raise ParseError(f"[등록] 뒤 화면이 {landed}로 바뀌었지만 등록 요청은 나가지 않았습니다 ({notes or '뜬 창 없음'}).")
+        return f"등록 요청 보냄 (화면 {landed}{' · ' + notes if notes else ''})"
+    finally:
+        page.close()
+
+
+def post_inquiry(context: BrowserContext, product_url: str, recipient_name: str,
+                 headless: bool = False) -> str:
+    """1:1 문의(배송/회수 > 배송문의)를 남기고 확인 문구를 돌려준다.
+
+    취소/품절 주문은 남기지 않고, 상담내역에 이 주문의 같은 문의가 주문일 이후에
+    이미 있으면 AlreadyInquired로 넘긴다. 등록 뒤 상담내역에 오늘 자로 올라갔는지
+    확인한다. 어디서든 어긋나면 ParseError/BlockedError - 남겼는지 불확실한 채로
+    성공이라 하지 않는다. 제목과 내용이 같은 문구다 (사용자 지시).
+    """
+    ord_no = extract_order_no(product_url)
+    message = f"{recipient_name.strip()} 배송 언제 시작하나요?"
+    order = _order_for_inquiry(context, product_url, ord_no, headless)
+    existing = _find_listed_inquiry(context, ord_no, _order_date_of(ord_no))
+    if existing is not None:
+        raise AlreadyInquired(f"상담내역에 이미 같은 문의가 있습니다: {_describe_listed(existing)}")
+
+    done = _submit_via_form(context, order, message, headless)
+    listed = _confirm_inquiry_listed(context, ord_no, message)
+    return f"{done} · 상담내역 확인: {listed}"

@@ -18,12 +18,12 @@
 버튼을 하루에 두 번 누르거나, 같은 엑셀로 다시 돌려도 이미 남긴 주문은 건너뛴다.
 
 사이트마다 문의 화면이 달라서 어댑터에 post_inquiry(context, product_url,
-recipient_name, headless)가 있는 사이트만 처리하고(지금은 롯데온·지마켓·SSG·네이버·GSSHOP), 없는
+recipient_name, headless)가 있는 사이트만 처리하고(지금은 롯데온·지마켓·SSG·네이버·GSSHOP·롯데아이몰), 없는
 사이트는 '아직 지원 안 함'으로 결과에 남긴다 - 사람이 그 건은 직접 남긴다.
 어댑터에 prepare_inquiries(context, product_urls, headless)가 더 있으면 그
 사이트의 첫 문의 전에 한 번 불러 배치를 미리 훑게 한다(롯데온은 주문목록
 API로 문의 화면 주소를 읽어 주문마다 상세를 여는 일을 던다). 어댑터가
-AlreadyInquired를 내면(지마켓·SSG·네이버·GSSHOP은 등록 전에 문의내역을 뒤져 사람이 직접 남긴
+AlreadyInquired를 내면(지마켓·SSG·네이버·GSSHOP·롯데아이몰은 등록 전에 문의내역을 뒤져 사람이 직접 남긴
 같은 문의를 찾는다) 그 주문은 '넘김'으로 적고 장부에도 올려, 다음 실행부터는
 문의내역을 다시 뒤지지 않는다. 송장조회처럼 WANTS_CDP_CHROME 어댑터(지마켓)는
 우리가 직접 띄운 진짜 크롬(CDP)에서 남긴다 - 번들 크로미엄은 봇 확인에 걸린다.
@@ -401,7 +401,7 @@ def _post_site(site: str, items: list[InquiryTarget], *, settings, headless: boo
                 "order_date": t.order_date,
                 "message": message,
                 "posted_at": datetime.now().isoformat(timespec="seconds"),
-                "confirmation": done,   # 어댑터가 확인한 완료 문구 (롯데온·지마켓·SSG·네이버·GSSHOP: 문의내역의 접수 상태·문의번호)
+                "confirmation": done,   # 어댑터가 확인한 완료 문구 (롯데온·지마켓·SSG·네이버·GSSHOP·롯데아이몰: 문의내역의 접수 상태·문의번호)
             })
             record(i, t, "success", done, message)
     log(f"[{site}] {total}건에 {time.monotonic() - started:.1f}초 걸렸습니다.")
