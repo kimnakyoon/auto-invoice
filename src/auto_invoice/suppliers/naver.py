@@ -627,12 +627,17 @@ def get_tracking(
 # 판매자·상태(답변완료/답변대기)·주문번호·제목([배송] ...)·작성일·문의번호(삭제
 # 버튼 value)가 있어 주문번호로 바로 맞출 수 있다 - 다른 사이트처럼 상세를 열
 # 필요가 없다. 어느 계정 주문인지는 조회와 같이 상세 API의 not_mine으로 가른다.
+# 최적화(2026-09-08): 등록은 폼의 [확인]이 보내는 JSON 요청을 context.request로 바로
+# 보내고(폼 열기·채우기·제출 0.3초 → 0.1초) 거부되면 폼 경로로 간다. 문의내역은
+# 계정마다 배치에 한 번만 읽어 재사용하고(등록 뒤 확인만 새로 받는다), 앞 주문이
+# 있던 계정부터 본다. 폼의 외부 리소스(pstatic) 차단은 재 보니 이득이 없어 안 한다.
 INQUIRY_FORM_URL = ("https://m.pay.naver.com/mobile/shoppingInquiry/form"
                     "?fromPC=Y&merchantNo={merchant_no}&orderNo={order_no}")
 INQUIRY_LIST_URL = ("https://m.pay.naver.com/mobile/shoppingInquiry/list"
                     "?fromPC=Y&searchPeriod=MONTH1&treatmentStatus=ALL")
 INQUIRY_PAGE_API_URL = "https://m.pay.naver.com/mobile/shoppingInquiry/page"
 INQUIRY_POST_PATH = "/mobile/shoppingInquiry"
+INQUIRY_POST_URL = "https://m.pay.naver.com" + INQUIRY_POST_PATH
 INQUIRY_CATEGORY_SELECT = "#inquiryCategory"
 INQUIRY_CATEGORY_VALUE = "DELIVERY"          # 문의유형 [배송]
 INQUIRY_CATEGORY_LABEL = "배송"
@@ -657,6 +662,10 @@ INQUIRY_ROW_ID = re.compile(r'_delete_inquiry_btn[^>]*value="(\d+)"')
 INQUIRY_TOTAL_COUNT = re.compile(r"totalCount\s*:\s*(\d+)")
 INQUIRY_ROW_PER_PAGE = re.compile(r"rowPerPage\s*:\s*(\d+)")
 INQUIRY_LIST_HEADERS = {"referer": "https://orders.pay.naver.com/"}
+# 계정(context)별로 배치에 한 번 읽어두는 문의내역 - {"rows", "pages", "total", "per_page"} (_load_inquiry_rows).
+_inquiry_rows_cache: dict[int, dict] = {}
+# 앞 주문이 있던 계정 - 다음 주문은 그 계정부터 본다 (_account_for_order).
+_last_account: dict[str, str] = {}
 
 
 def inquiry_message(recipient_name: str) -> str:
@@ -682,24 +691,38 @@ def _detail_logged_in(context: BrowserContext, order_no: str, headless: bool,
     return _fetch_detail(context, order_no)
 
 
+def prepare_inquiries(context: BrowserContext, product_urls, headless: bool = False) -> None:
+    """배치 시작 - 앞 배치의 문의내역 캐시와 '앞 주문이 있던 계정' 기억을 비운다.
+
+    캐시는 id(context)로 묶여 있어 새 배치의 context가 예전 id를 다시 받으면 지난
+    목록을 볼 수 있다. 오케스트레이터가 사이트별 첫 문의 전에 이 함수를 한 번
+    불러주므로 여기서 비운다 (목록 자체는 계정별 첫 주문에서 읽는다).
+    """
+    _inquiry_rows_cache.clear()
+    _last_account.clear()
+
+
 def _account_for_order(context: BrowserContext, order_no: str, headless: bool
                        ) -> tuple[BrowserContext, str, dict]:
     """(그 주문이 있는 계정의 context, 계정 표시, 주문상세 result).
 
-    조회(get_tracking)와 같다 - 첫째 계정에서 not_mine이면 둘째 계정을 본다.
+    조회(get_tracking)처럼 상세 API의 not_mine으로 가르되, 앞 주문이 있던 계정부터
+    본다 - 한 배치의 주문은 대개 같은 계정에 몰려 있어 다른 계정에 헛물켜는 0.04초를
+    던다. 두 계정 다 not_mine이면 OrderNotFound.
     """
-    kind, detail = _detail_logged_in(context, order_no, headless, "NAVER_ID", "1")
-    if kind == "ok":
-        return context, "1", detail
-    if kind != "not_mine":
-        raise ParseError(f"주문상세를 읽지 못했습니다 (주문번호={order_no}, 계정 1, {kind}).")
-    second = _get_second_context(context, headless)
-    kind, detail = _detail_logged_in(second, order_no, headless, "NAVER_ID2", "2")
-    if kind == "ok":
-        return second, "2", detail
-    if kind == "not_mine":
-        raise OrderNotFound(f"두 계정 어디에도 이 주문이 없습니다 (주문번호={order_no}).")
-    raise ParseError(f"주문상세를 읽지 못했습니다 (주문번호={order_no}, 계정 2, {kind}).")
+    accounts = [("1", context, "NAVER_ID"), ("2", None, "NAVER_ID2")]
+    if _last_account.get("label") == "2":
+        accounts.reverse()
+    for label, account_context, id_env in accounts:
+        if account_context is None:
+            account_context = _get_second_context(context, headless)
+        kind, detail = _detail_logged_in(account_context, order_no, headless, id_env, label)
+        if kind == "ok":
+            _last_account["label"] = label
+            return account_context, label, detail
+        if kind != "not_mine":
+            raise ParseError(f"주문상세를 읽지 못했습니다 (주문번호={order_no}, 계정 {label}, {kind}).")
+    raise OrderNotFound(f"두 계정 어디에도 이 주문이 없습니다 (주문번호={order_no}).")
 
 
 def _inquiry_product_order(detail: dict, order_no: str) -> dict:
@@ -753,56 +776,80 @@ def _row_date(entry: dict) -> date | None:
         return None
 
 
-def _find_listed_inquiry(context: BrowserContext, order_no: str, message: str,
-                         since: date | None, *, max_pages: int = INQUIRY_HISTORY_MAX_PAGES
-                         ) -> dict | None:
-    """문의내역(최신순)에서 이 주문번호에 같은 문구의 배송 문의가 since 이후로 있으면 그 항목.
+def _load_inquiry_rows(context: BrowserContext, since: date | None, *, refresh: bool,
+                       max_pages: int) -> list[dict]:
+    """문의내역(최신순)을 since 날짜까지 읽어 돌려준다 - 계정(context)마다 배치에 한 번.
 
-    목록이 최신순이라 since보다 오래된 항목이 나오면 더 넘기지 않는다. 목록을
-    못 읽으면(세션 만료 등) 모르는 채로 등록하지 않도록 BlockedError.
+    첫 페이지는 목록 화면 자체(15건 + totalCount/rowPerPage), 다음은 [더보기]의
+    페이지 API다. 읽어둔 것보다 오래된 날짜까지 필요할 때만 다음 페이지를 더 받고,
+    refresh면(등록 뒤 확인) 첫 페이지를 새로 받아 캐시를 갈아 끼운다. 목록을 못
+    읽으면(세션 만료 등) 모르는 채로 등록하지 않도록 BlockedError.
     """
-    try:
-        response = context.request.get(INQUIRY_LIST_URL, headers=INQUIRY_LIST_HEADERS)
-        html = response.text() if response.status == 200 else ""
-    except Exception as e:  # noqa: BLE001
-        raise BlockedError(f"문의내역을 읽지 못했습니다 ({e}).") from e
-    if "nid.naver.com" in response.url or "_inquiry_list" not in html:
-        raise BlockedError(f"문의내역을 읽지 못했습니다 (HTTP {response.status}, {response.url[:60]}).")
-    total_match = INQUIRY_TOTAL_COUNT.search(html)
-    per_page_match = INQUIRY_ROW_PER_PAGE.search(html)
-    total = int(total_match.group(1)) if total_match else 0
-    per_page = int(per_page_match.group(1)) if per_page_match else 15
-    page_no = 1
-    while True:
-        for entry in _parse_inquiry_rows(html):
-            written = _row_date(entry)
-            if since and written and written < since:
-                return None
-            if (entry["order_no"] == order_no and message in entry["subject"]
-                    and entry["subject"].startswith(f"[{INQUIRY_CATEGORY_LABEL}]")):
-                return entry
-        page_no += 1
-        if page_no > max_pages or total <= (page_no - 1) * per_page:
-            return None
-        status, body = 0, ""
+    cache = None if refresh else _inquiry_rows_cache.get(id(context))
+    if cache is None:
+        try:
+            response = context.request.get(INQUIRY_LIST_URL, headers=INQUIRY_LIST_HEADERS)
+            html = response.text() if response.status == 200 else ""
+        except Exception as e:  # noqa: BLE001
+            raise BlockedError(f"문의내역을 읽지 못했습니다 ({e}).") from e
+        if "nid.naver.com" in response.url or "_inquiry_list" not in html:
+            raise BlockedError(f"문의내역을 읽지 못했습니다 (HTTP {response.status}, {response.url[:60]}).")
+        total_match = INQUIRY_TOTAL_COUNT.search(html)
+        per_page_match = INQUIRY_ROW_PER_PAGE.search(html)
+        cache = {
+            "rows": _parse_inquiry_rows(html),
+            "pages": 1,
+            "total": int(total_match.group(1)) if total_match else 0,
+            "per_page": int(per_page_match.group(1)) if per_page_match else 15,
+        }
+        _inquiry_rows_cache[id(context)] = cache
+
+    def _needs_more() -> bool:
+        if since is None or not cache["rows"] or cache["pages"] >= max_pages:
+            return False
+        if cache["total"] <= cache["pages"] * cache["per_page"]:
+            return False
+        oldest = _row_date(cache["rows"][-1])
+        return oldest is None or oldest >= since
+
+    while _needs_more():
+        page_no = cache["pages"] + 1
+        body = ""
         try:
             response = context.request.post(
                 INQUIRY_PAGE_API_URL,
                 data=json.dumps({"searchPeriod": "MONTH1", "treatmentStatus": "ALL", "currentPage": page_no}),
                 headers={**INQUIRY_LIST_HEADERS, "content-type": "application/json"})
-            status, body = response.status, response.text()
+            body = response.text() if response.status == 200 else ""
         except Exception:  # noqa: BLE001
             pass
-        if status != 200 or INQUIRY_ROW_SPLIT not in body:
-            return None
-        html = body
+        more = _parse_inquiry_rows(body) if INQUIRY_ROW_SPLIT in body else []
+        if not more:
+            break
+        cache["rows"].extend(more)
+        cache["pages"] = page_no
+    return cache["rows"]
+
+
+def _find_listed_inquiry(context: BrowserContext, order_no: str, message: str,
+                         since: date | None, *, refresh: bool = False,
+                         max_pages: int = INQUIRY_HISTORY_MAX_PAGES) -> dict | None:
+    """문의내역에서 이 주문번호에 같은 문구의 배송 문의가 since 이후로 있으면 그 항목."""
+    for entry in _load_inquiry_rows(context, since, refresh=refresh, max_pages=max_pages):
+        written = _row_date(entry)
+        if since and written and written < since:
+            return None   # 최신순이라 여기부터는 전부 더 오래된 것
+        if (entry["order_no"] == order_no and message in entry["subject"]
+                and entry["subject"].startswith(f"[{INQUIRY_CATEGORY_LABEL}]")):
+            return entry
+    return None
 
 
 def _confirm_inquiry_listed(context: BrowserContext, order_no: str, message: str) -> str:
-    """등록 뒤 문의내역에 오늘 자로 올라갔는지 본다. 목록이 늦게 갱신될 수 있어 몇 번 다시 본다."""
+    """등록 뒤 문의내역을 새로 받아 오늘 자로 올라갔는지 본다. 목록이 늦게 갱신될 수 있어 몇 번 다시 본다."""
     today = datetime.now(KST).date()
     for attempt in range(1, INQUIRY_HISTORY_TRIES + 1):
-        found = _find_listed_inquiry(context, order_no, message, today, max_pages=1)
+        found = _find_listed_inquiry(context, order_no, message, today, refresh=True, max_pages=1)
         if found is not None:
             return _describe_listed(found)
         if attempt < INQUIRY_HISTORY_TRIES:
@@ -810,6 +857,39 @@ def _confirm_inquiry_listed(context: BrowserContext, order_no: str, message: str
     raise ParseError(
         f"완료 문구는 받았지만 문의내역에서 확인되지 않았습니다. "
         f"다시 남기기 전에 네이버페이 문의내역에서 '{message}'가 있는지 직접 확인해주세요.")
+
+
+def _submit_via_api(context: BrowserContext, order_no: str, product_order: dict, message: str) -> str | None:
+    """폼의 [확인]이 보내는 JSON 등록 요청을 폼 없이 바로 보낸다.
+
+    본문·헤더는 폼이 보내는 것과 같다(등록 요청을 가로채 확인한 값). 응답이
+    apiSuccess면 완료 문구, 그 밖의 무엇이든(HTTP 오류·apiSuccess false·JSON이
+    아님) None을 돌려주고 호출자가 검증된 폼 경로로 넘어간다 - 등록됐는지 모호한
+    채로 성공이라 하지도, 바로 실패라 하지도 않는다.
+    """
+    form_url = INQUIRY_FORM_URL.format(merchant_no=product_order["merchantNo"], order_no=order_no)
+    payload = {
+        "orderNo": order_no,
+        "merchantNo": str(product_order["merchantNo"]),
+        "productOrderNo": str(product_order["productOrderNo"]),
+        "inquiryCategory": INQUIRY_CATEGORY_VALUE,
+        "title": message[:INQUIRY_TITLE_MAX],
+        "inquiryContent": message,
+        "contractNo": "",
+    }
+    try:
+        response = context.request.post(
+            INQUIRY_POST_URL, data=json.dumps(payload, ensure_ascii=False).encode("utf-8"),
+            headers={"content-type": "application/json", "accept": "*/*",
+                     "origin": "https://m.pay.naver.com", "referer": form_url})
+        body = response.json() if "json" in response.headers.get("content-type", "") else None
+    except Exception as e:  # noqa: BLE001
+        common.safe_print(f"[naver] 등록 요청을 바로 보내지 못했습니다({e}) - 폼으로 남깁니다.")
+        return None
+    if response.status == 200 and isinstance(body, dict) and body.get("apiSuccess") is True:
+        return "등록 요청 성공(apiSuccess)"
+    common.safe_print(f"[naver] 바로 보낸 등록 요청이 거부됐습니다(HTTP {response.status}, {str(body)[:80]}) - 폼으로 남깁니다.")
+    return None
 
 
 def _pick_product_in_form(page, product_order_no: str) -> None:
@@ -833,15 +913,73 @@ def _pick_product_in_form(page, product_order_no: str) -> None:
         raise ParseError(f"폼의 상품주문번호({current or '비어 있음'})가 이 주문의 것({product_order_no})과 다릅니다.")
 
 
+def _submit_via_form(context: BrowserContext, order_no: str, product_order: dict, message: str,
+                     account_label: str) -> str:
+    """문의 폼을 열어 유형 [배송]·제목·내용을 채우고 [확인]을 눌러 완료 문구를 돌려준다.
+
+    등록 요청의 응답(apiSuccess)과 완료 alert 둘 다 있어야 성공이다.
+    """
+    page = context.new_page()
+    try:
+        page.goto(INQUIRY_FORM_URL.format(merchant_no=product_order["merchantNo"], order_no=order_no),
+                  wait_until="domcontentloaded")
+        if _looks_like_login_page(page):
+            raise BlockedError(f"문의 폼이 로그인 화면으로 넘어갔습니다 (계정 {account_label}).")
+        try:
+            page.wait_for_selector(INQUIRY_CATEGORY_SELECT, timeout=INQUIRY_STEP_WAIT_MS)
+        except PlaywrightTimeoutError as e:
+            raise ParseError(f"문의 폼이 그려지지 않았습니다 (주문번호={order_no}).") from e
+        shown = page.locator("#orderNo").first.evaluate("e => e.value") if page.locator("#orderNo").count() else ""
+        if shown != order_no:
+            raise ParseError(f"폼의 주문번호({shown or '없음'})가 이 주문({order_no})이 아닙니다.")
+        _pick_product_in_form(page, str(product_order["productOrderNo"]))
+        page.locator(INQUIRY_CATEGORY_SELECT).select_option(INQUIRY_CATEGORY_VALUE)
+        page.locator(INQUIRY_TITLE).fill(message[:INQUIRY_TITLE_MAX])
+        page.locator(INQUIRY_CONTENT).fill(message)
+
+        dialogs: list[str] = []
+
+        def _on_dialog(dialog) -> None:
+            dialogs.append(dialog.message)
+            dialog.accept()
+
+        page.on("dialog", _on_dialog)
+        try:
+            with page.expect_response(lambda r: r.url.rstrip("/").endswith(INQUIRY_POST_PATH)
+                                      and r.request.method == "POST",
+                                      timeout=INQUIRY_STEP_WAIT_MS) as posted:
+                page.locator(INQUIRY_SUBMIT).click()
+            response = posted.value
+        except PlaywrightTimeoutError as e:
+            seen = " / ".join(dialogs) or "(뜬 창 없음)"
+            raise ParseError(f"[확인]을 눌렀는데 등록 요청이 나가지 않았습니다 ({seen}).") from e
+        try:
+            api_ok = bool((response.json() or {}).get("apiSuccess"))
+        except Exception:  # noqa: BLE001
+            api_ok = False
+        waited = 0
+        while not any(INQUIRY_DONE_TEXT in m for m in dialogs) and waited < INQUIRY_STEP_WAIT_MS:
+            page.wait_for_timeout(100)
+            waited += 100
+        done = [m for m in dialogs if INQUIRY_DONE_TEXT in m]
+        if not done or not api_ok:
+            seen = " / ".join(dialogs) or "(뜬 창 없음)"
+            raise ParseError(f"등록 응답 HTTP {response.status}, apiSuccess={api_ok}, 완료 문구를 받지 못했습니다 ({seen}).")
+        return done[0].strip().rstrip(".")
+    finally:
+        page.close()
+
+
 def post_inquiry(context: BrowserContext, product_url: str, recipient_name: str,
                  headless: bool = False) -> str:
     """1:1 문의(문의유형 [배송])를 남기고 완료 문구를 돌려준다.
 
     주문이 있는 계정을 고르고(조회와 같은 두 계정 판별), 취소/품절 주문은 남기지
     않으며, 문의내역에 이 주문의 같은 문의가 주문일 이후에 이미 있으면
-    AlreadyInquired로 넘긴다. 완료 alert를 받은 뒤 문의내역에 오늘 자로 올라갔는지
-    까지 확인한다. 어디서든 어긋나면 ParseError/BlockedError - 남겼는지
-    불확실한 채로 성공이라 하지 않는다.
+    AlreadyInquired로 넘긴다. 등록은 폼이 보내는 JSON 요청을 바로 보내고
+    (_submit_via_api), 거부되면 폼을 열어 남긴다(_submit_via_form). 어느 쪽이든
+    문의내역에 오늘 자로 올라갔는지까지 확인한다. 어디서든 어긋나면
+    ParseError/BlockedError - 남겼는지 불확실한 채로 성공이라 하지 않는다.
     """
     order_no = extract_order_no(product_url)
     message = inquiry_message(recipient_name)
@@ -853,56 +991,16 @@ def post_inquiry(context: BrowserContext, product_url: str, recipient_name: str,
         if existing is not None:
             raise AlreadyInquired(f"문의내역에 이미 같은 문의가 있습니다 (계정 {account_label}): {_describe_listed(existing)}")
 
-        page = account_context.new_page()
-        try:
-            page.goto(INQUIRY_FORM_URL.format(merchant_no=product_order["merchantNo"], order_no=order_no),
-                      wait_until="domcontentloaded")
-            if _looks_like_login_page(page):
-                raise BlockedError(f"문의 폼이 로그인 화면으로 넘어갔습니다 (계정 {account_label}).")
-            try:
-                page.wait_for_selector(INQUIRY_CATEGORY_SELECT, timeout=INQUIRY_STEP_WAIT_MS)
-            except PlaywrightTimeoutError as e:
-                raise ParseError(f"문의 폼이 그려지지 않았습니다 (주문번호={order_no}).") from e
-            shown = page.locator("#orderNo").first.evaluate("e => e.value") if page.locator("#orderNo").count() else ""
-            if shown != order_no:
-                raise ParseError(f"폼의 주문번호({shown or '없음'})가 이 주문({order_no})이 아닙니다.")
-            _pick_product_in_form(page, str(product_order["productOrderNo"]))
-            page.locator(INQUIRY_CATEGORY_SELECT).select_option(INQUIRY_CATEGORY_VALUE)
-            page.locator(INQUIRY_TITLE).fill(message[:INQUIRY_TITLE_MAX])
-            page.locator(INQUIRY_CONTENT).fill(message)
-
-            dialogs: list[str] = []
-
-            def _on_dialog(dialog) -> None:
-                dialogs.append(dialog.message)
-                dialog.accept()
-
-            page.on("dialog", _on_dialog)
-            try:
-                with page.expect_response(lambda r: r.url.rstrip("/").endswith(INQUIRY_POST_PATH)
-                                          and r.request.method == "POST",
-                                          timeout=INQUIRY_STEP_WAIT_MS) as posted:
-                    page.locator(INQUIRY_SUBMIT).click()
-                response = posted.value
-            except PlaywrightTimeoutError as e:
-                seen = " / ".join(dialogs) or "(뜬 창 없음)"
-                raise ParseError(f"[확인]을 눌렀는데 등록 요청이 나가지 않았습니다 ({seen}).") from e
-            try:
-                api_ok = bool((response.json() or {}).get("apiSuccess"))
-            except Exception:  # noqa: BLE001
-                api_ok = False
-            waited = 0
-            while not any(INQUIRY_DONE_TEXT in m for m in dialogs) and waited < INQUIRY_STEP_WAIT_MS:
-                page.wait_for_timeout(100)
-                waited += 100
-            done = [m for m in dialogs if INQUIRY_DONE_TEXT in m]
-            if not done or not api_ok:
-                seen = " / ".join(dialogs) or "(뜬 창 없음)"
-                raise ParseError(f"등록 응답 HTTP {response.status}, apiSuccess={api_ok}, 완료 문구를 받지 못했습니다 ({seen}).")
-        finally:
-            page.close()
+        done = _submit_via_api(account_context, order_no, product_order, message)
+        if done is None:
+            # 거부 응답이었어도 그 사이 올라갔을 수 있으니 폼을 열기 전에 오늘 자를 한 번 본다.
+            today = datetime.now(KST).date()
+            posted = _find_listed_inquiry(account_context, order_no, message, today, refresh=True, max_pages=1)
+            if posted is not None:
+                return f"등록 요청은 거부 응답이었지만 문의내역에 올라감 (계정 {account_label}) · 문의내역: {_describe_listed(posted)}"
+            done = _submit_via_form(account_context, order_no, product_order, message, account_label)
         listed = _confirm_inquiry_listed(account_context, order_no, message)
-        return f"{done[0].strip().rstrip('.')} (계정 {account_label}) · 문의내역: {listed}"
+        return f"{done} (계정 {account_label}) · 문의내역: {listed}"
     finally:
         # 둘째 계정 세션은 여기서 직접 저장한다 (조회의 finally와 같은 이유 - 이
         # context는 오케스트레이터가 실행 끝에 저장해 주지 않는다).
