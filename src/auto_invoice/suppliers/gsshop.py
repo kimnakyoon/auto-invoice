@@ -89,13 +89,17 @@
 
 from __future__ import annotations
 
+import html as html_mod
 import json
 import os
 import re
+from datetime import date, datetime
+from types import SimpleNamespace
 from urllib.parse import parse_qs, urlparse
 
 from dotenv import load_dotenv
 from playwright.sync_api import BrowserContext
+from playwright.sync_api import TimeoutError as PlaywrightTimeoutError
 
 from .. import browser as browser_mod
 from .. import eta as eta_mod
@@ -104,7 +108,9 @@ from ..models import TrackingResult
 from . import common
 from .base import (
     AdapterError,
+    AlreadyInquired,
     BlockedError,
+    OrderCancelled,
     ParseError,
     TrackingNotAvailableYet,
     attach_order_date,
@@ -674,3 +680,413 @@ def get_tracking(
         return with_order_date(page, fetch, data=entry)
     finally:
         page.close()
+
+
+# --------------------------------------------------------------------------
+# 1:1 상담 남기기 (post_inquiry) - 2026-09-08 실측
+# --------------------------------------------------------------------------
+# 주문일이 이틀 지나도록 안 나간 주문에 "<주문번호> <수령인> 배송 언제 시작하나요?"를
+# 남긴다(inquiry.py). 사람이 누르는 순서는 주문상세 팝업 -> 상품명 -> [마이쇼핑] ->
+# 왼쪽 메뉴 [1:1 상담하기] -> 상담 유형 [배송 문의] -> 문의상품 선택 칸(내용) ->
+# [문의하기] -> 마이쇼핑 [나의 상담 내역] > [PC 상담]에서 확인이다. 실측한 구조:
+#   [1:1 상담하기] = 고정 주소 www.gsshop.com/cust/custCent/main.gs (주문번호가 주소에
+#     안 붙는다 - SSG처럼). 그래서 주문상세 화면은 열 필요가 없고, 취소/품절 여부와
+#     상품 정보만 주문상세 JSON(entry-data, 화면 없이 HTML만 받는다)으로 본다.
+#   상담 유형 드롭다운 = <a id="query_3" onclick="func_select('01')">배송 문의</a> ->
+#     숨은 폼 #board 의 #prsnConslTypCd 에 코드가 들어간다 (01=배송 문의, 03=상품 문의,
+#     23=결제/주문취소, 06=반품/교환, 11=이벤트/적립/혜택, 21=알림/회원/기타).
+#   문의상품 선택 탭 [주문내역]은 팝업(/ord/dlvcursta/popup/ordList.gs)을 띄우고, 그
+#     [선택]이 opener.setPrdResult('1', 주문번호, prdCd, 상품명, 주문일시, 'PA', 이미지,
+#     옵션, 정가, 판매가, ordItemNo)를 부른다 - 서버로 가는 값은 그중 ordNo/ordItemNo/
+#     prdCd 뿐이고 전부 주문상세 JSON(ordItemList[].ordNo/ordItemNo/prdCd)에 있어 팝업
+#     없이 같은 함수를 직접 불러 붙인다. 사람은 이 칸을 안 쓰고 내용에 주문번호를
+#     적지만, 상품까지 붙여두면 상담원이 주문을 바로 본다(내용의 주문번호는 그대로).
+#   내용 = textarea#email_desc (2,000자) -> [문의하기](#request-submit-button, submitForm)
+#     -> confirm("등록하시겠습니까?") -> jQuery POST /cust/myshop/inqry.gs 에 #board 를
+#     serialize (questCntnt, ordNo, ordItemNo, prdCd, custMailChkYn, custSmsSndYn=Y,
+#     prsnConslTypCd) -> JSON {retCd:"SUCC"} -> confirm("1:1문의가 접수되었습니다 ...
+#     1:1문의내역을 확인하시겠습니까?") -> 확인이면 oneConsl.gs?#EMAIL, 취소면 reload.
+#     retCd가 SUCC가 아니면 alert(retMsg) 뒤 reload. #blockCustYn=Y 면 "1:1상담을
+#     이용하실 수 없습니다"로 막힌다. 로그인이 없으면 이 화면이 로그인으로 넘어간다.
+#     **함정:** 완료 confirm을 닫으면(확인이든 취소든) 페이지가 이동/새로고침돼 등록
+#     응답 본문을 그 뒤에는 못 읽는다(첫 실등록 때 retCd=None으로 실패라고 잘못
+#     판정했다). 그래서 등록 요청을 page.route로 받아 본문을 먼저 읽어둔다(_serve_post).
+#   그 POST는 폼이 만드는 값이 전부라 폼 없이 바로 보낼 수 있다(_submit_via_api) -
+#     네이버와 같은 직행. 거부되면(HTTP 오류·retCd가 SUCC 아님·JSON 아님) 그 사이
+#     올라갔는지 오늘 자 상담내역을 본 뒤 폼을 열어 같은 순서로 남긴다(_submit_via_form).
+# 상담내역 확인: [나의 상담 내역] > [PC 상담] 화면(oneConsl.gs?#EMAIL)이 부르는
+#   oneConsl.gs?ajaxYn=Y&tabGbnCd=EMAIL&currPageNo=N (HTML 조각, 20건씩 최신순,
+#   #totalCnt)에 줄마다 <li id="email<문의번호>"> 등록일(2026.09.08)·내용 첫 줄·상태
+#   (답변대기 -> 답변완료)가 있다. 내용이 주문번호로 시작하므로
+#   상세(oneConslDtl.gs?oneConslId=, 답변까지 있는 HTML 조각) 없이 주문을 맞춘다.
+#   **등록 전**에 주문일 이후 같은 주문의 '배송 언제' 문의가 있으면 AlreadyInquired로
+#   넘긴다(2026-09-08 실측: 사용자가 그날 직접 남긴 3471224776 최창호 등 3건이 있었다).
+#   **등록 후**에는 오늘 자로 올라갔는지 확인해 완료 문구에 붙인다.
+INQUIRY_FORM_URL = "https://www.gsshop.com/cust/custCent/main.gs"
+INQUIRY_POST_PATH = "/cust/myshop/inqry.gs"
+INQUIRY_POST_URL = "https://www.gsshop.com" + INQUIRY_POST_PATH
+INQUIRY_LIST_URL = ("https://www.gsshop.com/cust/myshop/oneConsl.gs"
+                    "?ajaxYn=Y&tabGbnCd=EMAIL&currPageNo={page}")
+INQUIRY_LIST_MARKER = 'id="oneConsl-tab1"'
+INQUIRY_TYPE_CODE = "01"             # 상담 유형 [배송 문의]
+INQUIRY_TYPE_LABEL = "배송 문의"
+INQUIRY_CONTENT = "#email_desc"
+INQUIRY_CONTENT_MAX = 2000
+INQUIRY_SUBMIT = "#request-submit-button"
+INQUIRY_BLOCKED_FLAG = "#blockCustYn"
+INQUIRY_LOGIN_FLAG = "#entryLoginFlg"
+INQUIRY_MESSAGE = "{order_no} {name} 배송 언제 시작하나요?"
+INQUIRY_SAME_MARK = "배송 언제"       # 상담내역에서 '같은 문의'로 보는 표식 (주문번호와 함께)
+INQUIRY_DONE_TEXT = "1:1문의가 접수되었습니다"
+INQUIRY_SUCCESS_CODE = "SUCC"
+INQUIRY_STEP_WAIT_MS = 10000         # 화면 요소·등록 응답·완료 창이 오기까지 최대
+INQUIRY_HISTORY_TRIES = 3            # 등록 뒤 목록에 아직 안 보이면 이만큼 다시 본다
+INQUIRY_HISTORY_RETRY_GAP_SEC = 1.0
+INQUIRY_HISTORY_MAX_PAGES = 5        # '이미 남겼는지' 훑는 상담내역 페이지 수 (20건씩)
+INQUIRY_ROWS_PER_PAGE = 20
+# 문의 화면에서 받아줄 호스트 - 화면·API·정적파일이 이 안이다. 나머지는 광고/분석
+# 태그(google·airbridge·megadata·widerplanet 등)라 끊는다.
+INQUIRY_ALLOWED_HOSTS = ("gsshop.com", "m-gs.kr")
+INQUIRY_BLOCKED_RESOURCE_TYPES = {"image", "media", "font"}
+INQUIRY_ROW_PATTERN = re.compile(r'<li class="panel-box" id="email(\d+)">(.*?)</li>', re.S)
+INQUIRY_ROW_DATE = re.compile(r'<p class="rdate">.*?</span>\s*(\d{4}\.\d{2}\.\d{2})', re.S)
+INQUIRY_ROW_TEXT = re.compile(r'<dd class="text-nowrap">(.*?)</dd>', re.S)
+INQUIRY_ROW_STATE = re.compile(r'<span class="reply-state[^"]*">\s*(.*?)\s*</span>', re.S)
+INQUIRY_TOTAL_PATTERN = re.compile(r'id="totalCnt"[^>]*value="(\d+)"')
+# 폼의 setPrdResult에 넘기는 주문상세 JSON 항목의 값들 (표시용 - 서버로는 ordNo/ordItemNo/prdCd만 간다).
+INQUIRY_ITEM_FIELDS = ("prdCd", "exposPrdNm", "ordDtFullStr", "prdImgUrlPath",
+                       "exposAttrPrdNm", "stdUprc", "lastUprc", "ordItemNo")
+INQUIRY_ATTACH_JS = (
+    "([ordNo, item]) => setPrdResult('1', ordNo, String(item.prdCd || ''), item.exposPrdNm || '', "
+    "item.ordDtFullStr || '', 'PA', item.prdImgUrlPath || '', item.exposAttrPrdNm || '', "
+    "(item.stdUprc || '') + '원', (item.lastUprc || '') + '원', String(item.ordItemNo || ''))")
+INQUIRY_FILLED_JS = (
+    "() => ({type: document.getElementById('prsnConslTypCd').value, "
+    "ordNo: document.getElementById('ordNo').value, prdCd: document.getElementById('prdCd').value, "
+    "noPrd: document.getElementById('noPrdChk').value})")
+
+# 이 실행(컨텍스트)에서 이미 읽어둔 상담내역 {"rows": [...최신순], "pages": n, "total": n}.
+# 한 배치의 주문들이 같은 목록을 보므로 주문마다 다시 받지 않는다(prepare_inquiries가 비운다).
+_inquiry_rows_cache: dict[int, dict] = {}
+
+
+def inquiry_message(recipient_name: str, product_url: str | None = None) -> str:
+    """사용자 문구 그대로 "<주문번호> <수령인> 배송 언제 시작하나요?" (상품URL이 없으면 주문번호 없이)."""
+    name = recipient_name.strip()
+    if not product_url:
+        return f"{name} 배송 언제 시작하나요?"
+    return INQUIRY_MESSAGE.format(order_no=extract_order_no(product_url), name=name)
+
+
+def prepare_inquiries(context: BrowserContext, product_urls, headless: bool = False) -> None:
+    """이번에 문의할 주문들의 주문상세(취소/품절·상품)를 주문목록으로 미리 읽어두고,
+    상담내역 캐시는 새 배치라 비운다. 송장조회의 prepare_batch와 같은 목록이다."""
+    _inquiry_rows_cache.pop(id(context), None)
+    prepare_batch(context, [SimpleNamespace(product_url=u) for u in product_urls], headless=headless)
+
+
+def _abort_third_party(route) -> None:
+    """문의 화면 전용 라우팅 - GSSHOP 밖 호스트와 이미지·폰트는 끊고 나머지는 보낸다."""
+    request = route.request
+    host = urlparse(request.url).netloc.lower()
+    allowed = any(host == h or host.endswith("." + h) for h in INQUIRY_ALLOWED_HOSTS)
+    if allowed and request.resource_type not in INQUIRY_BLOCKED_RESOURCE_TYPES:
+        route.continue_()
+    else:
+        route.abort()
+
+
+def _order_date_of(entry: dict, ord_no: str) -> date:
+    """주문상세 JSON의 ordDt("2026.09.04")."""
+    try:
+        return datetime.strptime(str(entry.get("ordDt") or ""), "%Y.%m.%d").date()
+    except ValueError:
+        raise ParseError(
+            f"주문 정보에서 주문일을 읽을 수 없습니다 (주문번호={ord_no}, ordDt={entry.get('ordDt')!r})."
+        ) from None
+
+
+def _order_for_inquiry(context: BrowserContext, product_url: str, ord_no: str, headless: bool) -> dict:
+    """주문상세 JSON - prepare_inquiries가 읽어둔 목록 항목이면 그것을, 아니면 화면 없이
+    HTML만 받아 꺼낸다. 세션이 없으면 자동 로그인 뒤 한 번 더 받는다."""
+    listed = _listed_orders.get(id(context), {}).get(_list_key(ord_no, extract_order_type(product_url)))
+    if listed is not None:
+        return listed
+    final_url, entry = _fetch_entry_data(context, product_url)
+    if entry is None and _is_login_url(final_url):
+        common.safe_print("[gsshop] 로그인 세션이 없어 자동 로그인을 시도합니다 (로그인용 크롬 창이 잠깐 뜹니다).")
+        if not _auto_login(context, product_url, headless=headless):
+            raise BlockedError("GSSHOP 로그인이 필요합니다. 송장조회를 한 번 돌려 로그인해두거나 "
+                               "--headless 없이 실행해주세요.")
+        common.safe_print("[gsshop] 자동 로그인 완료.")
+        final_url, entry = _fetch_entry_data(context, product_url)
+    if entry is None:
+        raise ParseError(f"주문 정보(entry-data)를 찾지 못했습니다 (주문번호={ord_no}, 주소={final_url}).")
+    return entry
+
+
+def _inquiry_item(entry: dict, ord_no: str) -> dict:
+    """문의에 붙일 상품 - 취소/품절이 아닌 첫 상품. 전부 취소/품절이면 OrderCancelled."""
+    items = entry.get("ordItemList") or []
+    if not items:
+        raise ParseError(f"주문 응답에 상품 정보가 없습니다 (주문번호={ord_no}).")
+    first_error: OrderCancelled | None = None
+    for item in items:
+        try:
+            raise_if_cancelled(item.get("ordItemStExposNm"), ord_no)
+        except OrderCancelled as e:
+            first_error = first_error or e
+            continue
+        return item
+    assert first_error is not None
+    raise first_error
+
+
+def _get_html(context: BrowserContext, url: str) -> str | None:
+    """브라우저 쿠키로 GET - 로그인 화면으로 넘어가거나 실패하면 None."""
+    try:
+        response = context.request.get(url)
+    except Exception:  # noqa: BLE001 - 통신 실패는 '못 읽음'
+        return None
+    if not response.ok or _is_login_url(response.url):
+        return None
+    return response.text()
+
+
+def _parse_inquiry_rows(fragment: str) -> list[dict]:
+    """상담내역 HTML 조각에서 줄마다 문의번호·등록일·내용·상태 (최신순)."""
+    rows: list[dict] = []
+    for m in INQUIRY_ROW_PATTERN.finditer(fragment):
+        chunk = m.group(2)
+        d = INQUIRY_ROW_DATE.search(chunk)
+        t = INQUIRY_ROW_TEXT.search(chunk)
+        s = INQUIRY_ROW_STATE.search(chunk)
+        if not d or not t:
+            continue
+        text = html_mod.unescape(re.sub(r"\s+", " ", re.sub(r"<[^>]+>", " ", t.group(1)))).strip()
+        rows.append({
+            "inquiry_id": m.group(1),
+            "written_on": datetime.strptime(d.group(1), "%Y.%m.%d").date(),
+            "text": text,
+            "state": html_mod.unescape(s.group(1)).strip() if s else "",
+        })
+    return rows
+
+
+def _fetch_inquiry_page(context: BrowserContext, page_no: int) -> tuple[list[dict], int]:
+    """상담내역 한 페이지 (줄들, 전체 건수). 목록을 못 읽으면 ParseError - 모르는 채로 등록하지 않는다."""
+    fragment = _get_html(context, INQUIRY_LIST_URL.format(page=page_no))
+    if fragment is None or INQUIRY_LIST_MARKER not in fragment:
+        raise ParseError("나의 상담 내역을 읽지 못했습니다 (로그인 세션이 없거나 화면이 바뀜).")
+    total = INQUIRY_TOTAL_PATTERN.search(fragment)
+    return _parse_inquiry_rows(fragment), int(total.group(1)) if total else 0
+
+
+def _load_inquiry_rows(context: BrowserContext, since: date | None, *, refresh: bool = False,
+                       max_pages: int = INQUIRY_HISTORY_MAX_PAGES) -> list[dict]:
+    """since 이후 줄이 다 들어올 때까지 상담내역을 읽어둔 캐시(최신순). refresh면 1페이지부터 새로."""
+    cache = _inquiry_rows_cache.get(id(context))
+    if cache is None or refresh:
+        rows, total = _fetch_inquiry_page(context, 1)
+        cache = {"rows": rows, "pages": 1, "total": total}
+        _inquiry_rows_cache[id(context)] = cache
+    while (since is not None and cache["rows"] and cache["pages"] < max_pages
+           and cache["total"] > cache["pages"] * INQUIRY_ROWS_PER_PAGE
+           and cache["rows"][-1]["written_on"] >= since):
+        more, _ = _fetch_inquiry_page(context, cache["pages"] + 1)
+        if not more:
+            break
+        cache["rows"].extend(more)
+        cache["pages"] += 1
+    return cache["rows"]
+
+
+def _describe_listed(entry: dict) -> str:
+    return f"{entry.get('state') or '상태 모름'} {entry['written_on']:%Y.%m.%d} (문의번호 {entry['inquiry_id']})"
+
+
+def _find_listed_inquiry(context: BrowserContext, ord_no: str, since: date | None, *,
+                         refresh: bool = False, max_pages: int = INQUIRY_HISTORY_MAX_PAGES) -> dict | None:
+    """상담내역에서 since 이후에 쓴, 이 주문번호의 '배송 언제' 문의를 찾는다 (사람이 직접 남긴 것 포함)."""
+    for entry in _load_inquiry_rows(context, since, refresh=refresh, max_pages=max_pages):
+        if since is not None and entry["written_on"] < since:
+            return None   # 최신순이라 여기부터는 전부 더 오래된 것
+        if ord_no in entry["text"] and INQUIRY_SAME_MARK in entry["text"]:
+            return entry
+    return None
+
+
+def _confirm_inquiry_listed(context: BrowserContext, ord_no: str, message: str) -> str:
+    """등록 뒤 상담내역을 새로 받아 오늘 자로 올라갔는지 본다. 목록이 늦게 갱신될 수 있어 몇 번 다시 본다."""
+    today = date.today()
+    for attempt in range(1, INQUIRY_HISTORY_TRIES + 1):
+        found = _find_listed_inquiry(context, ord_no, today, refresh=True, max_pages=1)
+        if found is not None:
+            return _describe_listed(found)
+        if attempt < INQUIRY_HISTORY_TRIES:
+            common.sleep(INQUIRY_HISTORY_RETRY_GAP_SEC)
+    raise ParseError(
+        f"완료 응답은 받았지만 나의 상담 내역에서 확인되지 않았습니다. "
+        f"다시 남기기 전에 GSSHOP 마이쇼핑 > 나의 상담 내역 > PC 상담에서 '{message}'가 있는지 직접 확인해주세요.")
+
+
+def _inquiry_payload(ord_no: str, item: dict, message: str) -> dict[str, str]:
+    """[문의하기]가 보내는 숨은 폼 #board 의 값 그대로."""
+    return {
+        "questCntnt": message[:INQUIRY_CONTENT_MAX],
+        "ordNo": ord_no,
+        "ordItemNo": str(item.get("ordItemNo") or ""),
+        "prdCd": str(item.get("prdCd") or ""),
+        "custMailChkYn": "",
+        "custSmsSndYn": "Y",
+        "prsnConslTypCd": INQUIRY_TYPE_CODE,
+    }
+
+
+def _submit_via_api(context: BrowserContext, ord_no: str, item: dict, message: str) -> str | None:
+    """[문의하기]가 보내는 등록 요청을 폼 없이 바로 보낸다.
+
+    응답이 retCd SUCC면 완료 문구, 그 밖의 무엇이든(HTTP 오류·retCd가 SUCC 아님·JSON
+    아님) None을 돌려주고 호출자가 검증된 폼 경로로 넘어간다 - 등록됐는지 모호한
+    채로 성공이라 하지도, 바로 실패라 하지도 않는다.
+    """
+    try:
+        response = context.request.post(
+            INQUIRY_POST_URL, form=_inquiry_payload(ord_no, item, message),
+            headers={"accept": "application/json, text/javascript, */*; q=0.01",
+                     "x-requested-with": "XMLHttpRequest",
+                     "origin": "https://www.gsshop.com", "referer": INQUIRY_FORM_URL})
+        body = response.json() if "json" in response.headers.get("content-type", "") else None
+    except Exception as e:  # noqa: BLE001
+        common.safe_print(f"[gsshop] 등록 요청을 바로 보내지 못했습니다({e}) - 폼으로 남깁니다.")
+        return None
+    if response.status == 200 and isinstance(body, dict) and body.get("retCd") == INQUIRY_SUCCESS_CODE:
+        return f"등록 요청 성공(retCd {INQUIRY_SUCCESS_CODE})"
+    common.safe_print(
+        f"[gsshop] 바로 보낸 등록 요청이 거부됐습니다(HTTP {response.status}, {str(body)[:80]}) - 폼으로 남깁니다.")
+    return None
+
+
+def _prepare_inquiry_form(page, ord_no: str, item: dict, message: str) -> None:
+    """1:1 상담 화면을 열어 유형·상품·내용을 채운다 - [문의하기]는 누르지 않는다."""
+    page.goto(INQUIRY_FORM_URL, wait_until="domcontentloaded")
+    if _looks_like_login_page(page):
+        raise BlockedError("1:1 상담 화면이 로그인 화면으로 넘어갔습니다.")
+    try:
+        page.locator(INQUIRY_SUBMIT).wait_for(state="visible", timeout=INQUIRY_STEP_WAIT_MS)
+    except PlaywrightTimeoutError:
+        raise ParseError(f"1:1 상담 화면이 뜨지 않았습니다 (url={page.url}).") from None
+    flags = page.evaluate(
+        "([login, blocked]) => [login, blocked].map(sel => (document.querySelector(sel) || {}).value)",
+        [INQUIRY_LOGIN_FLAG, INQUIRY_BLOCKED_FLAG])
+    if flags[0] is not None and flags[0] != "true":
+        raise BlockedError("1:1 상담 화면이 로그인 안 된 상태로 떴습니다.")
+    if flags[1] == "Y":
+        raise BlockedError("이 계정은 1:1 상담을 이용할 수 없다고 표시돼 있습니다 (blockCustYn=Y).")
+    # 상담 유형 [배송 문의] - 드롭다운 항목의 onclick(func_select)을 그대로 부르고 표시 글자도 맞춘다.
+    page.evaluate("code => func_select(code)", INQUIRY_TYPE_CODE)
+    page.evaluate("label => { const el = document.getElementById('combo_t'); if (el) el.textContent = label; }",
+                  INQUIRY_TYPE_LABEL)
+    # 문의상품 - [주문내역] 팝업의 [선택]이 부르는 setPrdResult를 같은 인자로 부른다.
+    page.evaluate(INQUIRY_ATTACH_JS, [ord_no, {k: item.get(k) for k in INQUIRY_ITEM_FIELDS}])
+    page.locator(INQUIRY_CONTENT).fill(message[:INQUIRY_CONTENT_MAX])
+    filled = page.evaluate(INQUIRY_FILLED_JS)
+    if filled["type"] != INQUIRY_TYPE_CODE:
+        raise ParseError(f"상담 유형이 [{INQUIRY_TYPE_LABEL}]로 잡히지 않았습니다 (값: {filled['type']!r}).")
+    if filled["ordNo"] != ord_no or filled["prdCd"] != str(item.get("prdCd") or "") or filled["noPrd"] != "N":
+        raise ParseError(f"문의상품이 이 주문으로 붙지 않았습니다 (폼: {filled}).")
+    if page.locator(INQUIRY_CONTENT).input_value().strip() != message[:INQUIRY_CONTENT_MAX].strip():
+        raise ParseError("문의 내용이 입력되지 않았습니다.")
+
+
+def _serve_post(captured: dict):
+    """등록 요청(POST inqry.gs)을 서버로 보내고 응답을 페이지에 그대로 돌려주되, 본문을 먼저 읽어둔다.
+
+    완료 confirm을 닫으면 페이지가 바로 이동/새로고침돼 그 뒤에는 응답 본문을 못
+    읽는다(맨 위 주석의 함정). 검증 스크립트는 이 함수를 바꿔 끼워 서버 없이 재본다.
+    """
+    def _handler(route) -> None:
+        response = route.fetch()
+        captured["status"] = response.status
+        try:
+            captured["body"] = response.json() if "json" in response.headers.get("content-type", "") else None
+        except Exception:  # noqa: BLE001
+            captured["body"] = None
+        route.fulfill(response=response)
+    return _handler
+
+
+def _submit_via_form(context: BrowserContext, ord_no: str, item: dict, message: str) -> str:
+    """1:1 상담 화면을 열어 채우고 [문의하기]를 눌러 완료 문구를 돌려준다.
+
+    등록 요청의 응답(retCd SUCC)과 완료 confirm 둘 다 있어야 성공이다.
+    """
+    page = context.new_page()
+    page.set_viewport_size(browser_mod.DESKTOP_VIEWPORT)
+    page.route("**/*", _abort_third_party)
+    try:
+        _prepare_inquiry_form(page, ord_no, item, message)
+        dialogs: list[tuple[str, str]] = []
+        captured: dict = {}
+        page.route(f"**{INQUIRY_POST_PATH}*", _serve_post(captured))   # 나중에 건 것이 먼저 잡는다
+
+        def _on_dialog(dialog) -> None:
+            dialogs.append((dialog.type, dialog.message))
+            if INQUIRY_DONE_TEXT in dialog.message:
+                dialog.dismiss()   # "문의내역을 확인하시겠습니까?" - 이동 대신 새로고침 (목록은 따로 본다)
+            else:
+                dialog.accept()    # "등록하시겠습니까?" 승인, 안내 alert 닫기
+
+        page.on("dialog", _on_dialog)
+        try:
+            with page.expect_response(lambda r: urlparse(r.url).path == INQUIRY_POST_PATH
+                                      and r.request.method == "POST",
+                                      timeout=INQUIRY_STEP_WAIT_MS):
+                page.locator(INQUIRY_SUBMIT).click()
+        except PlaywrightTimeoutError as e:
+            seen = " / ".join(f"{t}: {m}" for t, m in dialogs) or "(뜬 창 없음)"
+            raise ParseError(f"[문의하기]를 눌렀는데 등록 요청이 나가지 않았습니다 ({seen}).") from e
+        body = captured.get("body") if isinstance(captured.get("body"), dict) else {}
+        api_ok = body.get("retCd") == INQUIRY_SUCCESS_CODE
+        waited = 0
+        while not any(INQUIRY_DONE_TEXT in m for _, m in dialogs) and waited < INQUIRY_STEP_WAIT_MS:
+            page.wait_for_timeout(100)
+            waited += 100
+        done = [m for _, m in dialogs if INQUIRY_DONE_TEXT in m]
+        if not done or not api_ok:
+            seen = " / ".join(f"{t}: {m}" for t, m in dialogs) or "(뜬 창 없음)"
+            detail = f", {body.get('retMsg')}" if body.get("retMsg") else ""
+            raise ParseError(f"등록 응답 HTTP {captured.get('status')}, retCd={body.get('retCd')!r}{detail}, "
+                             f"완료 문구를 받지 못했습니다 ({seen}).")
+        return done[0].strip().split("\n")[0].rstrip(".")
+    finally:
+        page.close()
+
+
+def post_inquiry(context: BrowserContext, product_url: str, recipient_name: str,
+                 headless: bool = False) -> str:
+    """1:1 상담(상담 유형 [배송 문의])을 남기고 완료 문구를 돌려준다.
+
+    취소/품절 주문은 남기지 않고, 나의 상담 내역에 이 주문의 같은 문의가 주문일
+    이후에 이미 있으면 AlreadyInquired로 넘긴다. 등록은 [문의하기]가 보내는 요청을
+    바로 보내고(_submit_via_api), 거부되면 화면을 열어 남긴다(_submit_via_form).
+    어느 쪽이든 상담내역에 오늘 자로 올라갔는지까지 확인한다. 어디서든 어긋나면
+    ParseError/BlockedError - 남겼는지 불확실한 채로 성공이라 하지 않는다.
+    """
+    ord_no = extract_order_no(product_url)
+    message = inquiry_message(recipient_name, product_url)
+    entry = _order_for_inquiry(context, product_url, ord_no, headless)
+    item = _inquiry_item(entry, ord_no)
+    existing = _find_listed_inquiry(context, ord_no, _order_date_of(entry, ord_no))
+    if existing is not None:
+        raise AlreadyInquired(f"나의 상담 내역에 이미 같은 문의가 있습니다: {_describe_listed(existing)}")
+
+    done = _submit_via_api(context, ord_no, item, message)
+    if done is None:
+        # 거부 응답이었어도 그 사이 올라갔을 수 있으니 폼을 열기 전에 오늘 자를 한 번 본다.
+        posted = _find_listed_inquiry(context, ord_no, date.today(), refresh=True, max_pages=1)
+        if posted is not None:
+            return f"등록 요청은 거부 응답이었지만 상담내역에 올라감 · 나의 상담 내역: {_describe_listed(posted)}"
+        done = _submit_via_form(context, ord_no, item, message)
+    listed = _confirm_inquiry_listed(context, ord_no, message)
+    return f"{done} · 나의 상담 내역: {listed}"
