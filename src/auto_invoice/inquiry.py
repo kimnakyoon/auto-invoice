@@ -18,11 +18,15 @@
 버튼을 하루에 두 번 누르거나, 같은 엑셀로 다시 돌려도 이미 남긴 주문은 건너뛴다.
 
 사이트마다 문의 화면이 달라서 어댑터에 post_inquiry(context, product_url,
-recipient_name, headless)가 있는 사이트만 처리하고(지금은 롯데온), 없는
+recipient_name, headless)가 있는 사이트만 처리하고(지금은 롯데온·지마켓), 없는
 사이트는 '아직 지원 안 함'으로 결과에 남긴다 - 사람이 그 건은 직접 남긴다.
 어댑터에 prepare_inquiries(context, product_urls, headless)가 더 있으면 그
 사이트의 첫 문의 전에 한 번 불러 배치를 미리 훑게 한다(롯데온은 주문목록
-API로 문의 화면 주소를 읽어 주문마다 상세를 여는 일을 던다).
+API로 문의 화면 주소를 읽어 주문마다 상세를 여는 일을 던다). 어댑터가
+AlreadyInquired를 내면(지마켓은 등록 전에 문의내역을 뒤져 사람이 직접 남긴
+같은 문의를 찾는다) 그 주문은 '넘김'으로 적고 장부에도 올려, 다음 실행부터는
+문의내역을 다시 뒤지지 않는다. 송장조회처럼 WANTS_CDP_CHROME 어댑터(지마켓)는
+우리가 직접 띄운 진짜 크롬(CDP)에서 남긴다 - 번들 크로미엄은 봇 확인에 걸린다.
 """
 
 from __future__ import annotations
@@ -56,7 +60,7 @@ from .result_excel import (
     _write_summary_band,
 )
 from .suppliers import common
-from .suppliers.base import AdapterError, BlockedError
+from .suppliers.base import AdapterError, AlreadyInquired, BlockedError
 from .suppliers.registry import get_adapter
 
 # 결과 엑셀 '주문일지연' 시트의 '지난 일수' 칸이 이 값인 건만 문의한다.
@@ -323,10 +327,17 @@ def _post_site(site: str, items: list[InquiryTarget], *, settings, headless: boo
         log(f"[{site}] {i}/{total} {t.order_id} {t.recipient_name}: {verb}")
 
     with sync_playwright() as p, contextlib.ExitStack() as stack:
-        browser, context = browser_mod.get_context(
-            p, site, headless=headless,
-            context_kwargs=getattr(adapter, "CONTEXT_KWARGS", None))
-        stack.callback(browser.close)
+        if getattr(adapter, "WANTS_CDP_CHROME", False):
+            # 번들 크로미엄이라는 것 자체로 봇 확인에 걸리는 사이트(지마켓)는
+            # 송장조회와 같이 우리가 직접 실행한 진짜 크롬(CDP)에서 남긴다 -
+            # 창이 하나 뜬다 (orchestrator._lookup_site와 같은 분기).
+            browser_mod.remember_playwright(p)
+            context = stack.enter_context(browser_mod.real_chrome_cdp_context(site, p))
+        else:
+            browser, context = browser_mod.get_context(
+                p, site, headless=headless,
+                context_kwargs=getattr(adapter, "CONTEXT_KWARGS", None))
+            stack.callback(browser.close)
         # 세션 저장은 브라우저를 닫기 전에 - ExitStack은 나중에 넣은 것을 먼저 푼다.
 
         def _save_state() -> None:
@@ -352,6 +363,21 @@ def _post_site(site: str, items: list[InquiryTarget], *, settings, headless: boo
             try:
                 done = adapter.post_inquiry(context, t.product_url, t.recipient_name,
                                             headless=headless)
+            except AlreadyInquired as e:
+                # 사람이 직접 남긴 같은 문의가 문의내역에 있다 - 남기지 않고 장부에만
+                # 올려 다음 실행부터는 문의내역을 다시 뒤지지 않게 한다.
+                _append_ledger({
+                    "order_id": t.order_id,
+                    "site": site,
+                    "recipient_name": t.recipient_name,
+                    "product_url": t.product_url,
+                    "order_date": t.order_date,
+                    "message": message,
+                    "posted_at": datetime.now().isoformat(timespec="seconds"),
+                    "confirmation": f"이미 있던 문의를 장부에만 적음: {e}",
+                })
+                record(i, t, "skip", f"문의내역에 이미 있어 넘김 (장부에 적음): {e}", message)
+                continue
             except Exception as e:  # noqa: BLE001 - 한 건의 오류가 나머지를 막으면 안 된다
                 reason = str(e) if isinstance(e, AdapterError) else f"{type(e).__name__}: {e}"
                 if isinstance(e, BlockedError):
@@ -366,7 +392,7 @@ def _post_site(site: str, items: list[InquiryTarget], *, settings, headless: boo
                 "order_date": t.order_date,
                 "message": message,
                 "posted_at": datetime.now().isoformat(timespec="seconds"),
-                "confirmation": done,   # 어댑터가 확인한 완료 문구 (롯데온: 문의내역의 접수 상태·문의번호)
+                "confirmation": done,   # 어댑터가 확인한 완료 문구 (롯데온·지마켓: 문의내역의 접수 상태·문의번호)
             })
             record(i, t, "success", done, message)
     log(f"[{site}] {total}건에 {time.monotonic() - started:.1f}초 걸렸습니다.")

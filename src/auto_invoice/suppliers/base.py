@@ -85,6 +85,15 @@ class BlockedError(AdapterError):
     """봇 차단(Imperva 등) 또는 로그인이 필요한 상태가 감지됨."""
 
 
+class AlreadyInquired(AdapterError):
+    """문의를 남기려는 주문에 같은 문의가 이미 공급사 문의내역에 있음.
+
+    사람이 직접 남겼거나 장부(logs/inquiries.json)에 안 적힌 채 남긴 경우다.
+    오류가 아니라 '넘김' 사유이고, inquiry.py가 장부에 적어 다음부터는 문의내역을
+    다시 뒤지지 않게 한다. 메시지에는 문의내역에서 본 것(접수 상태·날짜·문의번호)을 적는다.
+    """
+
+
 class OrderCancelled(AdapterError):
     """취소되었거나 품절이라 송장번호가 나올 수 없는 주문.
 

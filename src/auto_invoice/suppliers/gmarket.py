@@ -59,18 +59,23 @@
 
 from __future__ import annotations
 
+import contextlib
+import html as html_mod
 import os
 import re
+import time
 from datetime import date, datetime, timedelta, timezone
-from urllib.parse import urlparse
+from urllib.parse import quote, urlparse
 
 from dotenv import load_dotenv
 from playwright.sync_api import BrowserContext
+from playwright.sync_api import TimeoutError as PlaywrightTimeoutError
 
 from .. import browser as browser_mod
 from ..models import TrackingResult
 from . import common
 from .base import (
+    AlreadyInquired,
     BlockedError,
     ParseError,
     TrackingNotAvailableYet,
@@ -461,19 +466,13 @@ def _lookup_page(context: BrowserContext):
     return page
 
 
-def get_tracking(
-    context: BrowserContext, product_url: str, headless: bool = True, order_option: str | None = None
-) -> TrackingResult:
-    order_id = extract_order_id(product_url)
+def _open_logged_in(page, url: str) -> None:
+    """url을 열고, 봇 확인·로그인이 끼어들면 지나간 뒤 다시 url에 선다.
 
-    # 화면을 열지 않고 JSON API로 먼저 답한다 (맨 위 docstring). 세션이 없거나
-    # 봇 확인에 걸리면 None - 아래 화면 경로가 로그인/봇 확인을 처리한다.
-    data = _fetch_pay_detail(context, order_id)
-    if data is not None:
-        return _answer_from_pay_detail(data, order_id, order_option)
-
-    page = _lookup_page(context)
-    page.goto(product_url, wait_until="domcontentloaded")
+    조회(get_tracking)와 문의(post_inquiry)가 같이 쓴다. 로그인 뒤에도
+    로그인 페이지면 BlockedError.
+    """
+    page.goto(url, wait_until="domcontentloaded")
 
     if _looks_like_bot_check(page):
         # 진짜 크롬(CDP)에서는 Turnstile이 몇 초 만에 저절로 풀린다(옥션과
@@ -482,7 +481,7 @@ def get_tracking(
         common.safe_print("[gmarket] 봇 확인 화면이 떴습니다. 저절로 풀리기를 기다립니다 (뜬 크롬 창에서 직접 통과해도 됩니다).")
         if not _wait_for_bot_check_to_clear(page):
             raise BlockedError("봇 확인 대기 시간(3분)이 지났습니다. 통과 후 다시 실행해주세요.")
-        page.goto(product_url, wait_until="domcontentloaded")
+        page.goto(url, wait_until="domcontentloaded")
 
     if _looks_like_login_page(page):
         if _auto_login(page):
@@ -496,13 +495,28 @@ def get_tracking(
             if not _wait_for_manual_login(page):
                 raise BlockedError("로그인 대기 시간(5분)이 지났습니다. 로그인 후 다시 실행해주세요.")
             _wait_for_login_redirects(page)
-        common.goto_settled(page, product_url)
+        common.goto_settled(page, url)
         if _looks_like_login_page(page):
             # 로그인 쿠키가 아직 다 안 붙었을 수 있다 - 잠깐 뒤 한 번만 더 가본다.
             page.wait_for_timeout(2000)
-            common.goto_settled(page, product_url)
+            common.goto_settled(page, url)
         if _looks_like_login_page(page):
             raise BlockedError("로그인 후에도 여전히 로그인 페이지입니다.")
+
+
+def get_tracking(
+    context: BrowserContext, product_url: str, headless: bool = True, order_option: str | None = None
+) -> TrackingResult:
+    order_id = extract_order_id(product_url)
+
+    # 화면을 열지 않고 JSON API로 먼저 답한다 (맨 위 docstring). 세션이 없거나
+    # 봇 확인에 걸리면 None - 아래 화면 경로가 로그인/봇 확인을 처리한다.
+    data = _fetch_pay_detail(context, order_id)
+    if data is not None:
+        return _answer_from_pay_detail(data, order_id, order_option)
+
+    page = _lookup_page(context)
+    _open_logged_in(page, product_url)
 
     # 로그인/봇 확인을 지났으니 API를 한 번 더 - 그래도 안 되면 화면에서 읽는다.
     data = _fetch_pay_detail(context, order_id)
@@ -513,3 +527,316 @@ def get_tracking(
     common.wait_for_text(page, order_id)
     # 주문상세 화면을 떠나기 전에 주문일부터 읽어둔다 (오래된 주문을 결과에 따로 모으는 데 쓴다).
     return with_order_date(page, lambda: _scrape_tracking_from_page(page, order_id, order_option))
+
+
+# --------------------------------------------------------------------------
+# 1:1 문의 (판매자 문의) - inquiry.py가 부른다
+# --------------------------------------------------------------------------
+# 화면 순서 (2026-09-08 실측): 주문상세 [문의하기](button "문의하기") → 레이어의
+#   [판매자 문의] → 같은 페이지 위 iframe#popLayerIframe 에
+#   diary2.gmarket.co.kr/Popup/GoodsFAQWrite?cust_no=<암호화>&contr_no=<주문번호>
+#   &l_top_gd_no=<상품번호>&w_no=&oversea_chk=N&is_my=true 가 뜬다 (cust_no가
+#   열 때마다 바뀌는 값이라 주소를 직접 만들 수는 없다 - 화면을 거친다). 폼:
+#   문의종류 radio[name=kind_in] (K2 상품 / K4 배송 / K18 취소 / K17 반품·취소 /
+#   K19 교환 / K7 기타), #txt_email(회원 메일이 미리 채워짐), #txt_title(한글
+#   19자까지), #ta_content, #mysecretyn(비밀글), [문의하기] 링크 = fn_write()
+#   → confirm("문의 하시겠습니까?") → form POST Popup/SaveGoodsFAQ → 그 응답
+#   스크립트가 alert("문의가 정상적으로 등록되었습니다. ...")를 띄우고 레이어를
+#   닫는다. 확인/완료가 다 dialog라 핸들러로 받는다(로그인과 같은 사정).
+#   숨은 input contr_no(주문번호)·gd_no(상품번호)로 폼이 이 주문에 붙었는지 본다.
+# 연속 등록 제한 (2026-09-08 실측): 등록 직후 또 등록하면 SaveGoodsFAQ 응답이
+#   alert("자동입력 방지를 위해 일시적으로 등록이 제한됩니다. 잠시 후 다시
+#   등록해주세요.")로 거부한다. 간격을 40초로 낮추고 5초마다 다시 시도한 실측
+#   (4건 연속): 앞 등록 뒤 42·48~49·55~56초는 전부 거부, 61~62초는 전부 통과
+#   (시각은 시도가 끝난 뒤 잰 것이라 실제 제출은 그보다 1~2초 앞이다) - 즉
+#   **마지막으로 등록된 때부터 60초**다. 거부된 시도가 제한 시간을 늘리지는
+#   않는다(거부 세 번 뒤 그대로 통과). 그래서 앞 등록으로부터 INQUIRY_GAP_SEC
+#   (60초 + 여유)을 기다린 뒤 등록하고, 그래도 거부되면(사람이 그 사이 직접
+#   남겼거나 서버 시각이 다를 때) INQUIRY_RETRY_GAP_SEC마다 폼을 다시 열어
+#   시도한다. 걸린 시간은 로그에 "앞 등록 뒤 N초"로 남긴다.
+# 문의내역 확인: 문의내역 화면(diary2/MYBBS/MyInqueryList3)이 쓰는
+#   POST MyBBS/MyInqueryPage?startDate=&endDate=&ResponseStat=&PageNo=1
+#   &SearchKind=T&SearchText=<검색어> 가 목록을 HTML 조각으로 준다(제목 검색,
+#   최신순, 없으면 "문의하신 내역이 없습니다."). 줄마다 GetInquiryDetail(this,
+#   '<writeNo>','배송'), text__status(접수완료/답변완료), text__item(상품명),
+#   text__subject(제목), box__date(YYYY-MM-DD). 목록에는 주문번호가 없고 상세
+#   (GET MyBBS/MyInquiryDetail?WriteNo=..&ViewAddQna=true)에 상품번호가 있다 -
+#   주문상세 API(pay-detail)의 orderItem.itemNo와 같은 값이라 그것으로 이 주문의
+#   문의인지 맞춘다(같은 수령인 주문이 둘이면 제목이 같다). 같은 근거로 등록
+#   전에 이 주문의 같은 문의가 이미 있는지(사람이 직접 남긴 것) 보고, 있으면
+#   AlreadyInquired로 넘긴다 - 2026-09-08 실행 전에 사용자가 세 건을 직접 남겨
+#   두었고 장부에는 없었다.
+INQUIRY_BUTTON = "문의하기"            # 주문상세의 버튼
+INQUIRY_SELLER_BUTTON = "판매자 문의"  # [문의하기]를 누르면 뜨는 레이어의 버튼
+INQUIRY_FORM_IFRAME = 'iframe[src*="Popup/GoodsFAQWrite"]'
+INQUIRY_SAVE_URL_MARK = "Popup/SaveGoodsFAQ"
+INQUIRY_KIND_RADIO = 'input[name="kind_in"][value="K4"]'   # 배송
+INQUIRY_KIND_NAME = "배송"
+INQUIRY_TITLE = "#txt_title"
+INQUIRY_CONTENT = "#ta_content"
+INQUIRY_SECRET = "#mysecretyn"
+INQUIRY_ORDER_NO_INPUT = 'input[name="contr_no"]'
+INQUIRY_ITEM_NO_INPUT = 'input[name="gd_no"]'
+INQUIRY_SUBMIT = "문의하기"            # 폼 안의 링크 (javascript:fn_write())
+INQUIRY_DONE_TEXT = "정상적으로 등록되었습니다"
+INQUIRY_THROTTLED_TEXT = "일시적으로 등록이 제한"
+INQUIRY_MESSAGE = "{name} 배송 언제 시작하나요?"
+INQUIRY_STEP_WAIT_MS = 10000   # 클릭 뒤 다음 화면 요소·응답이 오기까지 최대
+# 연속 등록 제한 (헤더 주석). 앞 등록 뒤 이만큼 지나야 다음 등록을 시도한다 -
+# 실측 60초에 여유 2초. 우리가 재는 시각(완료 alert)이 서버의 등록 시각보다
+# 늦으므로 그만큼은 이미 안전한 쪽이다.
+INQUIRY_GAP_SEC = 62.0
+INQUIRY_RETRY_GAP_SEC = 10.0          # 그래도 거부되면 이 간격으로 다시
+INQUIRY_THROTTLE_WAIT_SEC = 240.0     # 거부가 이어질 때 한 건에 기다리는 최대
+INQUIRY_LIST_API = ("https://diary2.gmarket.co.kr/MyBBS/MyInqueryPage"
+                    "?startDate={start}&endDate={end}&ResponseStat=&PageNo=1&SearchKind=T&SearchText={text}")
+INQUIRY_DETAIL_API = "https://diary2.gmarket.co.kr/MyBBS/MyInquiryDetail?WriteNo={write_no}&ViewAddQna=true"
+INQUIRY_LIST_EMPTY_TEXT = "문의하신 내역이 없습니다"
+INQUIRY_HISTORY_TRIES = 3             # 등록 뒤 목록에 아직 안 보이면 이만큼 다시 본다
+INQUIRY_HISTORY_RETRY_GAP_SEC = 1.0
+INQUIRY_HISTORY_LOOKBACK_DAYS = 30    # 주문일을 못 읽었을 때 '이미 남겼는지' 훑는 기간
+
+# 이 프로세스에서 마지막으로 등록에 성공한 시각(monotonic). 연속 등록 제한은
+# 계정 단위라 컨텍스트가 아니라 모듈에 둔다.
+_last_inquiry_posted_at: float | None = None
+
+
+def inquiry_message(recipient_name: str) -> str:
+    return INQUIRY_MESSAGE.format(name=recipient_name.strip())
+
+
+def _parse_inquiry_list(html: str) -> list[dict]:
+    """MyInqueryPage 응답(HTML 조각)에서 줄마다 문의번호·종류·상태·제목·상품명·날짜."""
+    items: list[dict] = []
+    for m in re.finditer(r"GetInquiryDetail\(this,\s*'(\d+)',\s*'([^']*)'\)(.*?)</li>", html, re.S):
+        block = m.group(3)
+
+        def grab(cls: str) -> str:
+            mm = re.search(rf'class="{cls}"[^>]*>\s*(.*?)\s*</', block, re.S)
+            return html_mod.unescape(mm.group(1)).strip() if mm else ""
+
+        items.append({
+            "write_no": m.group(1), "kind": m.group(2), "status": grab("text__status"),
+            "item_name": grab("text__item"), "subject": grab("text__subject"), "date": grab("box__date"),
+        })
+    return items
+
+
+def _fetch_inquiry_list(context: BrowserContext, text: str, start: date, end: date) -> list[dict] | None:
+    """문의내역을 제목 검색어·기간으로 읽는다. 목록도 '없음' 문구도 아니면(세션 만료 등) None."""
+    url = INQUIRY_LIST_API.format(start=start.isoformat(), end=end.isoformat(), text=quote(text))
+    try:
+        response = context.request.post(url)
+        if response.status != 200:
+            return None
+        html = response.text()
+    except Exception:  # noqa: BLE001 - 못 읽은 것으로 친다
+        return None
+    if INQUIRY_LIST_EMPTY_TEXT in html:
+        return []
+    return _parse_inquiry_list(html) or None
+
+
+def _fetch_inquiry_item_no(context: BrowserContext, write_no: str) -> str | None:
+    """문의 상세의 상품번호 (pay-detail의 orderItem.itemNo와 같은 값)."""
+    try:
+        response = context.request.get(INQUIRY_DETAIL_API.format(write_no=write_no))
+        if response.status != 200:
+            return None
+        m = re.search(r'상품번호</span>\s*<span class="text__value">\s*(\d+)', response.text())
+    except Exception:  # noqa: BLE001
+        return None
+    return m.group(1) if m else None
+
+
+def _describe_listed(item: dict) -> str:
+    return f"{item['status']} {item['date']} (문의번호 {item['write_no']}, {item['kind']})"
+
+
+def _find_listed_inquiry(context: BrowserContext, recipient_name: str, message: str,
+                         item_nos: set[str], start: date, end: date) -> dict | None:
+    """문의내역에서 이 주문의 우리 문의(제목이 같고 상품번호가 맞는 것)를 찾는다.
+
+    목록을 읽지 못하면 ParseError - 모르는 채로 등록하거나 성공이라 하지 않는다.
+    """
+    items = _fetch_inquiry_list(context, recipient_name, start, end)
+    if items is None:
+        raise ParseError("지마켓 문의내역 목록을 읽지 못했습니다 (세션이 끊겼을 수 있습니다).")
+    for item in items:
+        if item["subject"] != message:
+            continue
+        if _fetch_inquiry_item_no(context, item["write_no"]) in item_nos:
+            return item
+    return None
+
+
+def _confirm_inquiry_listed(context: BrowserContext, recipient_name: str, message: str,
+                            item_nos: set[str], today: date) -> str:
+    """등록 뒤 문의내역에 오늘 자로 올라갔는지 확인하고 확인 문구를 돌려준다."""
+    for attempt in range(1, INQUIRY_HISTORY_TRIES + 1):
+        found = _find_listed_inquiry(context, recipient_name, message, item_nos, today, today)
+        if found is not None:
+            return _describe_listed(found)
+        if attempt < INQUIRY_HISTORY_TRIES:
+            common.sleep(INQUIRY_HISTORY_RETRY_GAP_SEC)
+    raise ParseError(
+        f"완료 문구는 받았지만 문의내역에서 확인되지 않았습니다. 다시 남기기 전에 지마켓 "
+        f"나의G마켓 > 문의내역/쪽지함에서 '{message}'가 있는지 직접 확인해주세요.")
+
+
+def _open_inquiry_form(page, product_url: str, cart_no: str, order_no: str, item_nos: set[str]):
+    """주문상세 → [문의하기] → [판매자 문의] → 폼 iframe. 폼이 이 주문의 것인지 확인한다."""
+    _open_logged_in(page, product_url)
+    button = page.get_by_role("button", name=INQUIRY_BUTTON, exact=True)
+    try:
+        button.first.wait_for(state="visible", timeout=INQUIRY_STEP_WAIT_MS)
+    except PlaywrightTimeoutError:
+        if _looks_like_bot_check(page):
+            raise BlockedError("지마켓 봇 확인 화면이 떴습니다 (주문상세). 뜬 크롬 창에서 통과한 뒤 다시 실행해주세요.") from None
+        raise ParseError(f"주문상세에 [문의하기] 버튼이 없습니다 (cartNo={cart_no}, url={page.url}).") from None
+    button.first.click()
+    seller = page.get_by_text(INQUIRY_SELLER_BUTTON, exact=True)
+    try:
+        seller.first.wait_for(state="visible", timeout=INQUIRY_STEP_WAIT_MS)
+    except PlaywrightTimeoutError:
+        raise ParseError("[문의하기]를 눌렀는데 [판매자 문의] 버튼이 뜨지 않았습니다.") from None
+    seller.first.click()
+    form = page.frame_locator(INQUIRY_FORM_IFRAME)
+    try:
+        form.locator(INQUIRY_TITLE).wait_for(state="visible", timeout=INQUIRY_STEP_WAIT_MS)
+    except PlaywrightTimeoutError:
+        raise ParseError("[판매자 문의]를 눌렀는데 문의 폼(GoodsFAQWrite)이 뜨지 않았습니다.") from None
+    form_order_no = form.locator(INQUIRY_ORDER_NO_INPUT).first.input_value()
+    form_item_no = form.locator(INQUIRY_ITEM_NO_INPUT).first.input_value()
+    if form_order_no != order_no or form_item_no not in item_nos:
+        raise ParseError(f"문의 폼이 다른 주문에 붙었습니다 (폼 주문번호 {form_order_no}/상품 {form_item_no}, "
+                         f"기대 {order_no}/{sorted(item_nos)}).")
+    return form
+
+
+def _fill_inquiry_form(form, message: str) -> None:
+    """문의종류 [배송]·제목·내용·비밀글을 채운다 - [문의하기]는 누르지 않는다."""
+    form.locator(INQUIRY_KIND_RADIO).check()
+    form.locator(INQUIRY_TITLE).fill(message)
+    form.locator(INQUIRY_CONTENT).fill(message)
+    form.locator(INQUIRY_SECRET).check()
+    if not form.locator(INQUIRY_KIND_RADIO).is_checked():
+        raise ParseError(f"문의종류 [{INQUIRY_KIND_NAME}]이 선택되지 않았습니다.")
+    if form.locator(INQUIRY_TITLE).input_value().strip() != message:
+        raise ParseError("문의 제목이 입력되지 않았습니다.")
+    if form.locator(INQUIRY_CONTENT).input_value().strip() != message:
+        raise ParseError("문의 내용이 입력되지 않았습니다.")
+    if not form.locator(INQUIRY_SECRET).is_checked():
+        raise ParseError("[비밀글로 문의하기]가 체크되지 않았습니다.")
+
+
+def _submit_inquiry_once(page, product_url: str, cart_no: str, order_no: str,
+                         item_nos: set[str], message: str) -> tuple[str, list[tuple[str, str]]]:
+    """폼을 열어 채우고 [문의하기]를 누른다. ("done"|"throttled"|"unknown", 뜬 dialog들)."""
+    form = _open_inquiry_form(page, product_url, cart_no, order_no, item_nos)
+    _fill_inquiry_form(form, message)
+
+    dialogs: list[tuple[str, str]] = []
+
+    def _on_dialog(dialog) -> None:
+        dialogs.append((dialog.type, dialog.message))
+        dialog.accept()   # confirm("문의 하시겠습니까?")은 승인, 결과 alert은 닫는다
+
+    def _has_alert() -> bool:
+        return any(t == "alert" for t, _ in dialogs)
+
+    page.on("dialog", _on_dialog)
+    try:
+        # fn_write()가 입력 검사에서 alert으로 멈추면 SaveGoodsFAQ 요청 자체가 없다 -
+        # 응답을 못 받아도 여기서 올리지 않고 아래에서 dialog로 사유를 가린다.
+        with contextlib.suppress(PlaywrightTimeoutError):
+            with page.expect_response(lambda r: INQUIRY_SAVE_URL_MARK in r.url, timeout=INQUIRY_STEP_WAIT_MS):
+                form.get_by_role("link", name=INQUIRY_SUBMIT, exact=True).click()
+        # 결과 alert은 응답 스크립트가 띄운다 - 응답이 온 뒤 잠깐 더 기다린다.
+        deadline = time.monotonic() + INQUIRY_STEP_WAIT_MS / 1000
+        while not _has_alert() and time.monotonic() < deadline:
+            page.wait_for_timeout(100)
+    finally:
+        page.remove_listener("dialog", _on_dialog)
+
+    alerts = [m for t, m in dialogs if t == "alert"]
+    if any(INQUIRY_DONE_TEXT in m for m in alerts):
+        return "done", dialogs
+    if any(INQUIRY_THROTTLED_TEXT in m for m in alerts):
+        return "throttled", dialogs
+    return "unknown", dialogs
+
+
+def _wait_for_inquiry_gap() -> None:
+    """앞 등록 뒤 INQUIRY_GAP_SEC이 지날 때까지 기다린다 (헤더 주석의 연속 등록 제한)."""
+    if _last_inquiry_posted_at is None:
+        return
+    remaining = INQUIRY_GAP_SEC - (time.monotonic() - _last_inquiry_posted_at)
+    if remaining > 0:
+        common.safe_print(f"[gmarket] 연속 등록 제한 때문에 {remaining:.0f}초 기다린 뒤 다음 문의를 남깁니다.")
+        common.sleep(remaining)
+
+
+def _since_last_posted() -> str:
+    if _last_inquiry_posted_at is None:
+        return "이 실행의 첫 등록"
+    return f"앞 등록 뒤 {time.monotonic() - _last_inquiry_posted_at:.0f}초"
+
+
+def post_inquiry(context: BrowserContext, product_url: str, recipient_name: str,
+                 headless: bool = False) -> str:
+    """판매자 문의(배송, 비밀글)를 남기고 완료 문구를 돌려준다.
+
+    주문상세 API로 주문번호·상품번호·상태를 읽어 취소/품절 주문은 남기지 않고,
+    문의내역에 이 주문의 같은 문의가 이미 있으면 AlreadyInquired로 넘긴다.
+    등록은 연속 등록 제한을 지켜 시도하고, 완료 문구를 받은 뒤 문의내역에
+    오늘 자로 올라갔는지까지 확인한다(_confirm_inquiry_listed). 어디서든
+    어긋나면 ParseError/BlockedError - 남겼는지 불확실한 채로 성공이라 하지 않는다.
+    """
+    global _last_inquiry_posted_at
+    cart_no = extract_order_id(product_url)
+    message = inquiry_message(recipient_name)
+    page = _lookup_page(context)
+
+    data = _fetch_pay_detail(context, cart_no)
+    if data is None:
+        _open_logged_in(page, product_url)   # 세션 만료·봇 확인을 지나고 다시
+        data = _fetch_pay_detail(context, cart_no)
+    if data is None:
+        raise ParseError(f"주문상세 API가 답하지 않아 문의를 남길 수 없습니다 (cartNo={cart_no}).")
+    orders = data.get("orderList") or []
+    statuses = [str(o.get("displayOrderStatusName") or "").strip() for o in orders]
+    with contextlib.suppress(TrackingNotAvailableYet):   # '아직 준비 중'은 문의 대상 그 자체다
+        raise_if_cancelled_any(statuses, cart_no)
+    order_no = str(orders[0].get("orderNo") or "")
+    item_nos = {str((o.get("orderItem") or {}).get("itemNo") or "") for o in orders} - {""}
+    if not order_no or not item_nos:
+        raise ParseError(f"주문상세 API에 주문번호/상품번호가 없습니다 (cartNo={cart_no}).")
+
+    today = datetime.now(KST).date()
+    order_date = (_kst_date(data.get("payDate")) or _kst_date(orders[0].get("orderDateTime"))
+                  or today - timedelta(days=INQUIRY_HISTORY_LOOKBACK_DAYS))
+    existing = _find_listed_inquiry(context, recipient_name, message, item_nos, order_date, today)
+    if existing is not None:
+        raise AlreadyInquired(f"문의내역에 이미 같은 문의가 있습니다: {_describe_listed(existing)}")
+
+    _wait_for_inquiry_gap()
+    started = time.monotonic()
+    while True:
+        outcome, dialogs = _submit_inquiry_once(page, product_url, cart_no, order_no, item_nos, message)
+        if outcome == "done":
+            break
+        if outcome != "throttled":
+            seen = " / ".join(f"{t}: {m}" for t, m in dialogs) or "(뜬 창 없음)"
+            raise ParseError(f"[문의하기]를 눌렀는데 완료 문구가 오지 않았습니다 ({seen}).")
+        waited = time.monotonic() - started
+        if waited + INQUIRY_RETRY_GAP_SEC > INQUIRY_THROTTLE_WAIT_SEC:
+            raise BlockedError(f"지마켓 연속 등록 제한이 {waited:.0f}초가 지나도 풀리지 않았습니다 "
+                               f"({_since_last_posted()}). 잠시 뒤 다시 실행해주세요.")
+        common.safe_print(f"[gmarket] 연속 등록 제한에 걸렸습니다 ({_since_last_posted()}). "
+                          f"{INQUIRY_RETRY_GAP_SEC:.0f}초 뒤 다시 엽니다.")
+        common.sleep(INQUIRY_RETRY_GAP_SEC)
+    common.safe_print(f"[gmarket] 등록됐습니다 ({_since_last_posted()}).")
+    _last_inquiry_posted_at = time.monotonic()
+    listed = _confirm_inquiry_listed(context, recipient_name, message, item_nos, today)
+    return f"문의가 정상적으로 등록되었습니다 · 문의내역 확인: {listed}"
