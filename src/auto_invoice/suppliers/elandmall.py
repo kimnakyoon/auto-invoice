@@ -39,7 +39,15 @@
   data-login-id="userId"/"pwd", 버튼은 [data-login-btn]. 폼이 페이지 안에 두 벌
   (상단 레이어용/본문용) 있어 보이는 것만 쓴다. 제출하면 reCAPTCHA v3 토큰을 받아
   POST /v1/login 으로 가는데, **번들 크로미엄 headless로도 통과했다**(창 안 뜸).
-  실패는 alert(resultMessage)로 온다. 사용자가 "쿠키로 첫 로그인부터 자동"을 요청해서
+  응답 JSON {"resultCode":"200","data":{"loginSuccess":true,...}} 을 expect_response로
+  바로 읽어 성공·실패를 판정한다(실패는 resultMessage, 화면에는 alert로도 뜬다).
+  로그인 화면은 분석·광고 태그 수십 개를 불러 window load가 늦는데 입력창이 그
+  뒤에야 보이므로, 그 페이지에만 route를 걸어 elandmall/elandrs/google(reCAPTCHA)
+  밖의 호스트를 끊는다 (실측: 로그인 3.9초 -> 1.9초, 틀린 비밀번호는 30초 대기 없이
+  2초 만에 "아이디 또는 비밀번호가 일치하지 않습니다"로 실패).
+  요청으로 로그인 여부를 볼 때는 max_redirects=0으로 302의 Location만 본다 -
+  따라가면 490KB짜리 로그인 화면을 받고 버리게 된다.
+  사용자가 "쿠키로 첫 로그인부터 자동"을 요청해서
   ELANDMALL_ID/ELANDMALL_PW로 완전 자동 로그인하고, 세션은 storage_state
   (auth/elandmall_state.json)로 저장돼 다음 실행부터는 쿠키만으로 바로 조회된다.
 
@@ -99,6 +107,12 @@ LOGIN_ID_SELECTOR = '[data-login-id="userId"]:visible'
 LOGIN_PW_SELECTOR = '[data-login-id="pwd"]:visible'
 LOGIN_BUTTON_SELECTOR = "[data-login-btn]:visible"
 LOGIN_WAIT_TIMEOUT_MS = 30 * 1000
+# 로그인 버튼이 부르는 API. 응답 JSON의 resultCode/resultMessage로 성공·실패를
+# 바로 안다 - 주소가 바뀌기를 기다리면 실패했을 때 30초를 그냥 보낸다.
+LOGIN_API_PATH = "/v1/login"
+# 로그인 화면에서 받아야 하는 곳. 그 밖의 호스트(분석·광고 태그 수십 개)는 끊는다 -
+# 입력창이 window load 뒤에야 보이는데, 그 load를 제3자 태그가 몇 초씩 붙든다.
+LOGIN_ALLOWED_HOSTS = ("elandmall.co.kr", "elandrs.com", "google.com", "gstatic.com")
 
 # 목록은 페이지당 10건 고정. 사이트가 허용하는 조회기간 상한(6개월)보다 조금
 # 안쪽으로 잡는다 - 그보다 오래된 주문은 어차피 송장 조회 대상이 아니다.
@@ -203,12 +217,31 @@ def _auto_login(page: Page) -> None:
         tab.first.click()
     page.locator(LOGIN_ID_SELECTOR).first.fill(login_id)
     page.locator(LOGIN_PW_SELECTOR).first.fill(login_pw)
-    page.locator(LOGIN_BUTTON_SELECTOR).first.click()
+    with page.expect_response(lambda r: LOGIN_API_PATH in r.url,
+                              timeout=LOGIN_WAIT_TIMEOUT_MS) as login_response:
+        page.locator(LOGIN_BUTTON_SELECTOR).first.click()
+    try:
+        body = login_response.value.json()
+    except Exception:  # noqa: BLE001 - JSON이 아니면 예전처럼 주소로 판정한다
+        body = {}
+    ok = (str(body.get("resultCode")) == "200"
+          and bool((body.get("data") or {}).get("loginSuccess", True)))
+    if body and not ok:
+        reason = body.get("resultMessage") or (alerts[-1] if alerts else "사유 없음")
+        raise BlockedError(f"이랜드몰이 로그인을 거부했습니다: {reason}")
     left = common.wait_for_url(page, lambda url: not _is_login_url(url), LOGIN_WAIT_TIMEOUT_MS,
-                               poll_ms=500)
+                               poll_ms=200)
     if not left:
         reason = f" 사이트 안내: {alerts[-1]}" if alerts else ""
         raise BlockedError(f"이랜드몰 자동 로그인 후에도 로그인 페이지에서 벗어나지 못했습니다.{reason}")
+
+
+def _abort_third_party(route) -> None:
+    host = urlparse(route.request.url).netloc.lower()
+    if any(host == h or host.endswith("." + h) for h in LOGIN_ALLOWED_HOSTS):
+        route.continue_()
+    else:
+        route.abort()
 
 
 def _login_with_page(context: BrowserContext) -> None:
@@ -216,6 +249,8 @@ def _login_with_page(context: BrowserContext) -> None:
     common.safe_print("[elandmall] 로그인 세션이 없어 자동 로그인을 시도합니다.")
     page = context.new_page()
     try:
+        # 이 페이지에만 건다 - 조회용 컨텍스트의 공용 라우팅(이미지 차단)은 그대로다.
+        page.route("**/*", _abort_third_party)
         common.goto_settled(page, LOGIN_URL)
         if not _is_login_url(page.url):
             return  # 요청 시점과 달리 지금은 로그인이 살아 있다
@@ -224,16 +259,33 @@ def _login_with_page(context: BrowserContext) -> None:
         page.close()
 
 
+def _fetch(context: BrowserContext, url: str) -> tuple[bool, str]:
+    """(로그인 화면으로 넘겨졌는가, HTML).
+
+    리다이렉트를 따라가지 않는다(max_redirects=0) - 로그인이 없으면 302로 /m/login
+    을 가리키는데, 그걸 따라가면 490KB짜리 로그인 화면을 받고 버리게 된다. 302의
+    Location만 보면 된다. 로그인이 살아 있으면 목록/레이어는 리다이렉트 없이 200이다.
+    """
+    response = context.request.get(url, max_redirects=0)
+    if 300 <= response.status < 400:
+        location = response.headers.get("location", "")
+        if _is_login_url(location):
+            return True, ""
+        response = context.request.get(url)  # 로그인이 아닌 다른 리다이렉트면 따라간다
+        return _is_login_url(response.url), response.text()
+    return False, response.text()
+
+
 def _get_html(context: BrowserContext, url: str) -> str:
     """로그인된 상태로 HTML을 받는다. 세션이 없으면 한 번 로그인하고 다시 받는다."""
-    response = context.request.get(url)
-    if not _is_login_url(response.url):
-        return response.text()
+    needs_login, html = _fetch(context, url)
+    if not needs_login:
+        return html
     _login_with_page(context)
-    response = context.request.get(url)
-    if _is_login_url(response.url):
+    needs_login, html = _fetch(context, url)
+    if needs_login:
         raise BlockedError("이랜드몰 로그인 후에도 여전히 로그인 페이지입니다.")
-    return response.text()
+    return html
 
 
 # --------------------------------------------------------------------------
