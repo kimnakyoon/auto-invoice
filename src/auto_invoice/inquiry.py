@@ -365,6 +365,7 @@ def _post_site(site: str, items: list[InquiryTarget], *, settings, headless: boo
                 "order_date": t.order_date,
                 "message": message,
                 "posted_at": datetime.now().isoformat(timespec="seconds"),
+                "confirmation": done,   # 어댑터가 확인한 완료 문구 (롯데온: 문의내역의 접수 상태·문의번호)
             })
             record(i, t, "success", done, message)
     log(f"[{site}] {total}건에 {time.monotonic() - started:.1f}초 걸렸습니다.")

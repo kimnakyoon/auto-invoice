@@ -251,10 +251,22 @@ API_RETRY_GAP_SEC = 1.0
 
 def _post_json(context: BrowserContext, url: str, payload: dict) -> dict | None:
     """API 한 번 (잠깐 실패하면 한 번 더). 그래도 안 되면 None - 호출한 쪽이 화면 방식으로 물러난다."""
-    name = url.rsplit("/", 1)[-1]
+    return _api_json(context, url, payload)
+
+
+def _get_json(context: BrowserContext, url: str) -> dict | None:
+    """_post_json의 GET 판 - 문의내역 목록·상세처럼 주소만으로 묻는 API용."""
+    return _api_json(context, url, None)
+
+
+def _api_json(context: BrowserContext, url: str, payload: dict | None) -> dict | None:
+    name = url.split("?", 1)[0].rsplit("/", 1)[-1]
     for attempt in (1, 2):
         try:
-            response = context.request.post(url, data=json.dumps(payload), headers=API_HEADERS)
+            if payload is None:
+                response = context.request.get(url, headers=API_HEADERS)
+            else:
+                response = context.request.post(url, data=json.dumps(payload), headers=API_HEADERS)
             if response.status == 200:
                 return response.json()
             problem = f"응답이 {response.status}입니다"
@@ -808,6 +820,17 @@ def get_tracking(
 #     -> confirm("1대1 문의를 등록하시겠습니까?") 확인
 #     -> alert("문의가 등록되었습니다. ...") -> 문의내역(customerOneToneHistory)으로 이동
 # 확인/완료가 둘 다 자바스크립트 dialog라 핸들러로 받는다(로그인과 같은 사정).
+#   문의내역 확인 (2026-09-08 실측): 완료 문구만 믿지 않고 문의내역에 실제로 올라갔는지
+#     본다. 문의내역 화면이 부르는 목록 API(customer/v2/oneToOneInquiry?pageNo=1&
+#     rowsPerPage=10)는 최신순으로 문의 제목(inqTtl - 우리가 적은 문구 그대로)·유형
+#     (inqTypCd CC=고객센터 문의, SO=판매자 문의)·접수일(accpDttm "2026.09.08")·상태
+#     (tskProcStatCd ACCP 접수/PROC 처리중/CMPT 답변완료)·문의번호(cnslNo)를 준다.
+#     목록에는 주문번호가 없어서 같은 문구의 고객센터 문의를 상세 API
+#     (oneToOneInquiry/customer/{cnslNo})로 열어 odNo·유형(vocLcsfNm/vocMcsfNm =
+#     배송/배송일정)·내용(inqCnts)·접수일이 이 주문의 오늘 문의인지 맞춰본다 - 같은
+#     수령인 주문이 둘이면 문구가 같아 제목만으로는 못 가른다. 상세 API는 GET이라
+#     화면에서 항목을 펼칠 때 나가는 '확인함' 갱신(updateCustomerOneToneHistoryCfmYn)
+#     같은 부작용이 없다.
 INQUIRY_FORM_URL = ("https://www.lotteon.com/p/customer/customerCenter/customerOneTone"
                     "?odNo={od_no}&trNo={tr_no}&lrtrNo={lrtr_no}&cmbnDvGrpNo={grp_no}")
 INQUIRY_BUTTON = "button.btnInquiry"
@@ -826,6 +849,13 @@ INQUIRY_DONE_TEXT = "등록되었습니다"
 INQUIRY_DONE_URL = "customerOneToneHistory"
 INQUIRY_MESSAGE = "{name} 배송 언제 시작하나요?"
 INQUIRY_STEP_WAIT_MS = 5000   # 클릭 뒤 다음 화면 요소가 나타나기까지 최대
+# 문의내역 확인 (헤더 주석). 목록은 문의내역 화면과 같은 10건 - 방금 남긴 문의는 맨 위다.
+INQUIRY_HISTORY_API = "https://pbf.lotteon.com/customer/v2/oneToOneInquiry?pageNo=1&rowsPerPage=10"
+INQUIRY_DETAIL_API = "https://pbf.lotteon.com/customer/v2/oneToOneInquiry/customer/{cnsl_no}"
+INQUIRY_HISTORY_TYPE = "CC"          # 고객센터 문의 (customerOneTone으로 남긴 것)
+INQUIRY_HISTORY_TRIES = 3            # 목록에 아직 안 보이면 이만큼 다시 본다
+INQUIRY_HISTORY_RETRY_GAP_SEC = 1.0
+INQUIRY_STATUS_TEXT = {"ACCP": "접수", "PROC": "처리중", "CMPT": "답변완료"}
 
 
 def inquiry_message(recipient_name: str) -> str:
@@ -918,6 +948,51 @@ def _open_inquiry_form_from_detail(context: BrowserContext, page, product_url: s
     return form
 
 
+def _confirm_inquiry_listed(context: BrowserContext, od_no: str, message: str,
+                            not_before: date | None = None) -> str:
+    """문의내역에 이 주문의 문의가 올라갔는지 목록·상세 API로 확인하고 확인 문구를 돌려준다.
+
+    같은 문구의 고객센터 문의를 최신순으로 훑어 상세의 odNo가 이 주문이고
+    접수일이 not_before(기본 오늘) 이후인 것을 찾는다 - 예전에 남긴 같은
+    주문의 문의는 방금 남긴 것이 아니므로 지나간다. 찾으면 유형이
+    배송/배송일정이고 내용이 우리 문구인지까지 본다. 목록이 아직 갱신되지
+    않았을 수 있어 잠깐씩 몇 번 다시 본다. 못 찾으면 ParseError - 완료
+    문구는 받았어도 확인이 안 되면 성공으로 치지 않는다.
+    """
+    since = f"{not_before or date.today():%Y.%m.%d}"
+    problem = "문의내역 목록에 같은 문구의 고객센터 문의가 없습니다"
+    for attempt in range(1, INQUIRY_HISTORY_TRIES + 1):
+        listed = _get_json(context, INQUIRY_HISTORY_API)
+        if listed is None:
+            raise ParseError(f"문의내역 목록을 읽지 못해 등록을 확인할 수 없습니다 (odNo={od_no}).")
+        for item in listed.get("data") or []:
+            if (item.get("inqTypCd") != INQUIRY_HISTORY_TYPE or not item.get("cnslNo")
+                    or str(item.get("inqTtl") or "").strip() != message):
+                continue
+            accepted = str(item.get("accpDttm") or "")
+            if accepted < since:
+                break  # 최신순이라 여기부터는 전부 오늘 이전 - 방금 남긴 것이 아니다
+            problem = f"{since} 이후 접수된 같은 문구의 문의는 있지만 이 주문(odNo={od_no})의 것이 아닙니다"
+            detail = _get_json(context, INQUIRY_DETAIL_API.format(cnsl_no=item["cnslNo"]))
+            data = (detail or {}).get("data") or {}
+            if str(data.get("odNo") or "") != od_no:
+                continue
+            kind = f"{data.get('vocLcsfNm') or ''}/{data.get('vocMcsfNm') or ''}"
+            if kind != f"{INQUIRY_TYPE}/{INQUIRY_SUBTYPE}":
+                raise ParseError(f"문의내역에 올라갔지만 유형이 {kind}입니다 (문의번호 {item['cnslNo']}).")
+            if str(data.get("inqCnts") or "").strip() != message:
+                raise ParseError(f"문의내역에 올라갔지만 내용이 다릅니다: '{data.get('inqCnts')}' (문의번호 {item['cnslNo']}).")
+            if data.get("delYn") == "Y":
+                raise ParseError(f"문의내역에 올라갔지만 삭제된 문의입니다 (문의번호 {item['cnslNo']}).")
+            status = INQUIRY_STATUS_TEXT.get(str(data.get("tskProcStatCd") or ""), str(data.get("tskProcStatCd") or "상태 모름"))
+            return f"{status} {data.get('accpDttm') or accepted} (문의번호 {item['cnslNo']}, {kind})"
+        if attempt < INQUIRY_HISTORY_TRIES:
+            common.sleep(INQUIRY_HISTORY_RETRY_GAP_SEC)
+    raise ParseError(
+        f"완료 문구는 받았지만 문의내역에서 확인되지 않았습니다 - {problem}. "
+        f"다시 남기기 전에 롯데온 문의내역 화면에서 '{message}'가 있는지 직접 확인해주세요.")
+
+
 def post_inquiry(context: BrowserContext, product_url: str, recipient_name: str,
                  headless: bool = False) -> str:
     """1:1 문의(배송 > 배송일정)를 남기고 완료 문구를 돌려준다.
@@ -926,7 +1001,8 @@ def post_inquiry(context: BrowserContext, product_url: str, recipient_name: str,
     주문상세의 [문의하기]를 거친다. 어디서든 어긋나면(버튼이 없다, 확인 창이
     안 뜬다, 완료 문구가 다르다) ParseError/BlockedError로 올린다 - 남겼는지
     불확실한 채로 성공이라고 하지 않는다. 남긴 뒤 문의내역 화면으로 넘어간
-    것까지 확인한다.
+    것과, 문의내역에 이 주문의 배송/배송일정 문의가 오늘 접수된 것까지
+    확인한다(_confirm_inquiry_listed). 돌려주는 문구에 접수 상태·접수일·문의번호가 붙는다.
     """
     od_no = extract_od_no(product_url)
     message = inquiry_message(recipient_name)
@@ -997,7 +1073,8 @@ def post_inquiry(context: BrowserContext, product_url: str, recipient_name: str,
             if INQUIRY_DONE_URL in form.url:
                 raise ParseError(f"문의내역 화면으로 넘어갔지만 완료 문구를 받지 못했습니다 ({seen}).")
             raise ParseError(f"[등록하기]를 눌렀는데 완료 문구가 오지 않았습니다 ({seen}).")
-        return done[0].strip()
+        listed = _confirm_inquiry_listed(context, od_no, message)
+        return f"{done[0].strip().split('.')[0]} · 문의내역 확인: {listed}"
     finally:
         if form is not None and form is not page:
             with contextlib.suppress(Exception):
