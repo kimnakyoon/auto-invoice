@@ -554,6 +554,11 @@ def get_tracking(
 #   (60초 + 여유)을 기다린 뒤 등록하고, 그래도 거부되면(사람이 그 사이 직접
 #   남겼거나 서버 시각이 다를 때) INQUIRY_RETRY_GAP_SEC마다 폼을 다시 열어
 #   시도한다. 걸린 시간은 로그에 "앞 등록 뒤 N초"로 남긴다.
+#   폼 열기·채우기(~0.8초)는 이 대기 '앞'에서 미리 한다(_prepare_inquiry_form) -
+#   폼 여는 것 자체는 제한에 안 걸리므로 그 시간이 60초 대기에 흡수되고, 대기가
+#   끝나면 [문의하기]만 눌러 제출이 제한 경계에 딱 맞는다. 대기 사이에 폼이
+#   사라지면(_form_ready) 다시 연다. 제출하면 iframe이 SaveGoodsFAQ로 넘어가
+#   폼이 없어지므로 재시도 때도 새로 연다.
 # 문의내역 확인: 문의내역 화면(diary2/MYBBS/MyInqueryList3)이 쓰는
 #   POST MyBBS/MyInqueryPage?startDate=&endDate=&ResponseStat=&PageNo=1
 #   &SearchKind=T&SearchText=<검색어> 가 목록을 HTML 조각으로 준다(제목 검색,
@@ -730,12 +735,29 @@ def _fill_inquiry_form(form, message: str) -> None:
         raise ParseError("[비밀글로 문의하기]가 체크되지 않았습니다.")
 
 
-def _submit_inquiry_once(page, product_url: str, cart_no: str, order_no: str,
-                         item_nos: set[str], message: str) -> tuple[str, list[tuple[str, str]]]:
-    """폼을 열어 채우고 [문의하기]를 누른다. ("done"|"throttled"|"unknown", 뜬 dialog들)."""
+def _prepare_inquiry_form(page, product_url: str, cart_no: str, order_no: str,
+                          item_nos: set[str], message: str):
+    """문의 폼을 열고 채운 뒤 [문의하기] 직전 상태의 form을 돌려준다 - 아직 누르지 않는다.
+
+    연속 등록 제한(60초)을 기다리는 동안 미리 불러 채워두려고 제출과 나눴다.
+    대기가 끝나면 _click_inquiry_submit이 [문의하기]만 누른다.
+    """
     form = _open_inquiry_form(page, product_url, cart_no, order_no, item_nos)
     _fill_inquiry_form(form, message)
+    return form
 
+
+def _form_ready(form, message: str) -> bool:
+    """미리 열어둔 폼이 대기 사이에 사라지거나 값이 지워지지 않았는지 (제출 직전 점검)."""
+    try:
+        return (form.locator(INQUIRY_TITLE).input_value().strip() == message
+                and form.locator(INQUIRY_KIND_RADIO).is_checked())
+    except Exception:  # noqa: BLE001 - 프레임이 사라졌으면 다시 열어야 한다
+        return False
+
+
+def _click_inquiry_submit(page, form) -> tuple[str, list[tuple[str, str]]]:
+    """채워둔 폼의 [문의하기]를 누른다. ("done"|"throttled"|"unknown", 뜬 dialog들)."""
     dialogs: list[tuple[str, str]] = []
 
     def _on_dialog(dialog) -> None:
@@ -820,10 +842,17 @@ def post_inquiry(context: BrowserContext, product_url: str, recipient_name: str,
     if existing is not None:
         raise AlreadyInquired(f"문의내역에 이미 같은 문의가 있습니다: {_describe_listed(existing)}")
 
+    # 폼을 대기 '앞'에서 열어 채운다 - 폼 열기(~0.8초)가 60초 대기에 흡수되고,
+    # 대기가 끝나면 [문의하기]만 눌러 제출이 제한 경계에 딱 맞는다. 폼 여는 것
+    # 자체는 제한에 안 걸린다(제한은 등록=SaveGoodsFAQ에만 걸린다).
+    form = _prepare_inquiry_form(page, product_url, cart_no, order_no, item_nos, message)
     _wait_for_inquiry_gap()
     started = time.monotonic()
     while True:
-        outcome, dialogs = _submit_inquiry_once(page, product_url, cart_no, order_no, item_nos, message)
+        if not _form_ready(form, message):
+            # 대기 사이에 폼이 사라졌거나(세션·레이어 타임아웃) 재시도라 새로 연다.
+            form = _prepare_inquiry_form(page, product_url, cart_no, order_no, item_nos, message)
+        outcome, dialogs = _click_inquiry_submit(page, form)
         if outcome == "done":
             break
         if outcome != "throttled":
@@ -836,6 +865,7 @@ def post_inquiry(context: BrowserContext, product_url: str, recipient_name: str,
         common.safe_print(f"[gmarket] 연속 등록 제한에 걸렸습니다 ({_since_last_posted()}). "
                           f"{INQUIRY_RETRY_GAP_SEC:.0f}초 뒤 다시 엽니다.")
         common.sleep(INQUIRY_RETRY_GAP_SEC)
+        # 제출하면 iframe이 SaveGoodsFAQ로 넘어가 폼이 없다 - 다음 바퀴가 새로 연다.
     common.safe_print(f"[gmarket] 등록됐습니다 ({_since_last_posted()}).")
     _last_inquiry_posted_at = time.monotonic()
     listed = _confirm_inquiry_listed(context, recipient_name, message, item_nos, today)
