@@ -384,6 +384,21 @@ python scripts/run_all.py --stop-before-apply   # 일괄등록까지만, 마지�
   처음엔 10초 시한을 다 채웠다(13.2초). 지금은 등록 POST가 나간 뒤 첫 화면 이동
   (`framenavigated`)까지만 기다린다 - 폼 열기부터 등록 요청까지 1.4초(가짜 응답 검증), 그 뒤
   상담내역 확인 0.3초. alert·confirm은 없다.
+- **롯데아이몰도 폼 없이 그 POST를 바로 보낸다** (`_submit_via_api`, 2026-09-08) - 네이버·GSSHOP과
+  같은 직행. 문의 화면 HTML을 `context.request`로 받아(0.3초) `#inquireForm` 안의 칸을 그대로
+  읽고(`_form_payload` - hidden·text·select 첫 항목·textarea, 체크된 radio만; JS가 뜬 뒤
+  disabled로 바꾸는 `wrtr_tel`은 뺀다), JS가 채우는 상품 칸 6개(goods_no·ord_no·ord_dtl_sn·
+  cash_yn·order_system_type·ord_goods_type)는 서버가 그린 숨은 칸(`ord_no1`·`cash_yn1`…)과
+  주문값으로, 비어 있는 `cash_all_yn`은 상품의 cash_yn으로, 유형 칸 5개는 소분류 목록
+  API(`selectFaqSmallMenuAjaxList.lotte`, 배치에 한 번 캐시)의 [배송문의] 항목(GOODS_NEED_CD·
+  ORD_GOODS_NEED_CD·OTSD_CUST_BBC_CAUS_CD=1101)으로 채운다. 전송 순서까지 실제 폼과 같다
+  (`INQUIRY_FIELD_ORDER` - 폼 경로의 POST를 페이지 라우팅 안에서 가짜 응답으로 받아 키·값
+  51개가 전부 같음을 확인, 2026-09-08). 보내기 전에 사이트 JS가 부르는 중복 확인
+  `getOrdDupInquireAjax.lotte`(cnt>0이면 `AlreadyInquired`)도 그대로 부른다. 서버는 등록 뒤
+  같은 폼 화면을 돌려주므로 응답으로는 성공을 알 수 없고 상담내역으로만 확인한다 - 응답이
+  HTTP 오류이거나 메인/로그인으로 튕기면 오늘 자 상담내역을 한 번 본 뒤 폼 경로로 간다.
+  준비(폼 HTML+소분류+중복확인) 0.33초 vs 폼 경로 1.4초. **직행 POST가 실서버에서 통하는지는
+  첫 실등록 때 드러난다** - 검증은 payload 비교까지만 했다(등록 주소에 검사 요청 금지).
 - **결과는 바탕화면 `문의결과_*.xlsx`** 로도 남긴다 (`save_result_excel`). 송장조회
   결과 엑셀과 같은 생김새이고, 정렬은 실패 → 미지원 사이트 넘김 → 남김 →
   이미 남긴 주문 순 - 앞의 둘이 사람이 직접 남겨야 하는 건이다.

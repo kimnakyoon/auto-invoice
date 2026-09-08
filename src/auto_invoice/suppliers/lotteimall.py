@@ -457,6 +457,26 @@ INQUIRY_TITLE_MAX = 200
 INQUIRY_CONTENT_MAX = 2000
 INQUIRY_STEP_WAIT_MS = 10000          # 화면 요소·소분류 응답·등록 뒤 화면 이동까지 최대
 INQUIRY_ALLOWED_HOSTS = ("lotteimall.com",)
+INQUIRY_POST_URL = "https://www.lotteimall.com" + INQUIRY_POST_PATH
+INQUIRY_SUBTYPE_API_URL = ("https://www.lotteimall.com/custcenter/selectFaqSmallMenuAjaxList.lotte"
+                           "?cust_inq_mdl_tp_cd=" + INQUIRY_TYPE_CODE)
+INQUIRY_DUP_API_URL = "https://www.lotteimall.com/custcenter/getOrdDupInquireAjax.lotte"
+INQUIRY_FORM_TAG = re.compile(r'<form[^>]*id="inquireForm"[^>]*>(.*?)</form>', re.S)
+INQUIRY_FIELD_TAG = re.compile(r"<(input|select|textarea)\b[^>]*>", re.S)
+INQUIRY_OPTION_TAG = re.compile(r"<option\b([^>]*)>(.*?)</option>", re.S)
+INQUIRY_HIDDEN_BY_ID = r'<input[^>]*\bid="{id}"[^>]*>'
+# 화면이 뜬 뒤 JS가 채우는 칸 - 정적 HTML에는 없거나 비어 있어 따로 넣는다 (_form_payload).
+INQUIRY_JS_FIELDS = ("goods_no", "ord_no", "ord_dtl_sn", "cash_yn", "order_system_type", "ord_goods_type")
+INQUIRY_JS_DISABLED = ("wrtr_tel",)   # JS가 뜬 뒤 disabled로 바꿔 전송에서 빠지는 칸
+# 사람이 [등록]을 눌렀을 때 폼이 실제로 보낸 칸 순서 (2026-09-08 page.route로 받아 적음).
+INQUIRY_FIELD_ORDER = (
+    "wrtr_cell_no wrtr_email_addr mbr_no wrtr_id wrtr_nm wrtr_nm1 wrtr_nm2 wrtr_nm3 ccn_prgs_stat_cd "
+    "accp_mdm_cd accp_tp_cd ccn_sct_cd ordNoYn cash_all_yn clientIp img_file_1_nm img_path_1_nm "
+    "img_file_2_nm img_path_2_nm img_file_3_nm img_path_3_nm img_no inq_cancel_yn ord_no1 ord_dtl_sn1 "
+    "cash_yn1 order_system_type1 goods_no1 goods_desc1 goods_new_item_nm1 goods_rel_qty1 "
+    "cust_inq_mdl_tp_cd cust_inq_sml_tp_cd cust_inq_sml_goods_need cust_inq_sml_ord_goods_need "
+    "otsd_cust_bbc_caus_cd goods_no ord_no ord_dtl_sn cash_yn order_system_type ord_goods_type "
+    "accp_tit_nm accp_cont accountowner bank_cd bank_name bank_code accountnum").split()
 
 INQUIRY_LIST_URL = "https://www.lotteimall.com/mypage/searchinquirePagingList.lotte?pageIdx={page}"
 INQUIRY_LIST_MARKER = "일대일 답변 목록"
@@ -474,11 +494,14 @@ INQUIRY_HISTORY_MAX_PAGES = 5         # '이미 남겼는지' 훑는 상담내�
 # 이 실행(컨텍스트)에서 이미 읽어둔 상담내역 {"rows": [...최신순], "pages": n, "last": n}.
 # 한 배치의 주문들이 같은 목록을 보므로 주문마다 다시 받지 않는다(prepare_inquiries가 비운다).
 _inquiry_rows_cache: dict[int, dict] = {}
+# 배치에 한 번 받아두는 [배송/회수] 소분류 목록의 [배송문의] 항목 (코드·필요 여부 코드들).
+_inquiry_subtype_cache: dict[int, dict] = {}
 
 
 def prepare_inquiries(context: BrowserContext, product_urls, headless: bool = False) -> None:
-    """새 배치 - 앞 배치에서 읽어둔 상담내역 캐시를 비운다."""
+    """새 배치 - 앞 배치에서 읽어둔 상담내역·소분류 캐시를 비운다."""
     _inquiry_rows_cache.pop(id(context), None)
+    _inquiry_subtype_cache.pop(id(context), None)
 
 
 def _order_date_of(ord_no: str) -> date | None:
@@ -671,6 +694,138 @@ def _fill_inquiry_form(form, order: dict, message: str) -> None:
         raise ParseError(f"문의할 상품이 주문상세의 상품(goods_no={order['goods_no']})과 다릅니다.")
 
 
+def _attr(tag: str, name: str) -> str | None:
+    m = re.search(r"\b" + name + r"\s*=\s*(?:\"([^\"]*)\"|'([^']*)'|([^\s>]+))", tag, re.I)
+    return html_mod.unescape(next(g for g in m.groups() if g is not None)) if m else None
+
+
+def _hidden_value(page_html: str, element_id: str) -> str | None:
+    m = re.search(INQUIRY_HIDDEN_BY_ID.format(id=element_id), page_html)
+    return _attr(m.group(0), "value") if m else None
+
+
+def _inquiry_subtype(context: BrowserContext) -> dict:
+    """[배송/회수]를 골랐을 때 화면이 받는 소분류 목록에서 [배송문의] 항목 (배치에 한 번).
+
+    사람이 고르면 이 항목의 GOODS_NEED_CD·ORD_GOODS_NEED_CD·OTSD_CUST_BBC_CAUS_CD가 숨은
+    select 세 개에 들어가 함께 전송되므로, 직행 경로도 같은 값을 넣는다.
+    """
+    cached = _inquiry_subtype_cache.get(id(context))
+    if cached is not None:
+        return cached
+    try:
+        items = (context.request.get(INQUIRY_SUBTYPE_API_URL).json() or {}).get("small_type") or []
+    except Exception as e:  # noqa: BLE001 - 목록을 못 받으면 아래에서 ParseError
+        raise ParseError(f"문의 소분류 목록을 받지 못했습니다 ({e}).") from None
+    item = next((i for i in items if str(i.get("CUST_INQ_TP_CD")) == INQUIRY_SUBTYPE_CODE), None)
+    if item is None or str(item.get("CUST_INQ_TP_NM") or "").strip() != INQUIRY_SUBTYPE_LABEL:
+        names = [i.get("CUST_INQ_TP_NM") for i in items]
+        raise ParseError(f"[{INQUIRY_TYPE_LABEL}] 소분류에 [{INQUIRY_SUBTYPE_LABEL}]({INQUIRY_SUBTYPE_CODE})이 없습니다 (목록: {names}).")
+    _inquiry_subtype_cache[id(context)] = item
+    return item
+
+
+def _form_payload(page_html: str, order: dict, message: str, subtype: dict) -> dict[str, str]:
+    """문의 화면 HTML에서 사람이 [등록]을 눌렀을 때 폼이 보내는 값을 그대로 만든다.
+
+    정적 HTML의 #inquireForm 안 칸(hidden·text·select·textarea, 체크된 radio)을 읽고,
+    화면이 뜬 뒤 JS가 채우는 상품 칸(INQUIRY_JS_FIELDS)은 주문값과 서버가 그린 숨은 칸(…1)에서,
+    유형 칸은 소분류 항목에서 넣는다. 전송 순서는 실제 폼과 같다(INQUIRY_FIELD_ORDER).
+    """
+    m = INQUIRY_FORM_TAG.search(page_html)
+    if m is None:
+        raise ParseError("1:1 문의 화면 HTML에 문의 폼(#inquireForm)이 없습니다.")
+    seg = m.group(1)
+    values: dict[str, str] = {}
+    for tm in INQUIRY_FIELD_TAG.finditer(seg):
+        tag, kind = tm.group(0), tm.group(1).lower()
+        name = _attr(tag, "name")
+        if not name or name in INQUIRY_JS_FIELDS or name in INQUIRY_JS_DISABLED or re.search(r"\bdisabled\b", tag, re.I):
+            continue
+        if kind == "input":
+            input_type = (_attr(tag, "type") or "text").lower()
+            if input_type in ("submit", "button", "file", "image"):
+                continue
+            if input_type in ("radio", "checkbox") and not re.search(r"\bchecked\b", tag, re.I):
+                continue
+            values.setdefault(name, _attr(tag, "value") or "")
+        elif kind == "select":
+            options = INQUIRY_OPTION_TAG.findall(seg[tm.end(): seg.find("</select>", tm.end())])
+            chosen = next((o for o in options if re.search(r"\bselected\b", o[0], re.I)), options[0] if options else None)
+            if chosen is not None:
+                value = _attr(chosen[0], "value")
+                values[name] = value if value is not None else html_mod.unescape(chosen[1]).strip()
+        else:
+            values[name] = html_mod.unescape(seg[tm.end(): seg.find("</textarea>", tm.end())])
+
+    # 상품 칸은 JS가 채우지만 같은 값이 서버가 그린 숨은 칸(ord_no1·goods_no1·cash_yn1 ...)에도 있다.
+    cash_yn = _hidden_value(page_html, "cash_yn1")
+    system_type = _hidden_value(page_html, "order_system_type1")
+    if (cash_yn is None or system_type is None
+            or _hidden_value(page_html, "ord_no1") != order["ord_no"]
+            or _hidden_value(page_html, "goods_no1") != order["goods_no"]
+            or _hidden_value(page_html, "ord_dtl_sn1") != order["ord_dtl_sn"]):
+        raise ParseError(f"1:1 문의 화면에 이 주문의 상품 정보가 없습니다 (주문번호={order['ord_no']}).")
+    if not values.get("cash_all_yn"):
+        values["cash_all_yn"] = cash_yn   # 정적 HTML에는 비어 있고 JS가 상품의 현금결제 여부로 채운다
+    values.update({
+        "goods_no": order["goods_no"], "ord_no": order["ord_no"], "ord_dtl_sn": order["ord_dtl_sn"],
+        "cash_yn": cash_yn, "order_system_type": system_type,
+        "ord_goods_type": _hidden_value(page_html, "ord_goods_type") or "ord",
+        "cust_inq_mdl_tp_cd": INQUIRY_TYPE_CODE, "cust_inq_sml_tp_cd": INQUIRY_SUBTYPE_CODE,
+        "cust_inq_sml_goods_need": str(subtype.get("GOODS_NEED_CD") or ""),
+        "cust_inq_sml_ord_goods_need": str(subtype.get("ORD_GOODS_NEED_CD") or ""),
+        "otsd_cust_bbc_caus_cd": str(subtype.get("OTSD_CUST_BBC_CAUS_CD") or ""),
+        "ordNoYn": "Y" if str(subtype.get("ORD_GOODS_NEED_CD")) == "10" else "N",
+        "accp_tit_nm": message[:INQUIRY_TITLE_MAX], "accp_cont": message[:INQUIRY_CONTENT_MAX],
+    })
+    missing = [k for k in INQUIRY_FIELD_ORDER if k not in values]
+    if missing:
+        raise ParseError(f"1:1 문의 화면의 칸이 달라졌습니다 - 없는 칸: {missing}.")
+    ordered = {k: values[k] for k in INQUIRY_FIELD_ORDER}
+    ordered.update({k: v for k, v in values.items() if k not in ordered})
+    return ordered
+
+
+def _site_says_duplicate(context: BrowserContext, order: dict) -> bool:
+    """[등록] 직전에 사이트 JS가 부르는 중복 문의 확인 - 같은 주문·상품·유형의 처리 중인 문의가 있으면 True."""
+    try:
+        data = context.request.post(INQUIRY_DUP_API_URL, form={
+            "ord_no": order["ord_no"], "goods_no": order["goods_no"],
+            "cust_inq_mdl_tp_cd": INQUIRY_TYPE_CODE, "cust_inq_sml_tp_cd": INQUIRY_SUBTYPE_CODE,
+        }).json()
+    except Exception:  # noqa: BLE001 - 확인이 안 되면 폼 경로가 사이트 알림으로 다시 본다
+        return False
+    return int((data or {}).get("cnt") or 0) > 0
+
+
+def _submit_via_api(context: BrowserContext, order: dict, message: str) -> str | None:
+    """폼이 보내는 등록 POST를 화면 없이 바로 보낸다 (네이버·GSSHOP과 같은 직행).
+
+    문의 화면 HTML을 받아(0.3초) 폼 값을 그대로 만들고 insertInquire.lotte 로 POST한다.
+    서버는 등록 뒤 같은 문의 폼 화면을 돌려주므로 응답으로는 성공을 알 수 없다 - 호출자가
+    상담내역으로 확인한다. 화면을 못 받거나(로그인 끊김·메인으로 튕김) 응답이 HTTP 오류이면
+    None - 그때만 폼 경로로 간다. 사이트의 중복 확인이 걸리면 AlreadyInquired.
+    """
+    page_html = _get_html(context, INQUIRY_FORM_URL.format(**order))
+    if page_html is None:
+        return None
+    payload = _form_payload(page_html, order, message, _inquiry_subtype(context))
+    if _site_says_duplicate(context, order):
+        raise AlreadyInquired("롯데아이몰 중복 문의 확인에 같은 주문·상품·유형의 처리 중인 문의가 있습니다.")
+    try:
+        response = context.request.post(
+            INQUIRY_POST_URL, form=payload,
+            headers={"Referer": INQUIRY_FORM_URL.format(**order), "Origin": "https://www.lotteimall.com"})
+    except Exception as e:  # noqa: BLE001 - 통신 실패면 폼으로
+        common.safe_print(f"[lotteimall] 등록 요청을 바로 보내지 못해 폼으로 남깁니다 ({e}).")
+        return None
+    if not response.ok or _url_needs_login(response.url):
+        common.safe_print(f"[lotteimall] 등록 요청이 거부돼(HTTP {response.status}, {response.url}) 폼으로 남깁니다.")
+        return None
+    return f"등록 요청 보냄 (직행, HTTP {response.status}, 화면 {urlparse(response.url).path})"
+
+
 def _submit_via_form(context: BrowserContext, order: dict, message: str, headless: bool) -> str:
     """문의 화면을 열어 유형·제목·내용을 채우고 [등록]을 눌러 등록 POST가 나간 것까지 본다."""
     ord_no = order["ord_no"]
@@ -719,8 +874,9 @@ def post_inquiry(context: BrowserContext, product_url: str, recipient_name: str,
     """1:1 문의(배송/회수 > 배송문의)를 남기고 확인 문구를 돌려준다.
 
     취소/품절 주문은 남기지 않고, 상담내역에 이 주문의 같은 문의가 주문일 이후에
-    이미 있으면 AlreadyInquired로 넘긴다. 등록 뒤 상담내역에 오늘 자로 올라갔는지
-    확인한다. 어디서든 어긋나면 ParseError/BlockedError - 남겼는지 불확실한 채로
+    이미 있으면 AlreadyInquired로 넘긴다. 등록은 폼이 보내는 요청을 바로 보내고
+    (_submit_via_api), 거부되면 화면을 열어 남긴다(_submit_via_form). 어느 쪽이든
+    등록 뒤 상담내역에 오늘 자로 올라갔는지 확인한다. 어디서든 어긋나면 ParseError/BlockedError - 남겼는지 불확실한 채로
     성공이라 하지 않는다. 제목과 내용이 같은 문구다 (사용자 지시).
     """
     ord_no = extract_order_no(product_url)
@@ -730,6 +886,12 @@ def post_inquiry(context: BrowserContext, product_url: str, recipient_name: str,
     if existing is not None:
         raise AlreadyInquired(f"상담내역에 이미 같은 문의가 있습니다: {_describe_listed(existing)}")
 
-    done = _submit_via_form(context, order, message, headless)
+    done = _submit_via_api(context, order, message)
+    if done is None:
+        # 거부 응답이었어도 그 사이 올라갔을 수 있으니 폼을 열기 전에 오늘 자를 한 번 본다.
+        posted = _find_listed_inquiry(context, ord_no, date.today(), refresh=True, max_pages=1)
+        if posted is not None:
+            return f"등록 요청은 거부 응답이었지만 상담내역에 올라감 · 상담내역 확인: {_describe_listed(posted)}"
+        done = _submit_via_form(context, order, message, headless)
     listed = _confirm_inquiry_listed(context, ord_no, message)
     return f"{done} · 상담내역 확인: {listed}"
