@@ -856,6 +856,14 @@ INQUIRY_HISTORY_TYPE = "CC"          # 고객센터 문의 (customerOneTone으�
 INQUIRY_HISTORY_TRIES = 3            # 목록에 아직 안 보이면 이만큼 다시 본다
 INQUIRY_HISTORY_RETRY_GAP_SEC = 1.0
 INQUIRY_STATUS_TEXT = {"ACCP": "접수", "PROC": "처리중", "CMPT": "답변완료"}
+# 문의 화면에서 받아줄 호스트. 화면·API·정적파일·로그인이 전부 이 도메인 안이고
+# (reCAPTCHA 없음, 맨 위 docstring), 나머지는 태그매니저/페이스북/애드테크 같은
+# 제3자 태그다. 2026-09-08 실측: 이 태그들이 유형 선택·입력 사이에 스크립트를
+# 돌려 한 건에 1.24초 걸리던 채우기가 0.98초로 준다. 롯데온 이미지를 1x1 GIF로
+# 대신 주거나 롯데온 요청을 파이썬으로 안 거치게 해도 더 빨라지지 않았다(같은 날
+# 3회씩 비교, 전부 0.9~1.1초). 남은 몫은 100ms 폴링 대기였고 그것을 이벤트
+# 대기로 바꿔 0.91초(5회 평균)가 됐다 - _appears, _open_prefetched_form.
+INQUIRY_ALLOWED_HOSTS = ("lotteon.com",)
 
 
 def inquiry_message(recipient_name: str) -> str:
@@ -948,6 +956,90 @@ def _open_inquiry_form_from_detail(context: BrowserContext, page, product_url: s
     return form
 
 
+def _abort_third_party(route) -> None:
+    """문의 화면 전용 라우팅 - 롯데온 밖 호스트는 끊고 나머지는 그대로 보낸다.
+
+    페이지 라우팅이 걸리면 컨텍스트 공용 라우팅(이미지 차단)은 그 페이지에
+    적용되지 않아 lotteon 이미지가 열린다 - 일부러 그렇게 둔다. 이 화면은
+    로고 이미지가 막히면 onerror로 곧바로 다시 요청해 초당 270번씩 실패
+    요청을 쏟아내는데(2026-09-08 실측, 15초에 7,500건), 그 소음이 클릭·입력을
+    느리게 했다. 이미지는 30장 남짓이고 컨텍스트 안에서 캐시된다.
+    """
+    host = urlparse(route.request.url).netloc.lower()
+    if any(host == h or host.endswith("." + h) for h in INQUIRY_ALLOWED_HOSTS):
+        route.continue_()
+    else:
+        route.abort()
+
+
+def _appears(page, text: str, timeout_ms: int = INQUIRY_STEP_WAIT_MS) -> bool:
+    """화면에 이 글자가 보일 때까지 기다린다 - 끝내 안 보이면 False.
+
+    common.wait_for_text는 100ms마다 body를 다시 읽는 폴링이라 글자가 뜬 뒤
+    평균 50ms를 더 기다린다. 문의 화면은 클릭 -> 창 뜸이 네 번 이어져 그 몫이
+    쌓이므로, DOM이 바뀌는 순간 깨워주는 로케이터 대기를 쓴다.
+    """
+    try:
+        page.get_by_text(text).first.wait_for(state="visible", timeout=timeout_ms)
+        return True
+    except PlaywrightTimeoutError:
+        return False
+
+
+def _open_prefetched_form(page, form_url: str, od_no: str, headless: bool) -> None:
+    """미리 읽어둔 주소로 문의 화면을 열고 유형 목록 응답까지 받는다.
+
+    유형 목록 응답은 가기 전부터 받아둔다(놓치면 영영 못 받는다). 로그인이
+    끼어들 수 있어 expect_response의 시한 안에 두지 않고 따로 센다. 이동이
+    끝났는데 아직이면 그때부터 시한을 걸고 응답 이벤트를 기다린다 - 동기
+    API는 호출 중에만 이벤트를 넘겨주므로 센 것과 기다리는 것 사이에 응답이
+    새지 않는다.
+    """
+    type_list_seen: list[str] = []
+    page.on("response", lambda r: type_list_seen.append(r.url) if INQUIRY_TYPE_LIST_API in r.url else None)
+    _goto_logged_in(page, form_url, headless)
+    if not type_list_seen:
+        try:
+            page.wait_for_event("response", lambda r: INQUIRY_TYPE_LIST_API in r.url,
+                                timeout=INQUIRY_STEP_WAIT_MS)
+        except PlaywrightTimeoutError:
+            raise ParseError(f"1:1 문의 화면의 유형 목록이 오지 않았습니다 (odNo={od_no}, url={page.url}).") from None
+
+
+def _fill_inquiry_form(form, od_no: str, message: str) -> None:
+    """문의 화면에서 유형(배송 > 배송일정)·내용·답변알림을 채운다 - [등록하기]는 누르지 않는다.
+
+    post_inquiry가 부르고, 등록 없이 채우기까지만 재보는 벤치도 이것을 그대로 쓴다.
+    """
+    if not _appears(form, INQUIRY_FORM_MARK):
+        raise ParseError(f"1:1 문의 화면이 뜨지 않았습니다 (odNo={od_no}, url={form.url}).")
+    # 문의가 이 주문에 붙는지 - 주소의 odNo가 그 근거다.
+    if od_no not in form.url and not _appears(form, od_no):
+        raise ParseError(f"1:1 문의 화면에 주문번호가 연결되지 않았습니다 (odNo={od_no}).")
+
+    form.locator(INQUIRY_TYPE_BUTTON).first.click()
+    type_item = form.locator(INQUIRY_TYPE_LIST).get_by_text(INQUIRY_TYPE, exact=True)
+    try:
+        type_item.first.wait_for(state="visible", timeout=INQUIRY_STEP_WAIT_MS)
+    except PlaywrightTimeoutError:
+        raise ParseError("[문의유형 선택]을 눌렀는데 유형 목록 창이 열리지 않았습니다.") from None
+    type_item.first.click()
+    if not _appears(form, INQUIRY_SUBTYPE_MODAL):
+        raise ParseError("문의유형 [배송]을 골랐는데 상세유형 선택 창이 뜨지 않았습니다.")
+    form.get_by_role("button", name=INQUIRY_SUBTYPE, exact=True).first.click()
+    chosen = [t.strip() for t in form.locator(INQUIRY_TYPE_BUTTON).all_inner_texts()]
+    if INQUIRY_TYPE not in chosen or INQUIRY_SUBTYPE not in chosen:
+        raise ParseError(f"문의유형이 배송/배송일정으로 잡히지 않았습니다 (화면: {chosen}).")
+
+    form.locator("textarea").first.fill(message)
+    if not form.locator(INQUIRY_NOTIFY_CHECKBOX).is_checked():
+        form.locator(INQUIRY_NOTIFY_LABEL).click()
+    if not form.locator(INQUIRY_NOTIFY_CHECKBOX).is_checked():
+        raise ParseError("답변알림 [문자/알림톡]이 체크되지 않았습니다.")
+    if form.locator("textarea").first.input_value().strip() != message:
+        raise ParseError("문의내용이 입력되지 않았습니다.")
+
+
 def _confirm_inquiry_listed(context: BrowserContext, od_no: str, message: str,
                             not_before: date | None = None) -> str:
     """문의내역에 이 주문의 문의가 올라갔는지 목록·상세 API로 확인하고 확인 문구를 돌려준다.
@@ -1010,28 +1102,15 @@ def post_inquiry(context: BrowserContext, product_url: str, recipient_name: str,
     if prefetched is not None:
         _raise_if_prefetched_cancelled(prefetched, od_no)
     page = context.new_page()
+    page.route("**/*", _abort_third_party)
     form = None
     try:
         if prefetched is not None:
             form = page
-            # 유형 목록 응답은 가기 전부터 받아둔다(놓치면 영영 못 받는다). 로그인이
-            # 끼어들 수 있어 expect_response의 시한 안에 두지 않고 따로 센다.
-            type_list_seen: list[str] = []
-            page.on("response", lambda r: type_list_seen.append(r.url) if INQUIRY_TYPE_LIST_API in r.url else None)
-            _goto_logged_in(page, prefetched["form_url"], headless)
-            waited_ms = 0
-            while not type_list_seen and waited_ms < INQUIRY_STEP_WAIT_MS:
-                page.wait_for_timeout(100)
-                waited_ms += 100
-            if not type_list_seen:
-                raise ParseError(f"1:1 문의 화면의 유형 목록이 오지 않았습니다 (odNo={od_no}, url={page.url}).")
+            _open_prefetched_form(page, prefetched["form_url"], od_no, headless)
         else:
             form = _open_inquiry_form_from_detail(context, page, product_url, od_no, headless)
-        if not common.wait_for_text(form, INQUIRY_FORM_MARK, timeout_ms=INQUIRY_STEP_WAIT_MS):
-            raise ParseError(f"1:1 문의 화면이 뜨지 않았습니다 (odNo={od_no}, url={form.url}).")
-        # 문의가 이 주문에 붙는지 - 주소의 odNo가 그 근거다.
-        if od_no not in form.url and not common.wait_for_text(form, od_no, timeout_ms=INQUIRY_STEP_WAIT_MS):
-            raise ParseError(f"1:1 문의 화면에 주문번호가 연결되지 않았습니다 (odNo={od_no}).")
+            form.route("**/*", _abort_third_party)   # 새 탭은 열린 뒤에야 걸 수 있다
 
         dialogs: list[tuple[str, str]] = []
 
@@ -1041,32 +1120,14 @@ def post_inquiry(context: BrowserContext, product_url: str, recipient_name: str,
             dialog.accept()
 
         form.on("dialog", _on_dialog)
-
-        form.locator(INQUIRY_TYPE_BUTTON).first.click()
-        type_item = form.locator(INQUIRY_TYPE_LIST).get_by_text(INQUIRY_TYPE, exact=True)
-        try:
-            type_item.first.wait_for(state="visible", timeout=INQUIRY_STEP_WAIT_MS)
-        except PlaywrightTimeoutError:
-            raise ParseError("[문의유형 선택]을 눌렀는데 유형 목록 창이 열리지 않았습니다.") from None
-        type_item.first.click()
-        if not common.wait_for_text(form, INQUIRY_SUBTYPE_MODAL, timeout_ms=INQUIRY_STEP_WAIT_MS):
-            raise ParseError("문의유형 [배송]을 골랐는데 상세유형 선택 창이 뜨지 않았습니다.")
-        form.get_by_role("button", name=INQUIRY_SUBTYPE, exact=True).first.click()
-        chosen = [t.strip() for t in form.locator(INQUIRY_TYPE_BUTTON).all_inner_texts()]
-        if INQUIRY_TYPE not in chosen or INQUIRY_SUBTYPE not in chosen:
-            raise ParseError(f"문의유형이 배송/배송일정으로 잡히지 않았습니다 (화면: {chosen}).")
-
-        form.locator("textarea").first.fill(message)
-        if not form.locator(INQUIRY_NOTIFY_CHECKBOX).is_checked():
-            form.locator(INQUIRY_NOTIFY_LABEL).click()
-        if not form.locator(INQUIRY_NOTIFY_CHECKBOX).is_checked():
-            raise ParseError("답변알림 [문자/알림톡]이 체크되지 않았습니다.")
-        if form.locator("textarea").first.input_value().strip() != message:
-            raise ParseError("문의내용이 입력되지 않았습니다.")
+        _fill_inquiry_form(form, od_no, message)
 
         form.get_by_role("button", name=INQUIRY_SUBMIT, exact=True).first.click()
-        # 확인 -> 완료 alert -> 문의내역 이동. 주소가 바뀔 때까지만 기다린다.
-        common.wait_for_url(form, lambda url: INQUIRY_DONE_URL in url, INQUIRY_STEP_WAIT_MS)
+        # 확인 -> 완료 alert -> 문의내역 이동. 주소가 바뀔 때까지만 기다린다 -
+        # 못 바뀌어도 여기서 올리지 않고 아래에서 사유를 가려 올린다.
+        with contextlib.suppress(PlaywrightTimeoutError):
+            form.wait_for_url(lambda url: INQUIRY_DONE_URL in url,
+                              wait_until="commit", timeout=INQUIRY_STEP_WAIT_MS)
         done = [m for t, m in dialogs if INQUIRY_DONE_TEXT in m]
         if not done:
             seen = " / ".join(f"{t}: {m}" for t, m in dialogs) or "(뜬 창 없음)"
