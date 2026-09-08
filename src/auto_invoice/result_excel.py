@@ -63,7 +63,8 @@ COL_APPLIED = HEADERS.index("샵마인 반영")
 COL_REASON = HEADERS.index("사유")
 COL_URL = HEADERS.index("상품URL")
 
-# '지난 일수'는 주말(토·일)을 뺀 일수다(order_date.days_since). inquiry.py가 이
+# '지난 일수'는 주말(토·일)을 뺀 일수다(order_date.days_since - 토·일 주문은
+# 다음 월요일 주문으로 친다). inquiry.py가 이
 # 칸을 그대로 읽어 '2일'인 건만 문의하므로 머리글 이름은 그대로 둔다.
 STALE_HEADERS = ["마켓 주문번호", "수령인", "주문일", "지난 일수", "출고/도착예정",
                  "상품URL", "조회 결과", "사유"]

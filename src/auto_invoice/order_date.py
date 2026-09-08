@@ -7,7 +7,9 @@
 보여준다. 어떤 건을 그 목록에 넣을지는 report.py의 is_stale_entry가
 정한다 - 이 모듈은 날짜만 다룬다. '며칠 지났나'는 주말(토·일)을 빼고 센다
 (days_since) - 공급사가 주말에는 출고하지 않으니 금요일 주문을 월요일에 봐도
-하루 기다린 셈이다.
+하루 기다린 셈이다. 같은 이유로 토·일에 들어온 주문은 그다음 월요일 주문으로
+본다(effective_order_date) - 토요일 5일 주문을 화요일 8일에 보면 월요일 7일
+주문처럼 1일 지난 것이다(사용자 기준).
 
 날짜를 잘못 읽어 멀쩡한 주문을 '오래됨'으로 올리면 목록 전체를 못 믿게 되므로,
 화면에 있는 아무 날짜나 줍지 않는다. 아래 세 규칙 중 하나에 걸리는 날짜만
@@ -34,6 +36,7 @@ from datetime import date, timedelta
 # 오늘과 이만큼(일) 이상 벌어진 주문일이면 따로 모아 보여준다.
 # 사용자 기준: 주문상세 8월 26일(수) / 오늘 8월 28일(금) = 2일 -> 해당됨.
 # 일수는 주말을 빼고 센다(days_since) - 금요일 주문을 월요일에 보면 1일.
+# 토·일 주문은 다음 월요일 주문으로 본다 - 토요일 주문을 화요일에 보면 1일.
 STALE_DAYS = 2
 
 # 주문상세 화면에서 주문일 앞에 붙는 라벨. 앞에 있는 것부터 찾아서 먼저
@@ -225,6 +228,18 @@ def _weekdays_up_to(day: date) -> int:
     return weeks * 5 + min(rest, 5)
 
 
+def effective_order_date(order_date: date) -> date:
+    """토·일에 들어온 주문은 그다음 월요일 주문으로 본다.
+
+    공급사는 주말에 주문을 받아만 두고 월요일부터 처리하므로, 토요일 5일 주문은
+    월요일 7일 주문과 같은 날부터 기다린 셈이다(사용자 기준). 평일 주문은
+    그대로다.
+    """
+    if order_date.weekday() >= 5:                       # 5=토, 6=일
+        return order_date + timedelta(days=7 - order_date.weekday())
+    return order_date
+
+
 def days_since(order_date: date | None, today: date | None = None) -> int | None:
     """주문일로부터 오늘까지 며칠 지났는지 - 주말(토·일)은 빼고 센다.
 
@@ -232,11 +247,14 @@ def days_since(order_date: date | None, today: date | None = None) -> int | None
     보면 달력으로는 3일이지만 토·일을 빼고 1일이다(사용자 기준). 주말이 끼지
     않으면 달력 일수와 같다. 토·일에 조회하면 그 날은 세지 않으므로 금요일에
     본 값과 같다 - 공급사가 주말에 출고하지 않는 이상 '더 기다린' 게 아니어서다.
+    토·일 주문은 다음 월요일 주문으로 보고 센다(effective_order_date) - 토요일
+    5일 주문을 화요일 8일에 보면 2일이 아니라 1일이다.
     미래 날짜면 음수. today는 시험용 - 안 주면 오늘이다.
     """
     if order_date is None:
         return None
-    return _weekdays_up_to(today or date.today()) - _weekdays_up_to(order_date)
+    return (_weekdays_up_to(today or date.today())
+            - _weekdays_up_to(effective_order_date(order_date)))
 
 
 def is_stale(order_date: date | None) -> bool:
@@ -245,12 +263,19 @@ def is_stale(order_date: date | None) -> bool:
 
 
 def describe(order_date: date | None) -> str:
-    """'2026-08-26 (2일 지남)' - 요약과 엑셀에서 같은 문구를 쓴다 (주말 제외 일수)."""
+    """'2026-08-26 (2일 지남)' - 요약과 엑셀에서 같은 문구를 쓴다 (주말 제외 일수).
+
+    주말 주문은 '2026-09-05 (1일 지남, 주말 주문이라 09-07부터 셈)'처럼 어느
+    날부터 셌는지 같이 적는다 - 날짜와 일수가 안 맞아 보여 헷갈리지 않도록.
+    """
     if order_date is None:
         return ""
     days = days_since(order_date)
     if days is None or days < 0:
         return f"{order_date:%Y-%m-%d}"
+    counted_from = effective_order_date(order_date)
+    note = (f", 주말 주문이라 {counted_from:%m-%d}부터 셈"
+            if counted_from != order_date else "")
     if days == 0:
-        return f"{order_date:%Y-%m-%d} (오늘)"
-    return f"{order_date:%Y-%m-%d} ({days}일 지남)"
+        return f"{order_date:%Y-%m-%d} (오늘{note})"
+    return f"{order_date:%Y-%m-%d} ({days}일 지남{note})"
