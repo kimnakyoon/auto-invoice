@@ -317,8 +317,10 @@ python scripts/run_all.py --stop-before-apply   # 일괄등록까지만, 마지�
   [1:1 상담하기] → 상담 유형 [배송 문의] → 문의상품 선택 칸에 `주문번호 수령인 배송 언제
   시작하나요?` → [문의하기] → [나의 상담 내역] > [PC 상담]에서 확인). [1:1 상담하기]는
   고정 주소 `www.gsshop.com/cust/custCent/main.gs`(주문번호가 안 붙는다)라 주문상세 화면은
-  열지 않고, 취소/품절과 상품은 주문상세 JSON(entry-data, 송장조회와 같은 `_fetch_entry_data`
-  또는 `prepare_batch`가 읽어둔 목록)으로 본다. 문구는 이 사이트만 **주문번호로 시작**한다 -
+  열지 않고, 취소/품절과 상품은 주문상세 JSON(entry-data, 송장조회와 같은 `_fetch_entry_data`로
+  HTML만 받아 0.24초)으로 본다. 송장조회가 쓰는 주문목록 선읽기(`prepare_batch`)는 한 페이지에
+  1.2초라 문의가 6건 이상일 때만 한다(`INQUIRY_LIST_MIN_ORDERS` - 그 아래면 상세가 더 싸다,
+  2026-09-08 실측). 첫 요청만 연결을 데우느라 1.5초쯤 더 든다. 문구는 이 사이트만 **주문번호로 시작**한다 -
   사용자가 늘 그렇게 남겨왔고 상담내역에서 주문을 맞추는 열쇠다(`inquiry_message(recipient_name,
   product_url)`, `inquiry._message_for`가 인자 수를 보고 상품URL을 넘긴다). 폼은 상담 유형
   드롭다운(`func_select('01')` → 숨은 `#prsnConslTypCd`)·문의상품 [주문내역] 팝업(`ordList.gs`의

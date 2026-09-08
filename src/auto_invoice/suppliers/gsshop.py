@@ -691,7 +691,8 @@ def get_tracking(
 # [문의하기] -> 마이쇼핑 [나의 상담 내역] > [PC 상담]에서 확인이다. 실측한 구조:
 #   [1:1 상담하기] = 고정 주소 www.gsshop.com/cust/custCent/main.gs (주문번호가 주소에
 #     안 붙는다 - SSG처럼). 그래서 주문상세 화면은 열 필요가 없고, 취소/품절 여부와
-#     상품 정보만 주문상세 JSON(entry-data, 화면 없이 HTML만 받는다)으로 본다.
+#     상품 정보만 주문상세 JSON(entry-data, 화면 없이 HTML만 받는다 - 31KB, 0.24초)으로
+#     본다. 첫 요청만 연결을 데우느라 1.5초쯤 더 걸린다(그 뒤로는 같은 호스트에 재사용).
 #   상담 유형 드롭다운 = <a id="query_3" onclick="func_select('01')">배송 문의</a> ->
 #     숨은 폼 #board 의 #prsnConslTypCd 에 코드가 들어간다 (01=배송 문의, 03=상품 문의,
 #     23=결제/주문취소, 06=반품/교환, 11=이벤트/적립/혜택, 21=알림/회원/기타).
@@ -744,6 +745,8 @@ INQUIRY_HISTORY_TRIES = 3            # 등록 뒤 목록에 아직 안 보이면
 INQUIRY_HISTORY_RETRY_GAP_SEC = 1.0
 INQUIRY_HISTORY_MAX_PAGES = 5        # '이미 남겼는지' 훑는 상담내역 페이지 수 (20건씩)
 INQUIRY_ROWS_PER_PAGE = 20
+# 주문목록(1.2초/20건)이 상세(0.24초/건)보다 싸지는 배치 크기 - prepare_inquiries 참고.
+INQUIRY_LIST_MIN_ORDERS = 6
 # 문의 화면에서 받아줄 호스트 - 화면·API·정적파일이 이 안이다. 나머지는 광고/분석
 # 태그(google·airbridge·megadata·widerplanet 등)라 끊는다.
 INQUIRY_ALLOWED_HOSTS = ("gsshop.com", "m-gs.kr")
@@ -779,9 +782,15 @@ def inquiry_message(recipient_name: str, product_url: str | None = None) -> str:
 
 
 def prepare_inquiries(context: BrowserContext, product_urls, headless: bool = False) -> None:
-    """이번에 문의할 주문들의 주문상세(취소/품절·상품)를 주문목록으로 미리 읽어두고,
-    상담내역 캐시는 새 배치라 비운다. 송장조회의 prepare_batch와 같은 목록이다."""
+    """상담내역 캐시는 새 배치라 비우고, 주문이 많을 때만 주문목록을 미리 읽어둔다.
+
+    문의는 주문상세를 화면 없이 HTML만 받아 0.24초면 되는데(2026-09-08 실측, 연결이
+    데워진 뒤), 주문목록은 한 페이지(20건)에 1.2초다. 그래서 송장조회(화면을 열어
+    1~2초)와 달리 5건은 넘어야 목록이 이득이다 - 그 아래면 주문마다 상세로 간다.
+    """
     _inquiry_rows_cache.pop(id(context), None)
+    if len(product_urls) < INQUIRY_LIST_MIN_ORDERS:
+        return
     prepare_batch(context, [SimpleNamespace(product_url=u) for u in product_urls], headless=headless)
 
 
