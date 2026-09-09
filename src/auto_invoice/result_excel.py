@@ -32,7 +32,7 @@
 
 from __future__ import annotations
 
-from datetime import datetime
+from datetime import date, datetime
 from pathlib import Path
 
 from openpyxl import Workbook
@@ -120,39 +120,28 @@ _TEXT_FORMAT = "@"
 _HEADER_ROW = 3
 
 
-def _group_key(entry: ReportEntry) -> tuple[int, int]:
+def _sort_key(entry: ReportEntry) -> tuple[int, int, date]:
     """실패 -> 취소/품절 -> 반영오류 -> 주문일지연 -> 미지원 사이트 -> 스킵 -> 성공.
 
     주문일이 오래된 건은 결과가 무엇이든 주문일지연 자리까지 끌어올린다. 이미
     그보다 위에 있는 결과(실패/취소·품절)는 제자리를 지킨다 - 더 급한 쪽이
     위여야 하니까. 같은 자리 안에서는 결과끼리 다시 모이도록 두 번째 값으로
     결과 순서를 쓴다(예: 주문일지연 칸의 스킵 건과 성공 건이 섞이지 않게).
+    앞 두 값이 곧 '묶음'이다 - 굵은 가로선은 이 두 값이 바뀌는 자리에 긋는다.
 
-    묶음(굵은 가로선으로 나뉘는 덩어리)을 정하는 값이라 여기까지만 비교한다 -
-    묶음 안 순서는 _sort_key가 이어서 정한다.
+    세 번째 값은 주문일지연 묶음 안의 순서: 주문일 오름차순(사용자 요청).
+    '며칠째 안 나가고 있나'가 핵심이라 오래된 주문부터 보여야 하는데, 파일
+    순서 그대로 두면 09-06·09-05·09-07·09-03이 섞여 4일 지난 건이 2일 지난 건
+    사이에 묻힌다. 별도 '주문일지연' 시트(report.stale_entries)와 같은
+    키(order_date)라 두 시트의 줄 순서가 같다. 나머지 묶음은 전부 date.min이라
+    파일(샵마인 내보내기) 순서를 그대로 유지한다 - 그쪽은 주문일이 아니라
+    결과·사유로 보는 건들이다.
     """
     label = result_label(entry)
     rank = _SORT_ORDER.index(label) if label in _SORT_ORDER else len(_SORT_ORDER)
-    if is_stale_entry(entry):
-        return min(rank, _SORT_ORDER.index(_STALE_SORT_LABEL)), rank
-    return rank, rank
-
-
-def _sort_key(entry: ReportEntry) -> tuple[int, int, int]:
-    """_group_key 순서로 묶고, 주문일지연 묶음 안은 주문일 오름차순.
-
-    주문일이 오래된 건은 '며칠째 안 나가고 있나'가 핵심이라 오래된 주문부터
-    보여야 한다(사용자 요청). 파일 순서 그대로 두면 09-06·09-05·09-07·09-03이
-    섞여 4일 지난 건이 2일 지난 건 사이에 묻힌다. 별도 '주문일지연'
-    시트(stale_entries)와 같은 기준이라 두 시트의 줄 순서가 같다.
-
-    나머지 묶음은 파일(샵마인 내보내기) 순서를 그대로 둔다 - 그쪽은 주문일이
-    아니라 결과·사유로 보는 건들이고, 사용자가 부탁한 범위도 아니다.
-    """
-    group = _group_key(entry)
-    if is_stale_entry(entry) and entry.order_date is not None:
-        return (*group, entry.order_date.toordinal())
-    return (*group, 0)
+    if is_stale_entry(entry):        # 주문일이 있어야 stale이라 order_date는 None이 아니다
+        return min(rank, _SORT_ORDER.index(_STALE_SORT_LABEL)), rank, entry.order_date
+    return rank, rank, date.min
 
 
 def label_counts(entries: list[ReportEntry]) -> list[tuple[str, int]]:
@@ -203,6 +192,7 @@ def _write_entries_sheet(ws, entries: list[ReportEntry], applied_label: str,
     ws.title = SHEET_NAME
     last_col = len(HEADERS)
     rows = sorted(entries, key=_sort_key)
+    keys = [_sort_key(e) for e in rows]     # 묶음 경계(굵은 선) 판정용
 
     _write_title(ws, title, rows, last_col)
 
@@ -229,11 +219,11 @@ def _write_entries_sheet(ws, entries: list[ReportEntry], applied_label: str,
             entry.reason or "",
         ])
         # 덩어리가 바뀌는 자리(그룹 끝)에는 굵은 선을 그어 나눈다. 결과
-        # 이름이 아니라 정렬 자리로 비교해야 '주문일지연으로 끌어올린 성공
-        # 건'과 '그냥 성공 건'도 선으로 나뉜다. 주문일까지 든 _sort_key로
-        # 비교하면 주문일이 바뀔 때마다 선이 그어지므로 _group_key로 본다.
-        next_key = _group_key(rows[i + 1]) if i + 1 < len(rows) else None
-        _style_row(ws[ws.max_row], label, group_end=next_key != _group_key(entry),
+        # 이름이 아니라 정렬 자리(키 앞 두 값)로 비교해야 '주문일지연으로
+        # 끌어올린 건'과 '그냥 스킵 건'도 선으로 나뉜다. 세 번째 값(주문일)까지
+        # 비교하면 주문일이 바뀔 때마다 선이 그어지므로 뺀다.
+        group_end = i + 1 == len(rows) or keys[i + 1][:2] != keys[i][:2]
+        _style_row(ws[ws.max_row], label, group_end=group_end,
                    stale=is_stale_entry(entry))
 
     for i, width in enumerate(COLUMN_WIDTHS, start=1):
