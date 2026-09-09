@@ -40,9 +40,14 @@
   서로 다른 송장인지 비교하고, 다르면 사람이 확인하도록 예외를 던진다.
   클릭할 때마다 다른 탭이 아니라 같은 탭이 이동해버리므로, 다음 링크를
   클릭하기 전에 주문상세 페이지로 다시 돌아간다.
-- 아직 발송 전 상태 문구(NOT_YET_PATTERNS)는 실제 미발송 주문으로 확인한
-  적이 없어 다른 어댑터에서 흔히 보이는 값으로 추정해뒀다 - 다르게 나오면
-  조정이 필요하다.
+- 아직 발송 전이면 "배송조회" 링크가 없고 상품 칸의 상태(<div class="pdstate">)에
+  **"상품준비"**(뒤에 "중"이 없다)라고 뜬다 (2026-09-09 실측, 주문상세
+  __NEXT_DATA__의 lastOrdStatGbcdNm="상품준비"·lastOrdStatGbcd="25"·invoice="N").
+  처음에는 다른 어댑터처럼 "상품준비중"으로 추정해 둬서 이 주문이 스킵이 아니라
+  실패("배송조회 링크를 찾지 못했습니다")로 잡혔다. 화면 하단 안내문에는
+  "상품준비중"이라는 글자가 숨은 <li>로 항상 들어있는데, page.inner_text는
+  숨은 요소를 빼고 주기 때문에(Playwright innerText - Context7로 확인) 그
+  글자로 오판하지는 않는다 - text_content로 바꾸면 안 된다.
 """
 
 from __future__ import annotations
@@ -101,7 +106,8 @@ TRACKING_NAV_WAIT_TIMEOUT_MS = 5 * 1000  # 배송조회 클릭 후 페이지 이
 
 TRACKING_LINK_TEXT = "배송조회"
 TRACKING_URL_MARKER = "selectDlvTrcUrl"
-NOT_YET_PATTERNS = ["결제완료", "상품준비중", "배송준비중", "주문접수"]
+# "상품준비"는 2026-09-09 실측값(장은진 20260908067895) - 현대몰은 "중"을 안 붙인다.
+NOT_YET_PATTERNS = ["결제완료", "상품준비", "배송준비중", "주문접수"]
 
 
 def extract_order_no(product_url: str) -> str:
