@@ -48,12 +48,38 @@
   "상품준비중"이라는 글자가 숨은 <li>로 항상 들어있는데, page.inner_text는
   숨은 요소를 빼고 주기 때문에(Playwright innerText - Context7로 확인) 그
   글자로 오판하지는 않는다 - text_content로 바꾸면 안 된다.
+
+2026-09-09 최적화 - 화면을 열지 않고 요청 두 번으로 끝낸다:
+- 주문상세는 Next.js 서버 렌더(__N_SSP)라 context.request.get으로 HTML만 받아도
+  <script id="__NEXT_DATA__">의 props.pageProps.data.map에 주문 정보가 통째로
+  들어있다(0.15초, 28KB). ordItemList[]마다 lastOrdStatGbcdNm(상품준비/배송완료…),
+  invoice(Y/N - 송장 유무), ordPtcSeq(상품 순번), uitmTotNm(옵션), shipPrrgDtm
+  (출고예정일), oshpDtm(출고일시)가 있어 미발급/취소는 여기서 끝난다.
+- 송장은 "배송조회" 클릭이 부르는 GET api.hmall.com/api/hf/od/v1/mypage/shpg-inf/
+  dlv-trcurl?ordNo=&ordPtcSeq= 의 respData(invcNo 송장, dlvcoNm 택배사명)로
+  받는다(0.04초). 브라우저는 accessToken 쿠키를 Authorization: Bearer로 붙이는데,
+  실측으로는 쿠키·헤더 없이도 200이 나온다 - 그래도 브라우저와 같게 붙여 보낸다.
+  같은 계정의 주문목록 API(shpg-inf/list)는 이 토큰으로도 401(feign-auth)이라
+  목록 선읽기는 하지 않는다 - 상세 요청이 0.15초라 필요도 없다.
+- 로그인 판정은 상세 요청의 307 Location(/mo/cob/loginForm)으로 본다. accessToken은
+  10분짜리 JWT이고 refreshToken으로 조용히 재발급하는 경로가 없다(next-auth
+  session·csrf, login/refresh 류 전부 확인) - 화면 방식도 토큰이 없으면 바로
+  로그인 폼으로 가므로, 만료 시엔 지금처럼 _auto_login(진짜 크롬 창)을 한 번
+  거치고 이어서 요청 방식으로 간다.
+- 요청 방식이 판정하지 못하는 응답(HTML 구조가 다름, 송장 API 비정상, 송장 없는
+  주문의 상태값이 모르는 값)이면 예전 화면 방식(_get_tracking_via_page)으로
+  물러난다. 화면에는 예정 문구가 없어 결과의 '출고/도착예정'이 늘 빈칸이었는데,
+  JSON의 shipPrrgDtm을 '출고예정 YYYY-MM-DD'로 실어준다.
+- 주문일은 주문번호 앞 8자리(=주문일, ordDtm과 대조 확인). ordDtm은 UTC라
+  자정 근처에 하루 어긋날 수 있어 앞 8자리를 못 읽을 때만 +9시간으로 쓴다.
 """
 
 from __future__ import annotations
 
+import json
 import os
 import re
+from datetime import date, datetime, timedelta, timezone
 from urllib.parse import parse_qs, urlparse
 
 from dotenv import load_dotenv
@@ -66,8 +92,11 @@ from .base import (
     BlockedError,
     ParseError,
     TrackingNotAvailableYet,
+    attach_order_date,
     normalize_option,
     raise_if_cancelled,
+    raise_if_cancelled_any,
+    raise_if_delayed_any,
     with_order_date,
 )
 
@@ -90,12 +119,11 @@ RECAPTCHA_MIN_SCORE = 0.5
 DOMAINS = {"hmall.com", "www.hmall.com"}
 SITE_KEY = "hmall"
 
-# 주문당 상세 화면 1개를 여는 사이트. 기본 간격(1.5~4초)은 봇 확인이 잘 뜨는
-# 사이트를 기준으로 잡은 값이라, 화면 하나 여는 데 1.2초쯤 걸리는 여기서는
-# 조회 시간의 절반이 그냥 쉬는 시간이었다 (2026-09-04 실측: 롯데아이몰 6건
-# 15.5초 중 순수 조회 7.5초). 네이버와 같은 간격으로 둔다 - 사람이 주문을
-# 하나씩 눌러 보는 속도다.
-REQUEST_GAP = (1.0, 2.0)
+# 2026-09-09부터 주문당 가벼운 요청 두 번(상세 HTML + 송장 JSON)으로 끝나는
+# 사이트. 화면을 열던 때는 (1.0, 2.0)이었고, 요청 방식으로 바뀐 다른 사이트
+# (지마켓·4910·신세계TV쇼핑)와 같은 간격으로 둔다. 화면 폴백으로 갔을 때도 이
+# 간격이 적용되지만 그 경로는 예외적이라 따로 두지 않는다.
+REQUEST_GAP = (0.5, 1.2)
 
 
 DEFAULT_COURIER = "택배"  # 이동한 URL에서 택배사명을 못 읽었을 때만 쓰는 기본값
@@ -106,6 +134,18 @@ TRACKING_NAV_WAIT_TIMEOUT_MS = 5 * 1000  # 배송조회 클릭 후 페이지 이
 
 TRACKING_LINK_TEXT = "배송조회"
 TRACKING_URL_MARKER = "selectDlvTrcUrl"
+
+# 요청 방식(2026-09-09) - 파일 맨 위 docstring 참고.
+DETAIL_URL = "https://www.hmall.com/mo/mpa/selectOrdPTCPup?ordNo={order_no}"
+TRACKING_API_URL = "https://api.hmall.com/api/hf/od/v1/mypage/shpg-inf/dlv-trcurl"
+NEXT_DATA_RE = re.compile(r'<script id="__NEXT_DATA__"[^>]*>(.*?)</script>', re.S)
+# 브라우저가 api.hmall.com에 붙이는 헤더 중 쿠키에서 그대로 만들 수 있는 것.
+ACCESS_TOKEN_COOKIE = "accessToken"
+DEVICE_ID_COOKIE = "uh2oxid"
+# 송장 유무를 알려주는 상품 칸. "Y"면 배송조회 링크가 뜨는 상품이다.
+INVOICE_FLAG_KEY = "invoice"
+STATUS_KEY = "lastOrdStatGbcdNm"
+KST = timezone(timedelta(hours=9))
 # "상품준비"는 2026-09-09 실측값(장은진 20260908067895) - 현대몰은 "중"을 안 붙인다.
 NOT_YET_PATTERNS = ["결제완료", "상품준비", "배송준비중", "주문접수"]
 
@@ -336,9 +376,185 @@ def _scrape_tracking_from_page(page: Page, product_url: str, order_no: str, orde
     return TrackingResult(tracking_no=tracking_no, courier=courier)
 
 
+class _NeedsLogin(Exception):
+    """요청 방식에서 로그인 폼으로 넘겨졌다 - 로그인하고 다시 시도한다."""
+
+
+class _RequestPathUnusable(Exception):
+    """요청 방식으로는 결론을 못 낸다 - 화면 방식으로 물러난다.
+
+    미발급/취소/성공 같은 진짜 결론은 이 예외가 아니라 어댑터 예외로 곧장
+    나간다. 이 예외는 '응답 모양이 예상과 다르다'는 뜻일 때만 쓴다.
+    """
+
+
+def _fetch_detail(context: BrowserContext, order_no: str) -> dict:
+    """주문상세 HTML만 받아 __NEXT_DATA__의 주문 정보(data.map)를 돌려준다."""
+    url = DETAIL_URL.format(order_no=order_no)
+    response = context.request.get(url, max_redirects=0)
+    if 300 <= response.status < 400:
+        location = response.headers.get("location", "")
+        if "login" in location.lower():
+            raise _NeedsLogin()
+        response = context.request.get(url)  # 로그인이 아닌 다른 리다이렉트면 따라간다
+        if "login" in response.url.lower():
+            raise _NeedsLogin()
+    if response.status != 200:
+        raise _RequestPathUnusable(f"주문상세 응답이 HTTP {response.status}")
+    match = NEXT_DATA_RE.search(response.text())
+    if not match:
+        raise _RequestPathUnusable("주문상세 HTML에 __NEXT_DATA__가 없음")
+    try:
+        data = json.loads(match.group(1))
+        detail = data["props"]["pageProps"]["data"]["map"]
+    except (ValueError, KeyError, TypeError) as exc:
+        raise _RequestPathUnusable(f"__NEXT_DATA__ 구조가 다름 ({exc!r})") from exc
+    items = detail.get("ordItemList") if isinstance(detail, dict) else None
+    if not items:
+        raise _RequestPathUnusable("ordItemList가 비어 있음")
+    if str(detail.get("ordNo") or "") != order_no:
+        raise _RequestPathUnusable(f"응답의 주문번호가 다름 ({detail.get('ordNo')})")
+    return detail
+
+
+def _order_date_of(order_no: str, detail: dict) -> date | None:
+    """주문번호 앞 8자리가 주문일이다. 못 읽으면 ordDtm(UTC)을 한국 시간으로."""
+    try:
+        return datetime.strptime(order_no[:8], "%Y%m%d").date()
+    except ValueError:
+        pass
+    raw = str(detail.get("ordDtm") or "")
+    try:
+        parsed = datetime.fromisoformat(raw.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    if parsed.tzinfo is not None:
+        parsed = parsed.astimezone(KST)
+    return parsed.date()
+
+
+def _delivery_note(items: list[dict]) -> str | None:
+    """출고예정일(shipPrrgDtm "2026-09-11 00:00:00")을 '출고예정 2026-09-11'로."""
+    notes: list[str] = []
+    for item in items:
+        raw = str(item.get("shipPrrgDtm") or "")[:10]
+        if re.fullmatch(r"20\d{2}-\d{2}-\d{2}", raw):
+            note = f"출고예정 {raw}"
+            if note not in notes:
+                notes.append(note)
+    return " / ".join(notes) if notes else None
+
+
+def _select_items(items: list[dict], order_option: str | None) -> list[dict]:
+    """샵마인 "주문옵션"이 상품명+옵션(uitmTotNm)에 유일하게 맞는 상품만 남긴다.
+
+    화면 방식의 _select_link_index_by_order_option과 같은 규칙 - 0개 또는 2개
+    이상 맞으면 전부 돌려주고, 호출자가 송장을 비교한다.
+    """
+    if len(items) <= 1 or not order_option:
+        return items
+    target = normalize_option(order_option)
+    if not target:
+        return items
+    matched = [
+        item for item in items
+        if target in normalize_option(f"{item.get('ordItemNm') or ''} {item.get('uitmTotNm') or ''}")
+    ]
+    return matched if len(matched) == 1 else items
+
+
+def _api_headers(context: BrowserContext) -> dict[str, str]:
+    headers = {"Accept": "application/json, text/plain, */*", "Origin": "https://www.hmall.com",
+               "Referer": "https://www.hmall.com/", "device": "mobile"}
+    for cookie in context.cookies("https://www.hmall.com/"):
+        if cookie["name"] == ACCESS_TOKEN_COOKIE and cookie["value"]:
+            headers["Authorization"] = f"Bearer {cookie['value']}"
+        elif cookie["name"] == DEVICE_ID_COOKIE and cookie["value"]:
+            headers[DEVICE_ID_COOKIE] = cookie["value"]
+    return headers
+
+
+def _fetch_tracking(context: BrowserContext, order_no: str, ptc_seq) -> tuple[str, str]:
+    """배송조회 클릭이 부르는 송장 API - (송장번호, 택배사명)."""
+    response = context.request.get(
+        TRACKING_API_URL, params={"ordNo": order_no, "ordPtcSeq": ptc_seq}, headers=_api_headers(context))
+    if response.status != 200:
+        raise _RequestPathUnusable(f"송장 API가 HTTP {response.status}")
+    try:
+        body = response.json()
+    except Exception as exc:  # noqa: BLE001 - JSON이 아니면 화면 방식으로
+        raise _RequestPathUnusable("송장 API 응답이 JSON이 아님") from exc
+    data = body.get("respData") if isinstance(body, dict) else None
+    if body.get("successYn") != "Y" or not isinstance(data, dict):
+        raise _RequestPathUnusable(f"송장 API 거부 ({body.get('respCode')}: {body.get('respMsg')})")
+    tracking_no = re.sub(r"[^0-9]", "", str(data.get("invcNo") or ""))
+    if not tracking_no:
+        raise _RequestPathUnusable("송장 API 응답에 invcNo가 없음")
+    name = str(data.get("dlvcoNm") or "").strip()
+    courier = common.normalize_courier(name) if name else DEFAULT_COURIER
+    return tracking_no, courier
+
+
+def _resolve_from_json(context: BrowserContext, order_no: str, items: list[dict],
+                       order_option: str | None) -> TrackingResult:
+    chosen = _select_items(items, order_option)
+    shipped = [item for item in chosen if str(item.get(INVOICE_FLAG_KEY) or "").upper() == "Y"]
+    if not shipped:
+        statuses = [str(item.get(STATUS_KEY) or "") for item in chosen]
+        # 상태값을 정확히 아는 공급사 규칙 - 취소/지연을 먼저, 미발급은 그 다음.
+        raise_if_cancelled_any(statuses, order_no)
+        raise_if_delayed_any(statuses, order_no)
+        joined = "/".join(statuses)
+        if any(p in status for status in statuses for p in NOT_YET_PATTERNS):
+            raise TrackingNotAvailableYet(
+                f"아직 송장번호가 발급되지 않았습니다 (주문번호={order_no}, 상태={joined}).")
+        raise _RequestPathUnusable(f"송장이 없는데 상태를 모름 (상태={joined})")
+
+    results = [_fetch_tracking(context, order_no, item.get("ordPtcSeq")) for item in shipped]
+    if len({tracking_no for tracking_no, _ in results}) > 1:
+        raise ParseError(
+            f"한 주문에 서로 다른 송장번호가 여러 개 있습니다 (주문번호={order_no}) "
+            "- 상품별로 나눠 배송된 것으로 보입니다.")
+    tracking_no, courier = results[0]
+    return TrackingResult(tracking_no=tracking_no, courier=courier)
+
+
+def _lookup_via_request(context: BrowserContext, order_no: str, order_option: str | None) -> TrackingResult:
+    detail = _fetch_detail(context, order_no)
+    items = detail["ordItemList"]
+    return attach_order_date(
+        _order_date_of(order_no, detail),
+        lambda: _resolve_from_json(context, order_no, items, order_option),
+        delivery_note=_delivery_note(items),
+    )
+
+
 def get_tracking(
     context: BrowserContext, product_url: str, headless: bool = True, order_option: str | None = None
 ) -> TrackingResult:
+    """요청 방식으로 먼저, 결론을 못 내면 화면 방식으로 (파일 맨 위 docstring)."""
+    order_no = extract_order_no(product_url)
+    try:
+        return _lookup_via_request(context, order_no, order_option)
+    except _NeedsLogin:
+        # 자동 로그인은 자체 크롬 창을 띄우므로 headless 실행 중에도 쓸 수 있다.
+        # 실패하면(비밀번호 없음/점수 미달) 화면 방식이 수동 로그인까지 맡는다.
+        if _auto_login(context):
+            try:
+                return _lookup_via_request(context, order_no, order_option)
+            except _NeedsLogin:
+                raise BlockedError("자동 로그인 후에도 여전히 로그인 페이지입니다.") from None
+            except _RequestPathUnusable as exc:
+                common.safe_print(f"[hmall] 요청 방식으로 판정하지 못했습니다({exc}) - 화면 방식으로 조회합니다.")
+    except _RequestPathUnusable as exc:
+        common.safe_print(f"[hmall] 요청 방식으로 판정하지 못했습니다({exc}) - 화면 방식으로 조회합니다.")
+    return _get_tracking_via_page(context, product_url, headless, order_option)
+
+
+def _get_tracking_via_page(
+    context: BrowserContext, product_url: str, headless: bool = True, order_option: str | None = None
+) -> TrackingResult:
+    """2026-09-09 이전의 조회 - 주문상세 화면을 열고 "배송조회"를 클릭한다."""
     order_no = extract_order_no(product_url)
     page = context.new_page()
     try:
