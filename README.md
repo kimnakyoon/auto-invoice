@@ -427,8 +427,10 @@ python scripts/run_all.py --stop-before-apply   # 일괄등록까지만, 마지�
   `sessionStorage.access_token`)이 있어야 하고, 등록 본문의 회원 이름·전화는 API 응답에는
   `[ENC]` 암호문으로만 오는데 화면의 Pinia 저장소 `userStore.custInfo`에 복호화돼 있다.
   주문상세 화면을 한 번 열어(만료됐으면 자동 로그인) 셋을 읽어두고(`_read_session`, 배치에
-  한 번·만료 30초 전이나 401이면 다시) 주문상세(0.07초)·유형 목록·상담내역·등록을 전부
-  `context.request`로 보낸다. 주문번호(560907010024)에는 연도가 없어 주문일은 주문상세의
+  한 번·만료 30초 전이나 401이면 다시) 주문상세(0.07초)·유형 목록(배치에 한 번)·상담내역·
+  등록을 전부 `context.request`로 보낸다. 세션 화면은 주문번호가 그려지기를 기다리지 않고
+  토큰·회원정보가 생기는 즉시(`wait_for_function`, 외부 스크립트는 페이지 라우팅으로 끊음)
+  읽어 0.71초→0.58초(2026-09-09 4회 중앙값), 둘째 건부터는 유형 확인도 안 해 한 건 0.14초. 주문번호(560907010024)에는 연도가 없어 주문일은 주문상세의
   orderDttm으로 본다. 취소/품절은 상품 줄의 orderRtnClssfCdNm·reltStatCdNm(주문·출고지시 등)만 본다.
 - **NS홈쇼핑도 폼 없이 그 POST를 바로 보낸다** (`_submit_via_api`). 화면 JS가 만드는 본문
   `{title, ctnt, custNm, boardClssfCd:"Q", confGb:"01", largeCaCd:"2", mediumCaCd:"31",

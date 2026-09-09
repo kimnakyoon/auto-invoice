@@ -393,6 +393,8 @@ INQUIRY_ALLOWED_HOSTS = ("nsmall.com",)
 # 와 상담내역 캐시 {"rows": [...최신순], "pages": n, "total": n}. prepare_inquiries가 비운다.
 _inquiry_session_cache: dict[int, dict] = {}
 _inquiry_rows_cache: dict[int, dict] = {}
+# 유형 코드 확인은 배치에 한 번이면 된다 (유형 목록 두 번 = 0.06초/건).
+_inquiry_types_checked: set[int] = set()
 
 READ_SESSION_JS = """() => {
   const app = document.querySelector('#app') || document.body.firstElementChild;
@@ -408,6 +410,7 @@ def prepare_inquiries(context: BrowserContext, product_urls, headless: bool = Fa
     """새 배치 - 앞 배치에서 읽어둔 세션·상담내역 캐시를 비운다."""
     _inquiry_session_cache.pop(id(context), None)
     _inquiry_rows_cache.pop(id(context), None)
+    _inquiry_types_checked.discard(id(context))
 
 
 def _token_expiry(token: str) -> float:
@@ -430,22 +433,53 @@ def _format_phone(digits: str) -> str:
     return digits
 
 
+SESSION_OR_LOGIN_JS = """([pw]) => {
+  const app = document.querySelector('#app') || document.body.firstElementChild;
+  const vapp = app && app.__vue_app__;
+  const pinia = vapp && vapp.config.globalProperties.$pinia;
+  const store = pinia && pinia._s.get('userStore');
+  const cust = (store && store.$state && store.$state.custInfo) || {};
+  return (!!sessionStorage.getItem('access_token') && !!cust.custNm) || !!document.querySelector(pw);
+}"""
+
+
+def _wait_for_session(page: Page, product_url: str, order_no: str, timeout_ms: int) -> dict:
+    """주문상세 주소를 열고 토큰·회원 이름이 생기는 즉시 읽는다 - 주문번호가 그려질 때까지 기다리지 않는다.
+
+    실측(2026-09-09): 토큰·회원정보는 0.47~0.61초, 주문번호 렌더는 0.70~0.99초 - 화면 안에서
+    도는 wait_for_function으로 기다리면 세션 읽기가 0.71초→0.58초(4회 중앙값). 로그인 화면
+    (비밀번호 칸)이 먼저 뜨면 자동 로그인하고 한 번 더 기다린다 - 로그인되면 사이트가
+    주문상세로 스스로 돌아오며 새 토큰을 받는다.
+    """
+    page.goto(product_url, wait_until="domcontentloaded")
+    for attempt in range(2):
+        try:
+            page.wait_for_function(SESSION_OR_LOGIN_JS, arg=[LOGIN_PW_SELECTOR], timeout=timeout_ms)
+        except PlaywrightTimeoutError:
+            raise BlockedError(f"NS홈쇼핑 화면에서 로그인 토큰(access_token)을 읽지 못했습니다 "
+                               f"(주문번호={order_no}, 현재 주소={page.url}).") from None
+        found = page.evaluate(READ_SESSION_JS)
+        token = found.get("token") or ""
+        if token and found.get("cust_nm") and _token_expiry(token) - time.time() > INQUIRY_TOKEN_MARGIN_SEC:
+            return found
+        if attempt == 0 and page.locator(LOGIN_PW_SELECTOR).count() > 0:
+            common.safe_print("[nsmall] 로그인 세션이 없어 자동 로그인을 시도합니다.")
+            _auto_login(page)
+            continue
+        break
+    raise ParseError("NS홈쇼핑 화면에서 회원 이름(userStore.custInfo)이나 살아 있는 토큰을 읽지 못했습니다 - 문의 등록에 필요합니다.")
+
+
 def _read_session(context: BrowserContext, product_url: str, order_no: str) -> dict:
     """주문상세 화면을 열어(로그인이 필요하면 하고) accessToken·회원 이름·전화를 읽는다."""
     page = context.new_page()
+    page.route("**/*", _guard_inquiry_page)   # 분석·광고 스크립트를 끊으면 화면이 더 빨리 뜬다
     try:
-        _open_order_screen(page, product_url, order_no)
-        found = page.evaluate(READ_SESSION_JS)
+        found = _wait_for_session(page, product_url, order_no, common.RENDER_WAIT_TIMEOUT_MS)
     finally:
         page.close()
-    token = found.get("token") or ""
-    expires = _token_expiry(token)
-    if not token or expires <= time.time():
-        raise BlockedError("NS홈쇼핑 화면에서 로그인 토큰(access_token)을 읽지 못했습니다.")
-    if not found.get("cust_nm"):
-        raise ParseError("NS홈쇼핑 화면에서 회원 이름(userStore.custInfo)을 읽지 못했습니다 - 문의 등록에 필요합니다.")
-    return {"bearer": f"Bearer {token}", "cust_nm": found["cust_nm"],
-            "phone": _format_phone(found.get("phone") or ""), "expires": expires}
+    return {"bearer": f"Bearer {found['token']}", "cust_nm": found["cust_nm"],
+            "phone": _format_phone(found.get("phone") or ""), "expires": _token_expiry(found["token"])}
 
 
 def _inquiry_session(context: BrowserContext, product_url: str, order_no: str, *,
@@ -628,7 +662,9 @@ def _inquiry_payload(session: dict, order: dict, message: str) -> dict:
 
 
 def _check_inquiry_types(context: BrowserContext, product_url: str, order_no: str) -> None:
-    """유형 코드가 여전히 [배송·수거]>[배송문의]>[배송일(시간)문의]인지 유형 목록 API로 확인한다."""
+    """유형 코드가 여전히 [배송·수거]>[배송문의]>[배송일(시간)문의]인지 유형 목록 API로 확인한다 (배치에 한 번)."""
+    if id(context) in _inquiry_types_checked:
+        return
     mediums = _api_logged_in(context, product_url, order_no, INQUIRY_TYPE_LIST_URL.format(large=INQUIRY_TYPE_LARGE)) or []
     medium = next((m for m in mediums if str(m.get("csClssfNum")) == INQUIRY_TYPE_MEDIUM), None)
     if medium is None or str(medium.get("csClssfNm") or "").strip() != INQUIRY_TYPE_MEDIUM_LABEL:
@@ -639,6 +675,7 @@ def _check_inquiry_types(context: BrowserContext, product_url: str, order_no: st
     if small is None or str(small.get("csClssfNm") or "").strip() != INQUIRY_TYPE_SMALL_LABEL:
         raise ParseError(f"[{INQUIRY_TYPE_MEDIUM_LABEL}]의 소분류에 [{INQUIRY_TYPE_SMALL_LABEL}]({INQUIRY_TYPE_SMALL})이 없습니다 "
                          f"(목록: {[s.get('csClssfNm') for s in smalls]}).")
+    _inquiry_types_checked.add(id(context))
 
 
 def _submit_via_api(context: BrowserContext, product_url: str, order: dict, message: str) -> str | None:
