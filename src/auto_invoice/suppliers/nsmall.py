@@ -363,7 +363,8 @@ INQUIRY_HISTORY_RETRY_GAP_SEC = 1.0
 INQUIRY_HISTORY_MAX_PAGES = 5         # '이미 남겼는지' 훑는 상담내역 페이지 수
 INQUIRY_TOKEN_MARGIN_SEC = 30         # accessToken 만료가 이보다 가까우면 화면을 다시 열어 받는다
 # 화면의 axios가 mapi 요청마다 붙이는 헤더 (2026-09-09 가로채기로 확인). 읽기 GET은 authorization만
-# 있어도 200이지만, 등록 POST를 이 둘 없이 보냈더니 400이었다(그날 첫 실등록은 화면 경로로 남김).
+# 있어도 200이지만, 등록 POST를 accpt-path-cd·ptn-cd 없이 보냈더니 400이었다(그날 첫 실등록은 화면
+# 경로로 남김). 둘을 붙이니 통과 - 같은 날 두 번째 실등록(560908003321 → 문의번호 260909011483, 0.17초).
 INQUIRY_API_HEADERS = {"origin": "https://m.nsmall.com", "referer": "https://m.nsmall.com/",
                        "accept": "application/json, text/plain, */*",
                        "accpt-path-cd": "100", "ptn-cd": "110"}
@@ -656,7 +657,8 @@ def _submit_via_api(context: BrowserContext, product_url: str, order: dict, mess
             raise
         common.safe_print(f"[nsmall] 등록 요청이 거부돼 화면으로 남깁니다 ({e}).")
         return None
-    return f"등록 요청 보냄 (직행, resultCode 0000{', 응답 ' + str(result)[:60] if result else ''})"
+    # resultData는 새 문의번호(custCmplnNum)다 - 2026-09-09 실등록 260909011483로 확인.
+    return f"등록 요청 보냄 (직행, resultCode 0000{', 문의번호 ' + str(result)[:20] if result else ''})"
 
 
 def _guard_inquiry_page(route) -> None:

@@ -430,16 +430,18 @@ python scripts/run_all.py --stop-before-apply   # 일괄등록까지만, 마지�
   한 번·만료 30초 전이나 401이면 다시) 주문상세(0.07초)·유형 목록·상담내역·등록을 전부
   `context.request`로 보낸다. 주문번호(560907010024)에는 연도가 없어 주문일은 주문상세의
   orderDttm으로 본다. 취소/품절은 상품 줄의 orderRtnClssfCdNm·reltStatCdNm(주문·출고지시 등)만 본다.
-- **NS홈쇼핑 직행 POST는 아직 검증 전이다.** 화면 JS가 만드는 본문
+- **NS홈쇼핑도 폼 없이 그 POST를 바로 보낸다** (`_submit_via_api`). 화면 JS가 만드는 본문
   `{title, ctnt, custNm, boardClssfCd:"Q", confGb:"01", largeCaCd:"2", mediumCaCd:"31",
   smallCaCd:"485", orderNum, orderSeq(상품의 maxOrderSeq), mobilDdd/Htel/Num}`을 그대로 만들어
   (`_inquiry_payload` - 폼 경로의 POST를 페이지 라우팅 안에서 가짜 응답으로 받아 키·값이
   전부 같음을 확인) 보내는데, 2026-09-09 첫 실등록(사용자가 고른 560907010024 CHI MICHAEL
   CHRISTOPHER)에서 이 요청이 **HTTP 400**으로 거부돼 화면 경로로 남겨졌다(문의번호 260909011324
   '답변대기', 한 건 7.2초). 화면의 axios는 `accpt-path-cd: 100`·`ptn-cd: 110`·`content-type:
-  application/json;charset=UTF-8`를 더 붙이므로 그 헤더를 맞춰 두었고(읽기 GET은 없어도 200),
-  다음 실제 등록 때 통하는지 본다 - 거부되면 오늘 자 상담내역을 한 번 보고 화면 경로로 간다.
-  그날은 제목 잘림 때문에 등록 뒤 상담내역 대조가 실패해 결과가 '실패'로 적혔고(실제로는
+  application/json;charset=UTF-8`를 더 붙이는데(읽기 GET은 없어도 200) 이 둘이 빠진 탓이었다.
+  헤더를 맞춘 뒤 **직행 첫 실등록**(사용자가 고른 2026-09-08 주문 560908003321 김태현 → 문의번호
+  260909011483 '답변대기', 응답 resultData가 곧 문의번호, 주문상세·상담내역 확인 포함 한 건
+  0.17초) - 정식 경로 검증 완료. 거부되면 오늘 자 상담내역을 한 번 보고 화면 경로로 간다.
+  첫날은 제목 잘림 때문에 등록 뒤 상담내역 대조가 실패해 결과가 '실패'로 적혔고(실제로는
   올라감) 장부에는 손으로 적었다 - 대조 규칙을 '문구의 앞부분'으로 고쳤다.
 - **결과는 바탕화면 `문의결과_*.xlsx`** 로도 남긴다 (`save_result_excel`). 송장조회
   결과 엑셀과 같은 생김새이고, 정렬은 실패 → 미지원 사이트 넘김 → 남김 →
