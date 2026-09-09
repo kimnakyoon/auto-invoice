@@ -198,7 +198,7 @@ python scripts/run_all.py --stop-before-apply   # 일괄등록까지만, 마지�
 - **장부로 중복을 막는다.** 남긴 주문은 `logs/inquiries.json` 에 마켓
   주문번호로 적고, 다시 돌려도 그 주문은 넘긴다. 한 건 남길 때마다 바로
   적어서 도중에 멈춰도 남긴 건은 장부에 있다.
-- **어댑터에 `post_inquiry`가 있는 사이트만** 남긴다 (지금은 롯데온·지마켓·SSG·네이버·GSSHOP·롯데아이몰). 나머지는
+- **어댑터에 `post_inquiry`가 있는 사이트만** 남긴다 (지금은 롯데온·지마켓·SSG·네이버·GSSHOP·롯데아이몰·NS홈쇼핑). 나머지는
   '아직 지원하지 않음'으로 결과에 남겨 사람이 직접 하게 한다. 사이트별로
   브라우저 하나를 열어 한 건씩, 송장조회와 같은 요청 간격으로 남긴다.
   송장조회처럼 `WANTS_CDP_CHROME` 어댑터(지마켓)는 우리가 직접 띄운 진짜
@@ -400,6 +400,47 @@ python scripts/run_all.py --stop-before-apply   # 일괄등록까지만, 마지�
   준비(폼 HTML+소분류+중복확인) 0.33초 vs 폼 경로 1.4초. **직행 첫 실등록**은 사용자가 고른
   오늘 주문 20260908J90935 최성만 → 문의번호 646349407 '접수'(HTTP 200, 주문상세·상담내역
   확인 포함 한 건 2.15초, 첫 요청 연결 데우기 포함) - 정식 경로 검증 완료.
+- **NS홈쇼핑 화면 순서** (2026-09-09 실측, 사용자 지시: 주문번호 복사 → 오른쪽 메뉴 [고객센터]
+  → 가운데 [1:1 문의] → [배송수거] → 문의유형 [배송문의] → 주문번호로 상품 선택 → 제목·내용
+  → [문의하기] → 상담내역 [1:1문의]에서 확인): 고객센터는 고정 주소 `m.nsmall.com/customer-center`
+  이고 [1:1문의](`a.inquiry-btn`)는 주소 이동 없이 레이어(`div.modal-inquiry-privacy`)를 띄운다.
+  문의 유형은 체크박스 [배송·수거](largeCaCd 2) → 유형 목록 API(`customercenter/qst-cscate?
+  largeCaCd=2`)로 온 중분류를 커스텀 드롭다운(`.dropdown-wrap button.result-item` →
+  `button.contents-item`)에서 [배송문의](31) → 소분류는 [배송일(시간)문의](485) 하나라 자동
+  (숨은 `input[name=custom-select-01/02]`로 확인). [상품 선택] 레이어(`div.modal-inquiry-goods-select`)
+  는 주문목록 API(`order/order-list`, 최근 1개월 10건씩, 아래 페이지 번호 버튼)를 그리고
+  주문마다 `div.goods-status-wrap`(`span.order-number b`=주문번호, 상품마다 `button.choice-btn`)
+  이라 이 주문번호 묶음의 [선택]을 누르고(없으면 다음 페이지 번호를 눌러 최대 10쪽), 고른
+  상품 이름이 주문상세의 상품과 같은지 본다. 제목 `#title`은 **25자 제한**(긴 수령인은
+  `CHI MICHAEL CHRISTOPHER 배`처럼 잘린다 - 내용 `textarea`(200자)에는 다 들어간다), SMS 답변
+  알림은 기본 체크·전화번호는 회원 정보로 미리 채워짐 → [문의하기] → JSON POST
+  `mapi.nsmall.com/or/api/v1/cust/customercenter/qst` → `{"data":{"resultCode":"0000"}}` →
+  레이어가 닫히고 상담내역으로 간다(alert·confirm 없음). 화면 경로 2.6초(가짜 응답 검증,
+  2페이지 주문 3.1초).
+- **NS홈쇼핑 상담내역** = `customercenter/qst?pageNum=N&pageSize=10`(최신순, custCmplnNum·goodsCd·
+  largeCaCd '배송'·ansrYn·qstDate·title). 목록에도 상세(`qst-dtl`)에도 **주문번호가 없어**
+  상품코드(goodsCd)로 맞춘다 - 제목이 우리 문구의 앞부분(25자 잘림)이거나 '배송 언제'가 든
+  [배송] 문의가 주문일 이후에 있으면 `AlreadyInquired`(첫 실측 0.93초, 캐시 0.04초). 같은
+  상품을 며칠 사이 두 번 주문했으면 앞 주문의 문의가 뒤 주문 것으로 보일 수 있다(넘김으로
+  적히니 결과 엑셀에서 확인). 등록 뒤 오늘 자로 올라갔는지 1초 간격 3번까지 본다.
+- **NS홈쇼핑 세션은 화면에서 한 번 읽는다.** mapi 요청은 Bearer accessToken(JWT 15분,
+  `sessionStorage.access_token`)이 있어야 하고, 등록 본문의 회원 이름·전화는 API 응답에는
+  `[ENC]` 암호문으로만 오는데 화면의 Pinia 저장소 `userStore.custInfo`에 복호화돼 있다.
+  주문상세 화면을 한 번 열어(만료됐으면 자동 로그인) 셋을 읽어두고(`_read_session`, 배치에
+  한 번·만료 30초 전이나 401이면 다시) 주문상세(0.07초)·유형 목록·상담내역·등록을 전부
+  `context.request`로 보낸다. 주문번호(560907010024)에는 연도가 없어 주문일은 주문상세의
+  orderDttm으로 본다. 취소/품절은 상품 줄의 orderRtnClssfCdNm·reltStatCdNm(주문·출고지시 등)만 본다.
+- **NS홈쇼핑 직행 POST는 아직 검증 전이다.** 화면 JS가 만드는 본문
+  `{title, ctnt, custNm, boardClssfCd:"Q", confGb:"01", largeCaCd:"2", mediumCaCd:"31",
+  smallCaCd:"485", orderNum, orderSeq(상품의 maxOrderSeq), mobilDdd/Htel/Num}`을 그대로 만들어
+  (`_inquiry_payload` - 폼 경로의 POST를 페이지 라우팅 안에서 가짜 응답으로 받아 키·값이
+  전부 같음을 확인) 보내는데, 2026-09-09 첫 실등록(사용자가 고른 560907010024 CHI MICHAEL
+  CHRISTOPHER)에서 이 요청이 **HTTP 400**으로 거부돼 화면 경로로 남겨졌다(문의번호 260909011324
+  '답변대기', 한 건 7.2초). 화면의 axios는 `accpt-path-cd: 100`·`ptn-cd: 110`·`content-type:
+  application/json;charset=UTF-8`를 더 붙이므로 그 헤더를 맞춰 두었고(읽기 GET은 없어도 200),
+  다음 실제 등록 때 통하는지 본다 - 거부되면 오늘 자 상담내역을 한 번 보고 화면 경로로 간다.
+  그날은 제목 잘림 때문에 등록 뒤 상담내역 대조가 실패해 결과가 '실패'로 적혔고(실제로는
+  올라감) 장부에는 손으로 적었다 - 대조 규칙을 '문구의 앞부분'으로 고쳤다.
 - **결과는 바탕화면 `문의결과_*.xlsx`** 로도 남긴다 (`save_result_excel`). 송장조회
   결과 엑셀과 같은 생김새이고, 정렬은 실패 → 미지원 사이트 넘김 → 남김 →
   이미 남긴 주문 순 - 앞의 둘이 사람이 직접 남겨야 하는 건이다.

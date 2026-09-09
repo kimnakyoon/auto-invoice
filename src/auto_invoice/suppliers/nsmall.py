@@ -34,25 +34,34 @@
   normalize_option으로 공백/구분자를 지우고 비교한다. 나머지 값들("결제완료",
   "배송준비중", "주문접수")은 다른 어댑터에서 흔히 보이는 값으로 추정해둔 것이라
   다르게 나오면 조정이 필요하다.
+- 1:1 문의 남기기(post_inquiry)는 아래 '1:1 문의 남기기' 구간에 실측을 적어뒀다 (2026-09-09).
 """
 
 from __future__ import annotations
 
+import base64
+import contextlib
+import json
 import os
 import re
+import time
+from datetime import date, datetime
 from urllib.parse import parse_qs, urlparse
 
 from dotenv import load_dotenv
 from playwright.sync_api import BrowserContext, Page
+from playwright.sync_api import TimeoutError as PlaywrightTimeoutError
 
 from ..models import TrackingResult
 from . import common
 from .base import (
+    AlreadyInquired,
     BlockedError,
     ParseError,
     TrackingNotAvailableYet,
     normalize_option,
     raise_if_cancelled,
+    raise_if_cancelled_any,
     with_order_date,
 )
 
@@ -291,3 +300,502 @@ def get_tracking(
         return with_order_date(page, lambda: _scrape_tracking_from_page(page, order_no, order_option))
     finally:
         page.close()
+
+
+# ---------------------------------------------------------------------------
+# 1:1 문의 남기기 (post_inquiry) - 2026-09-09 실측
+#
+# 사용자 지시 순서: 주문상세에서 주문번호를 복사 → 오른쪽 메뉴 [고객센터] →
+# 가운데 [1:1문의] → 문의 유형 [배송·수거] → 문의유형 [배송문의] → 주문번호로 상품
+# 선택 → 제목·내용 "수취인명 배송 언제 시작하나요?" → [문의하기] → 오른쪽 메뉴
+# [상담내역 > 1:1 문의]에서 등록 확인.
+#
+# 실측:
+# - 고객센터는 고정 주소 m.nsmall.com/customer-center. 가운데 [1:1문의](a.inquiry-btn)는
+#   주소 이동 없이 같은 페이지 위에 레이어(div.modal-inquiry-privacy)를 띄운다.
+#   문의 유형은 체크박스(label > span "배송·수거") → GET customercenter/qst-cscate?largeCaCd=2
+#   로 중분류 [배송문의(31)·수거문의(749)]가 오고, 커스텀 드롭다운(.dropdown-wrap
+#   button.result-item → button.contents-item)에서 [배송문의]를 고르면 소분류
+#   (qst-cscate?mediumCaCd=31)는 [배송일(시간)문의(485)] 하나뿐이라 자동으로 잡힌다
+#   (숨은 input[name=custom-select-01]=31, custom-select-02=485).
+# - [상품 선택](button.goods-select-btn)은 두 번째 레이어(div.modal-inquiry-goods-select)에
+#   주문목록 API(order/order-list, 최근 1개월, 10건씩·아래 페이지 번호 버튼 ul.pagination-wrap)를
+#   그린다 - 주문마다 div.goods-status-wrap(span.order-number b = 주문번호, 상품마다 li와 button.choice-btn).
+# - 제목 #title(최대 25자)·내용 textarea(최대 200자, 최소 4자)·SMS 답변 알림(#sms, 기본
+#   체크, 전화번호 #inputField는 회원 정보로 미리 채워짐) → [문의하기](.layer-bottom
+#   button.button, 채우기 전엔 disabled).
+# - 등록 = POST mapi.nsmall.com/or/api/v1/cust/customercenter/qst (JSON, Bearer
+#   accessToken). 사이트 JS(modal-inquiry-privacy 컴포넌트)가 만드는 본문:
+#   {title, ctnt, custNm: userStore.custInfo.custNm, boardClssfCd:"Q", confGb: SMS면 "01",
+#    largeCaCd:"2", mediumCaCd:"31", smallCaCd:"485", orderNum: Number, orderSeq: 고른
+#    상품의 maxOrderSeq, mobilDdd/mobilHtel/mobilNum: 전화번호를 '-'로 나눈 셋}.
+#   응답 {"data":{"resultCode":"0000",...}} → 레이어가 닫히고 상담내역 목록으로 간다
+#   (alert/confirm 없음).
+# - 상담내역 [1:1 문의] = GET customercenter/qst?pageNum=N&pageSize=10 (최신순,
+#   custCmplnNum·goodsCd·goodsNm·largeCaCd "배송"·ansrYn·qstDate "2026.09.08"·title).
+#   상세 POST customercenter/qst-dtl {custCmplnNum} 에도 주문번호는 없다 - 상품코드
+#   (goodsCd)와 제목·문의일로 이 주문의 문의인지 맞춘다.
+# - 세션: accessToken(JWT, 15분)은 sessionStorage 'access_token'에, 회원 이름·전화는
+#   Vue 3 Pinia 저장소 userStore.custInfo(custNm, phoneNum - API 응답은 [ENC] 암호문인데
+#   화면이 복호화해 둔다)에 있다. 화면을 한 번 열어(로그인 포함) 읽어두고 그 값으로
+#   주문상세·상담내역·등록을 전부 요청으로 처리한다 - 화면 경로는 폴백.
+# ---------------------------------------------------------------------------
+INQUIRY_API_BASE = "https://mapi.nsmall.com/or/api/v1"
+INQUIRY_POST_URL = INQUIRY_API_BASE + "/cust/customercenter/qst"
+INQUIRY_LIST_URL = INQUIRY_API_BASE + "/cust/customercenter/qst?pageNum={page}&pageSize={size}"
+INQUIRY_TYPE_LIST_URL = INQUIRY_API_BASE + "/cust/customercenter/qst-cscate?largeCaCd={large}"
+INQUIRY_SUBTYPE_LIST_URL = INQUIRY_API_BASE + "/cust/customercenter/qst-cscate?mediumCaCd={medium}"
+ORDER_DETAIL_API_URL = INQUIRY_API_BASE + "/order/order/order-detail?orderNum={order_no}&reqSpr=mobile"
+INQUIRY_LIST_PAGE_SIZE = 10
+INQUIRY_TYPE_LARGE = "2"              # 문의 유형 [배송·수거]
+INQUIRY_TYPE_LARGE_LABEL = "배송·수거"
+INQUIRY_TYPE_MEDIUM = "31"            # 문의유형 [배송문의]
+INQUIRY_TYPE_MEDIUM_LABEL = "배송문의"
+INQUIRY_TYPE_SMALL = "485"            # 소분류 [배송일(시간)문의] - 배송문의의 유일한 소분류라 자동 선택
+INQUIRY_TYPE_SMALL_LABEL = "배송일(시간)문의"
+INQUIRY_LIST_CATEGORY = "배송"        # 상담내역 largeCaCd에 찍히는 [배송·수거]의 이름
+INQUIRY_TITLE_MAX = 25
+INQUIRY_CONTENT_MAX = 200
+INQUIRY_SAME_MARK = "배송 언제"       # 상담내역에서 '같은 문의'로 보는 표식 (상품코드와 함께) - 사람이 남긴 것용
+INQUIRY_TITLE_MIN = 4                 # 사이트의 최소 글자 수 - 이보다 짧은 제목은 문구 앞부분으로 치지 않는다
+INQUIRY_HISTORY_TRIES = 3             # 등록 뒤 목록에 아직 안 보이면 이만큼 다시 본다
+INQUIRY_HISTORY_RETRY_GAP_SEC = 1.0
+INQUIRY_HISTORY_MAX_PAGES = 5         # '이미 남겼는지' 훑는 상담내역 페이지 수
+INQUIRY_TOKEN_MARGIN_SEC = 30         # accessToken 만료가 이보다 가까우면 화면을 다시 열어 받는다
+# 화면의 axios가 mapi 요청마다 붙이는 헤더 (2026-09-09 가로채기로 확인). 읽기 GET은 authorization만
+# 있어도 200이지만, 등록 POST를 이 둘 없이 보냈더니 400이었다(그날 첫 실등록은 화면 경로로 남김).
+INQUIRY_API_HEADERS = {"origin": "https://m.nsmall.com", "referer": "https://m.nsmall.com/",
+                       "accept": "application/json, text/plain, */*",
+                       "accpt-path-cd": "100", "ptn-cd": "110"}
+INQUIRY_POST_CONTENT_TYPE = "application/json;charset=UTF-8"
+
+CUSTOMER_CENTER_URL = "https://m.nsmall.com/customer-center"
+INQUIRY_OPEN_BUTTON = "a.inquiry-btn"
+INQUIRY_MODAL = "div.modal-inquiry-privacy"
+INQUIRY_GOODS_MODAL = "div.modal-inquiry-goods-select"
+INQUIRY_TYPE_DROPDOWN = INQUIRY_MODAL + " .dropdown-wrap"
+INQUIRY_TYPE_MEDIUM_INPUT = INQUIRY_MODAL + " input[name=custom-select-01]"
+INQUIRY_TYPE_SMALL_INPUT = INQUIRY_MODAL + " input[name=custom-select-02]"
+INQUIRY_GOODS_BUTTON = INQUIRY_MODAL + " button.goods-select-btn"
+INQUIRY_GOODS_BLOCK = INQUIRY_GOODS_MODAL + " .goods-status-wrap"
+INQUIRY_GOODS_PAGING = INQUIRY_GOODS_MODAL + " .pagination-wrap"
+INQUIRY_GOODS_LIST_API = "/order/order/order-list?"
+INQUIRY_GOODS_CHOSEN_NAME = INQUIRY_MODAL + " .goods-inquiry-wrap .goods-name"
+INQUIRY_TITLE = INQUIRY_MODAL + " #title"
+INQUIRY_CONTENT = INQUIRY_MODAL + " textarea"
+INQUIRY_SUBMIT = INQUIRY_MODAL + " .layer-bottom button.button"
+INQUIRY_STEP_WAIT_MS = 10000          # 레이어·드롭다운·상품목록·등록 응답까지 최대
+INQUIRY_GOODS_PAGE_MAX = 10           # 상품 선택 레이어에서 주문을 찾을 때까지 넘겨 보는 페이지 수 (10건씩)
+INQUIRY_ALLOWED_HOSTS = ("nsmall.com",)
+
+# 이 실행(컨텍스트)에서 화면을 열어 읽어둔 세션 {"bearer", "cust_nm", "phone", "expires"}
+# 와 상담내역 캐시 {"rows": [...최신순], "pages": n, "total": n}. prepare_inquiries가 비운다.
+_inquiry_session_cache: dict[int, dict] = {}
+_inquiry_rows_cache: dict[int, dict] = {}
+
+READ_SESSION_JS = """() => {
+  const app = document.querySelector('#app') || document.body.firstElementChild;
+  const vapp = app && app.__vue_app__;
+  const pinia = vapp && vapp.config.globalProperties.$pinia;
+  const store = pinia && pinia._s.get('userStore');
+  const cust = (store && store.$state && store.$state.custInfo) || {};
+  return {token: sessionStorage.getItem('access_token'), cust_nm: cust.custNm || null, phone: cust.phoneNum || null};
+}"""
+
+
+def prepare_inquiries(context: BrowserContext, product_urls, headless: bool = False) -> None:
+    """새 배치 - 앞 배치에서 읽어둔 세션·상담내역 캐시를 비운다."""
+    _inquiry_session_cache.pop(id(context), None)
+    _inquiry_rows_cache.pop(id(context), None)
+
+
+def _token_expiry(token: str) -> float:
+    """JWT의 exp(초, epoch). 못 읽으면 0 - 만료로 친다."""
+    try:
+        payload = token.split(".")[1]
+        payload += "=" * (-len(payload) % 4)
+        return float(json.loads(base64.urlsafe_b64decode(payload)).get("exp") or 0)
+    except Exception:  # noqa: BLE001 - 형식이 다르면 만료로 보고 다시 받는다
+        return 0.0
+
+
+def _format_phone(digits: str) -> str:
+    """01022178032 -> 010-2217-8032 (화면의 답변 알림 칸이 이렇게 채운다)."""
+    digits = re.sub(r"[^0-9]", "", digits or "")
+    if len(digits) == 11:
+        return f"{digits[:3]}-{digits[3:7]}-{digits[7:]}"
+    if len(digits) == 10:
+        return f"{digits[:3]}-{digits[3:6]}-{digits[6:]}"
+    return digits
+
+
+def _read_session(context: BrowserContext, product_url: str, order_no: str) -> dict:
+    """주문상세 화면을 열어(로그인이 필요하면 하고) accessToken·회원 이름·전화를 읽는다."""
+    page = context.new_page()
+    try:
+        _open_order_screen(page, product_url, order_no)
+        found = page.evaluate(READ_SESSION_JS)
+    finally:
+        page.close()
+    token = found.get("token") or ""
+    expires = _token_expiry(token)
+    if not token or expires <= time.time():
+        raise BlockedError("NS홈쇼핑 화면에서 로그인 토큰(access_token)을 읽지 못했습니다.")
+    if not found.get("cust_nm"):
+        raise ParseError("NS홈쇼핑 화면에서 회원 이름(userStore.custInfo)을 읽지 못했습니다 - 문의 등록에 필요합니다.")
+    return {"bearer": f"Bearer {token}", "cust_nm": found["cust_nm"],
+            "phone": _format_phone(found.get("phone") or ""), "expires": expires}
+
+
+def _inquiry_session(context: BrowserContext, product_url: str, order_no: str, *,
+                     refresh: bool = False) -> dict:
+    """읽어둔 세션. 없거나 토큰이 곧 만료(15분짜리)면 화면을 다시 열어 받는다."""
+    cached = _inquiry_session_cache.get(id(context))
+    if refresh or cached is None or cached["expires"] - time.time() < INQUIRY_TOKEN_MARGIN_SEC:
+        cached = _read_session(context, product_url, order_no)
+        _inquiry_session_cache[id(context)] = cached
+    return cached
+
+
+def _api(context: BrowserContext, session: dict, url: str, *, data: dict | None = None):
+    """mapi 요청 한 번 - 정상이면 resultData, 401이면 None(토큰 만료), 그 밖의 오류는 ParseError."""
+    headers = {"authorization": session["bearer"], **INQUIRY_API_HEADERS}
+    if data is not None:
+        headers["content-type"] = INQUIRY_POST_CONTENT_TYPE
+    short = url.split("/v1/")[-1]
+    try:
+        response = (context.request.post(url, data=data, headers=headers) if data is not None
+                    else context.request.get(url, headers=headers))
+    except Exception as e:  # noqa: BLE001 - 통신 실패
+        raise ParseError(f"NS홈쇼핑 요청에 실패했습니다 ({short}: {e}).") from None
+    if response.status == 401:
+        return None
+    if not response.ok:
+        raise ParseError(f"NS홈쇼핑 요청이 거부됐습니다 (HTTP {response.status}, {short}).")
+    try:
+        body = response.json()
+    except Exception:  # noqa: BLE001 - JSON이 아니면 화면이 바뀐 것
+        raise ParseError(f"NS홈쇼핑 응답이 JSON이 아닙니다 ({short}).") from None
+    data_part = (body or {}).get("data") or {}
+    if str(data_part.get("resultCode")) != "0000":
+        raise ParseError(f"NS홈쇼핑이 요청을 거절했습니다 ({short}: "
+                         f"{data_part.get('resultCode')} {data_part.get('resultMessage')}).")
+    return data_part.get("resultData")
+
+
+def _api_logged_in(context: BrowserContext, product_url: str, order_no: str, url: str, *,
+                   data: dict | None = None):
+    """_api에 토큰 만료(401)면 화면을 다시 열어 로그인·토큰을 새로 받고 한 번 더."""
+    session = _inquiry_session(context, product_url, order_no)
+    result = _api(context, session, url, data=data)
+    if result is None:
+        common.safe_print("[nsmall] 로그인 토큰이 만료돼 화면을 다시 열어 받습니다.")
+        session = _inquiry_session(context, product_url, order_no, refresh=True)
+        result = _api(context, session, url, data=data)
+        if result is None:
+            raise BlockedError("NS홈쇼핑 로그인 토큰을 새로 받았는데도 요청이 401입니다.")
+    return result
+
+
+def _order_for_inquiry(context: BrowserContext, product_url: str, order_no: str) -> dict:
+    """주문상세 API에서 문의할 상품(첫 상품)의 코드·이름·순번을 읽고 취소/품절이면 올린다.
+
+    상태는 상품 줄의 orderRtnClssfCdNm(주문/취소...)·reltStatCdNm(출고지시/출고완료...)만
+    본다. '준비 중'(TrackingNotAvailableYet)은 문의 대상 그 자체라 지나간다.
+    """
+    detail = _api_logged_in(context, product_url, order_no, ORDER_DETAIL_API_URL.format(order_no=order_no)) or {}
+    orders = detail.get("orders") or {}
+    if str(orders.get("orderNum") or "") != order_no:
+        raise ParseError(f"주문상세가 열리지 않았습니다 (주문번호={order_no}).")
+    items = [it for ship in (orders.get("ships") or [])
+             for it in ((ship.get("dlvrOrderItems") or []) + (ship.get("pickOrderItems") or []))
+             if str(it.get("orderNum") or order_no) == order_no]
+    if not items:
+        raise ParseError(f"주문상세에 상품이 없습니다 (주문번호={order_no}).")
+    statuses = [f"{it.get('orderRtnClssfCdNm') or ''} {it.get('reltStatCdNm') or ''}".strip() for it in items]
+    with contextlib.suppress(TrackingNotAvailableYet):
+        raise_if_cancelled_any(statuses, order_no)
+    first = items[0]
+    if not first.get("goodsCd"):
+        raise ParseError(f"주문상세 상품에 상품코드(goodsCd)가 없습니다 (주문번호={order_no}).")
+    try:   # 주문번호에는 연도가 없어(560907010024) 주문일은 orderDttm("20260907")에서
+        order_date = datetime.strptime(str(orders.get("orderDttm") or "")[:8], "%Y%m%d").date()
+    except ValueError:
+        order_date = None
+    return {"order_no": order_no, "goods_cd": str(first["goodsCd"]), "goods_nm": str(first.get("goodsNm") or "").strip(),
+            "order_seq": int(first.get("maxOrderSeq") or 1), "statuses": statuses, "order_date": order_date}
+
+
+def _parse_inquiry_rows(items: list[dict]) -> list[dict]:
+    rows: list[dict] = []
+    for it in items or []:
+        try:
+            written = datetime.strptime(str(it.get("qstDate") or ""), "%Y.%m.%d").date()
+        except ValueError:
+            continue
+        rows.append({
+            "inquiry_id": str(it.get("custCmplnNum") or ""),
+            "goods_cd": str(it.get("goodsCd") or ""),
+            "category": str(it.get("largeCaCd") or "").strip(),
+            "title": str(it.get("title") or "").strip(),
+            "written_on": written,
+            "state": "답변완료" if str(it.get("ansrYn")) == "Y" else "답변대기",
+        })
+    return rows
+
+
+def _fetch_inquiry_page(context: BrowserContext, product_url: str, order_no: str, page_no: int) -> tuple[list[dict], int]:
+    """상담내역 한 페이지 (줄들, 전체 건수). 못 읽으면 ParseError - 모르는 채로 등록하지 않는다."""
+    result = _api_logged_in(context, product_url, order_no,
+                            INQUIRY_LIST_URL.format(page=page_no, size=INQUIRY_LIST_PAGE_SIZE))
+    if not isinstance(result, dict) or "list" not in result:
+        raise ParseError("상담내역을 읽지 못했습니다 (응답 모양이 다릅니다).")
+    return _parse_inquiry_rows(result.get("list") or []), int(result.get("total") or 0)
+
+
+def _load_inquiry_rows(context: BrowserContext, product_url: str, order_no: str, since: date | None, *,
+                       refresh: bool = False, max_pages: int = INQUIRY_HISTORY_MAX_PAGES) -> list[dict]:
+    """since 이후 줄이 다 들어올 때까지 상담내역을 읽어둔 캐시(최신순). refresh면 1페이지부터 새로."""
+    cache = _inquiry_rows_cache.get(id(context))
+    if cache is None or refresh:
+        rows, total = _fetch_inquiry_page(context, product_url, order_no, 1)
+        cache = {"rows": rows, "pages": 1, "total": total}
+        _inquiry_rows_cache[id(context)] = cache
+    while (since is not None and cache["rows"] and cache["pages"] < max_pages
+           and len(cache["rows"]) < cache["total"] and cache["rows"][-1]["written_on"] >= since):
+        more, _ = _fetch_inquiry_page(context, product_url, order_no, cache["pages"] + 1)
+        if not more:
+            break
+        cache["rows"].extend(more)
+        cache["pages"] += 1
+    return cache["rows"]
+
+
+def _describe_listed(entry: dict) -> str:
+    return (f"{entry['state']} {entry['written_on']:%Y.%m.%d} "
+            f"(문의번호 {entry['inquiry_id']}, [{entry['category']}] '{entry['title']}')")
+
+
+def _same_inquiry(entry: dict, order: dict, message: str) -> bool:
+    """이 상품의 [배송] 문의이고, 제목이 우리 문구의 앞부분(제목은 25자에서 잘린다 - 2026-09-09 실등록
+    'CHI MICHAEL CHRISTOPHER 배')이거나 사람이 남긴 '배송 언제' 문의면 같은 문의로 본다."""
+    title = entry["title"]
+    return (entry["goods_cd"] == order["goods_cd"] and entry["category"] == INQUIRY_LIST_CATEGORY
+            and (INQUIRY_SAME_MARK in title
+                 or (len(title) >= INQUIRY_TITLE_MIN and message.startswith(title))))
+
+
+def _find_listed_inquiry(context: BrowserContext, product_url: str, order: dict, message: str, since: date | None, *,
+                         refresh: bool = False, max_pages: int = INQUIRY_HISTORY_MAX_PAGES) -> dict | None:
+    """상담내역에서 since 이후에 쓴, 이 상품의 같은 문의(_same_inquiry)를 찾는다 (사람이 직접 남긴 것 포함).
+
+    상담내역에는 주문번호가 없어 상품코드로 맞춘다 - 같은 상품을 며칠 사이에 두 번 주문했으면
+    앞 주문의 문의가 뒤 주문 것으로 보일 수 있다(그때는 넘김으로 적히니 결과 엑셀에서 확인).
+    """
+    for entry in _load_inquiry_rows(context, product_url, order["order_no"], since, refresh=refresh, max_pages=max_pages):
+        if since is not None and entry["written_on"] < since:
+            return None   # 최신순이라 여기부터는 전부 더 오래된 것
+        if _same_inquiry(entry, order, message):
+            return entry
+    return None
+
+
+def _confirm_inquiry_listed(context: BrowserContext, product_url: str, order: dict, message: str) -> str:
+    """등록 뒤 상담내역을 새로 받아 오늘 자로 올라갔는지 본다. 목록이 늦게 갱신될 수 있어 몇 번 다시 본다."""
+    today = date.today()
+    for attempt in range(1, INQUIRY_HISTORY_TRIES + 1):
+        found = _find_listed_inquiry(context, product_url, order, message, today, refresh=True, max_pages=1)
+        if found is not None:
+            return _describe_listed(found)
+        if attempt < INQUIRY_HISTORY_TRIES:
+            common.sleep(INQUIRY_HISTORY_RETRY_GAP_SEC)
+    raise ParseError(
+        f"[문의하기]는 보냈지만 상담내역에서 확인되지 않았습니다. "
+        f"다시 남기기 전에 NS홈쇼핑 고객센터 > 상담내역 > 1:1 문의에서 '{message}'가 있는지 직접 확인해주세요.")
+
+
+def _inquiry_payload(session: dict, order: dict, message: str) -> dict:
+    """사람이 [문의하기]를 눌렀을 때 화면 JS가 보내는 본문과 같은 모양 (SMS 답변 알림 켬)."""
+    ddd, htel, num = (session["phone"].split("-") + ["", "", ""])[:3]
+    return {
+        "title": message[:INQUIRY_TITLE_MAX], "ctnt": message[:INQUIRY_CONTENT_MAX],
+        "custNm": session["cust_nm"], "boardClssfCd": "Q", "confGb": "01",
+        "largeCaCd": INQUIRY_TYPE_LARGE, "mediumCaCd": INQUIRY_TYPE_MEDIUM, "smallCaCd": INQUIRY_TYPE_SMALL,
+        "orderNum": int(order["order_no"]), "orderSeq": order["order_seq"],
+        "mobilDdd": ddd, "mobilHtel": htel, "mobilNum": num,
+    }
+
+
+def _check_inquiry_types(context: BrowserContext, product_url: str, order_no: str) -> None:
+    """유형 코드가 여전히 [배송·수거]>[배송문의]>[배송일(시간)문의]인지 유형 목록 API로 확인한다."""
+    mediums = _api_logged_in(context, product_url, order_no, INQUIRY_TYPE_LIST_URL.format(large=INQUIRY_TYPE_LARGE)) or []
+    medium = next((m for m in mediums if str(m.get("csClssfNum")) == INQUIRY_TYPE_MEDIUM), None)
+    if medium is None or str(medium.get("csClssfNm") or "").strip() != INQUIRY_TYPE_MEDIUM_LABEL:
+        raise ParseError(f"[{INQUIRY_TYPE_LARGE_LABEL}]의 문의유형에 [{INQUIRY_TYPE_MEDIUM_LABEL}]({INQUIRY_TYPE_MEDIUM})이 없습니다 "
+                         f"(목록: {[m.get('csClssfNm') for m in mediums]}).")
+    smalls = _api_logged_in(context, product_url, order_no, INQUIRY_SUBTYPE_LIST_URL.format(medium=INQUIRY_TYPE_MEDIUM)) or []
+    small = next((s for s in smalls if str(s.get("csClssfNum")) == INQUIRY_TYPE_SMALL), None)
+    if small is None or str(small.get("csClssfNm") or "").strip() != INQUIRY_TYPE_SMALL_LABEL:
+        raise ParseError(f"[{INQUIRY_TYPE_MEDIUM_LABEL}]의 소분류에 [{INQUIRY_TYPE_SMALL_LABEL}]({INQUIRY_TYPE_SMALL})이 없습니다 "
+                         f"(목록: {[s.get('csClssfNm') for s in smalls]}).")
+
+
+def _submit_via_api(context: BrowserContext, product_url: str, order: dict, message: str) -> str | None:
+    """화면 JS가 보내는 등록 POST를 화면 없이 바로 보낸다 (네이버·GSSHOP·롯데아이몰과 같은 직행).
+
+    resultCode 0000이면 성공 문구, HTTP 오류(401은 토큰을 새로 받아 한 번 더)면 None - 그때만
+    화면 경로로 간다. 사이트가 내용을 거절(resultCode≠0000)하면 화면으로 보내도 같으니 ParseError.
+    """
+    _check_inquiry_types(context, product_url, order["order_no"])
+    session = _inquiry_session(context, product_url, order["order_no"])
+    payload = _inquiry_payload(session, order, message)
+    try:
+        result = _api_logged_in(context, product_url, order["order_no"], INQUIRY_POST_URL, data=payload)
+    except ParseError as e:
+        if "HTTP" not in str(e):
+            raise
+        common.safe_print(f"[nsmall] 등록 요청이 거부돼 화면으로 남깁니다 ({e}).")
+        return None
+    return f"등록 요청 보냄 (직행, resultCode 0000{', 응답 ' + str(result)[:60] if result else ''})"
+
+
+def _guard_inquiry_page(route) -> None:
+    """문의 화면 전용 라우팅 - NS홈쇼핑 밖 호스트(분석·광고 스크립트)는 끊어 화면을 가볍게 한다."""
+    host = urlparse(route.request.url).netloc.lower()
+    if any(host == h or host.endswith("." + h) for h in INQUIRY_ALLOWED_HOSTS):
+        route.continue_()
+    else:
+        route.abort()
+
+
+def _pick_goods_in_layer(page, order: dict) -> None:
+    """[상품 선택] 레이어에서 이 주문번호 묶음의 상품 [선택]을 누른다 - 없으면 다음 페이지(10건씩)로 넘기며 찾는다."""
+    page.locator(INQUIRY_GOODS_BUTTON).click()
+    page.locator(INQUIRY_GOODS_BLOCK).first.wait_for(timeout=INQUIRY_STEP_WAIT_MS)
+    block = page.locator(INQUIRY_GOODS_BLOCK).filter(
+        has=page.locator("span.order-number b", has_text=re.compile(rf"^\s*{re.escape(order['order_no'])}\s*$")))
+    for _ in range(INQUIRY_GOODS_PAGE_MAX):
+        if block.count() > 0:
+            break
+        active = page.locator(INQUIRY_GOODS_PAGING + " button.active")
+        if active.count() == 0:
+            break
+        next_no = str(int(active.first.inner_text().strip()) + 1)
+        next_button = page.locator(INQUIRY_GOODS_PAGING + " button", has_text=re.compile(rf"^\s*{next_no}\s*$"))
+        if next_button.count() == 0:
+            next_button = page.locator(INQUIRY_GOODS_PAGING + " button.next-btn:visible")
+        if next_button.count() == 0:
+            break   # 마지막 페이지
+        with page.expect_response(lambda r, n=next_no: INQUIRY_GOODS_LIST_API in r.url and f"pageNum={n}&" in r.url,
+                                  timeout=INQUIRY_STEP_WAIT_MS):
+            next_button.first.click()
+        page.locator(INQUIRY_GOODS_PAGING + " button.active", has_text=next_no).wait_for(timeout=INQUIRY_STEP_WAIT_MS)
+    if block.count() == 0:
+        raise ParseError(f"[상품 선택] 목록(최근 1개월)에 이 주문이 없습니다 (주문번호={order['order_no']}).")
+    items = block.first.locator("li")
+    chosen = items.filter(has_text=order["goods_nm"]) if order["goods_nm"] and items.count() > 1 else items
+    if chosen.count() == 0:
+        chosen = items
+    chosen.first.locator("button.choice-btn").click()
+    page.locator(INQUIRY_GOODS_MODAL).wait_for(state="detached", timeout=INQUIRY_STEP_WAIT_MS)
+    shown = page.locator(INQUIRY_GOODS_CHOSEN_NAME).first.inner_text().strip()
+    if order["goods_nm"] and shown != order["goods_nm"]:
+        raise ParseError(f"문의 상품이 주문상세의 상품과 다릅니다 (화면 '{shown}', 주문 '{order['goods_nm']}').")
+
+
+def _fill_inquiry_form(page, order: dict, message: str) -> None:
+    """레이어에서 유형·상품·제목·내용을 채운다 - [문의하기]는 누르지 않는다."""
+    modal = page.locator(INQUIRY_MODAL)
+    modal.get_by_text(INQUIRY_TYPE_LARGE_LABEL, exact=True).click()
+    dropdown = page.locator(INQUIRY_TYPE_DROPDOWN).first
+    dropdown.locator("button.result-item").wait_for(timeout=INQUIRY_STEP_WAIT_MS)
+    dropdown.locator("button.result-item").click()
+    option = dropdown.locator("button.contents-item", has_text=INQUIRY_TYPE_MEDIUM_LABEL)
+    try:
+        option.first.wait_for(timeout=INQUIRY_STEP_WAIT_MS)
+    except PlaywrightTimeoutError:
+        seen = dropdown.locator("button.contents-item").all_inner_texts()
+        raise ParseError(f"[{INQUIRY_TYPE_LARGE_LABEL}]을 골랐는데 문의유형에 [{INQUIRY_TYPE_MEDIUM_LABEL}]이 없습니다 (화면: {seen}).") from None
+    option.first.click()
+    try:
+        page.wait_for_function(
+            "([m, s, mv, sv]) => document.querySelector(m)?.value === mv && document.querySelector(s)?.value === sv",
+            arg=[INQUIRY_TYPE_MEDIUM_INPUT, INQUIRY_TYPE_SMALL_INPUT, INQUIRY_TYPE_MEDIUM, INQUIRY_TYPE_SMALL],
+            timeout=INQUIRY_STEP_WAIT_MS)
+    except PlaywrightTimeoutError:
+        chosen = (page.locator(INQUIRY_TYPE_MEDIUM_INPUT).input_value(), page.locator(INQUIRY_TYPE_SMALL_INPUT).input_value())
+        raise ParseError(f"문의 유형이 {INQUIRY_TYPE_MEDIUM_LABEL}/{INQUIRY_TYPE_SMALL_LABEL}"
+                         f"({INQUIRY_TYPE_MEDIUM}/{INQUIRY_TYPE_SMALL})로 잡히지 않았습니다 (화면: {chosen}).") from None
+    _pick_goods_in_layer(page, order)
+    page.fill(INQUIRY_TITLE, message[:INQUIRY_TITLE_MAX])
+    page.fill(INQUIRY_CONTENT, message[:INQUIRY_CONTENT_MAX])
+    if page.locator(INQUIRY_TITLE).input_value().strip() != message[:INQUIRY_TITLE_MAX].strip():
+        raise ParseError("문의 제목이 입력되지 않았습니다.")
+    if page.locator(INQUIRY_CONTENT).input_value().strip() != message[:INQUIRY_CONTENT_MAX]:
+        raise ParseError("문의 내용이 입력되지 않았습니다.")
+
+
+def _submit_via_form(context: BrowserContext, product_url: str, order: dict, message: str) -> str:
+    """고객센터 화면을 열어 [1:1문의] 레이어를 채우고 [문의하기]를 눌러 등록 응답까지 본다."""
+    order_no = order["order_no"]
+    page = context.new_page()
+    page.route("**/*", _guard_inquiry_page)
+    dialogs: list[str] = []
+    page.on("dialog", lambda d: (dialogs.append(f"{d.type}: {d.message}"), d.accept()))
+    try:
+        _open_order_screen(page, product_url, order_no)   # 로그인 확인 겸 (고객센터는 로그인 화면으로 안 튕긴다)
+        page.goto(CUSTOMER_CENTER_URL, wait_until="domcontentloaded")
+        page.locator(INQUIRY_OPEN_BUTTON).first.wait_for(timeout=INQUIRY_STEP_WAIT_MS)
+        page.locator(INQUIRY_OPEN_BUTTON).first.click()
+        page.locator(INQUIRY_MODAL).wait_for(timeout=INQUIRY_STEP_WAIT_MS)
+        _fill_inquiry_form(page, order, message)
+
+        submit = page.locator(INQUIRY_SUBMIT).first
+        if not submit.is_enabled():
+            raise ParseError("[문의하기] 버튼이 아직 비활성입니다 - 필수 칸이 덜 채워졌습니다.")
+        with page.expect_response(
+                lambda r: r.request.method == "POST" and urlparse(r.url).path == urlparse(INQUIRY_POST_URL).path,
+                timeout=INQUIRY_STEP_WAIT_MS) as posted:
+            submit.click()
+        response = posted.value
+        try:
+            body = response.json()
+        except Exception:  # noqa: BLE001
+            body = {}
+        code = str(((body or {}).get("data") or {}).get("resultCode"))
+        if response.status != 200 or code != "0000":
+            note = ((body or {}).get("data") or {}).get("resultMessage") or (body or {}).get("message") or ""
+            raise ParseError(f"[문의하기]를 눌렀는데 등록되지 않았습니다 (HTTP {response.status}, resultCode {code} {note}"
+                             f"{' / ' + ' / '.join(dialogs) if dialogs else ''}).")
+        with contextlib.suppress(PlaywrightTimeoutError):
+            page.locator(INQUIRY_MODAL).wait_for(state="detached", timeout=INQUIRY_STEP_WAIT_MS)
+        return f"등록 요청 보냄 (화면, resultCode 0000{' · ' + ' / '.join(dialogs) if dialogs else ''})"
+    finally:
+        page.close()
+
+
+def post_inquiry(context: BrowserContext, product_url: str, recipient_name: str,
+                 headless: bool = False) -> str:
+    """1:1 문의([배송·수거] > [배송문의])를 남기고 확인 문구를 돌려준다.
+
+    취소/품절 주문은 남기지 않고, 상담내역에 이 상품의 같은 문의가 주문일 이후에 이미 있으면
+    AlreadyInquired로 넘긴다. 등록은 화면 JS가 보내는 요청을 바로 보내고(_submit_via_api),
+    거부되면 화면을 열어 남긴다(_submit_via_form). 어느 쪽이든 등록 뒤 상담내역에 오늘 자로
+    올라갔는지 확인한다. 제목(최대 25자)과 내용이 같은 문구다 (사용자 지시).
+    """
+    order_no = extract_order_no(product_url)
+    message = f"{recipient_name.strip()} 배송 언제 시작하나요?"
+    order = _order_for_inquiry(context, product_url, order_no)
+    existing = _find_listed_inquiry(context, product_url, order, message, order["order_date"])
+    if existing is not None:
+        raise AlreadyInquired(f"상담내역에 이미 같은 문의가 있습니다: {_describe_listed(existing)}")
+
+    done = _submit_via_api(context, product_url, order, message)
+    if done is None:
+        # 거부 응답이었어도 그 사이 올라갔을 수 있으니 화면을 열기 전에 오늘 자를 한 번 본다.
+        posted = _find_listed_inquiry(context, product_url, order, message, date.today(), refresh=True, max_pages=1)
+        if posted is not None:
+            return f"등록 요청은 거부 응답이었지만 상담내역에 올라감 · 상담내역 확인: {_describe_listed(posted)}"
+        done = _submit_via_form(context, product_url, order, message)
+    listed = _confirm_inquiry_listed(context, product_url, order, message)
+    return f"{done} · 상담내역 확인: {listed}"
