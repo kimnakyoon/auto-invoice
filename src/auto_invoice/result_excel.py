@@ -10,7 +10,9 @@
 (실패 -> 취소/품절 -> 반영오류 -> 주문일지연 -> 미지원 사이트 -> 스킵 -> 성공).
 성공
 건은 이미 업로드용 CSV로 처리되므로 맨 뒤여도 되고, 확인이 필요한 건이 위로
-올라온다.
+올라온다. 주문일지연 묶음 안은 주문일 오름차순(오래된 주문부터)이다 - 별도
+'주문일지연' 시트, 실행 요약 문구(report.stale_lines)와 같은 순서라 세 곳을
+번갈아 봐도 같은 줄이 같은 자리에 있다.
 
 보기 편하라고 넣은 것들: 맨 위에 실행 시각과 결과별 건수 한 줄, '결과' 칸은
 색깔 배지, 줄 전체는 같은 계열 옅은 색, 결과가 바뀌는 자리에는 굵은 가로선.
@@ -118,19 +120,39 @@ _TEXT_FORMAT = "@"
 _HEADER_ROW = 3
 
 
-def _sort_key(entry: ReportEntry) -> tuple[int, int]:
+def _group_key(entry: ReportEntry) -> tuple[int, int]:
     """실패 -> 취소/품절 -> 반영오류 -> 주문일지연 -> 미지원 사이트 -> 스킵 -> 성공.
 
     주문일이 오래된 건은 결과가 무엇이든 주문일지연 자리까지 끌어올린다. 이미
     그보다 위에 있는 결과(실패/취소·품절)는 제자리를 지킨다 - 더 급한 쪽이
     위여야 하니까. 같은 자리 안에서는 결과끼리 다시 모이도록 두 번째 값으로
     결과 순서를 쓴다(예: 주문일지연 칸의 스킵 건과 성공 건이 섞이지 않게).
+
+    묶음(굵은 가로선으로 나뉘는 덩어리)을 정하는 값이라 여기까지만 비교한다 -
+    묶음 안 순서는 _sort_key가 이어서 정한다.
     """
     label = result_label(entry)
     rank = _SORT_ORDER.index(label) if label in _SORT_ORDER else len(_SORT_ORDER)
     if is_stale_entry(entry):
         return min(rank, _SORT_ORDER.index(_STALE_SORT_LABEL)), rank
     return rank, rank
+
+
+def _sort_key(entry: ReportEntry) -> tuple[int, int, int]:
+    """_group_key 순서로 묶고, 주문일지연 묶음 안은 주문일 오름차순.
+
+    주문일이 오래된 건은 '며칠째 안 나가고 있나'가 핵심이라 오래된 주문부터
+    보여야 한다(사용자 요청). 파일 순서 그대로 두면 09-06·09-05·09-07·09-03이
+    섞여 4일 지난 건이 2일 지난 건 사이에 묻힌다. 별도 '주문일지연'
+    시트(stale_entries)와 같은 기준이라 두 시트의 줄 순서가 같다.
+
+    나머지 묶음은 파일(샵마인 내보내기) 순서를 그대로 둔다 - 그쪽은 주문일이
+    아니라 결과·사유로 보는 건들이고, 사용자가 부탁한 범위도 아니다.
+    """
+    group = _group_key(entry)
+    if is_stale_entry(entry) and entry.order_date is not None:
+        return (*group, entry.order_date.toordinal())
+    return (*group, 0)
 
 
 def label_counts(entries: list[ReportEntry]) -> list[tuple[str, int]]:
@@ -208,9 +230,10 @@ def _write_entries_sheet(ws, entries: list[ReportEntry], applied_label: str,
         ])
         # 덩어리가 바뀌는 자리(그룹 끝)에는 굵은 선을 그어 나눈다. 결과
         # 이름이 아니라 정렬 자리로 비교해야 '주문일지연으로 끌어올린 성공
-        # 건'과 '그냥 성공 건'도 선으로 나뉜다.
-        next_key = _sort_key(rows[i + 1]) if i + 1 < len(rows) else None
-        _style_row(ws[ws.max_row], label, group_end=next_key != _sort_key(entry),
+        # 건'과 '그냥 성공 건'도 선으로 나뉜다. 주문일까지 든 _sort_key로
+        # 비교하면 주문일이 바뀔 때마다 선이 그어지므로 _group_key로 본다.
+        next_key = _group_key(rows[i + 1]) if i + 1 < len(rows) else None
+        _style_row(ws[ws.max_row], label, group_end=next_key != _group_key(entry),
                    stale=is_stale_entry(entry))
 
     for i, width in enumerate(COLUMN_WIDTHS, start=1):
