@@ -78,10 +78,11 @@ import os
 import re
 from dataclasses import dataclass
 from datetime import date, timedelta
-from urllib.parse import parse_qs, urlparse
+from urllib.parse import parse_qs, quote, urlparse
 
 from dotenv import load_dotenv
 from playwright.sync_api import BrowserContext, Page
+from playwright.sync_api import TimeoutError as PlaywrightTimeoutError
 
 from .. import browser as browser_mod
 from .. import order_date as order_date_mod
@@ -121,7 +122,21 @@ LOGIN_ID_SELECTOR = "#typeMemberInputId"
 LOGIN_PW_SELECTOR = "#typeMemberInputPassword"
 LOGIN_BUTTON_SELECTOR = "#btnLogin"
 LOGIN_HOST = "signin.auction.co.kr"
+# 로그인 페이지. url=에 로그인 뒤 돌아갈 주소를 실으면 SSO 체인(signin ->
+# memberssl -> ...)이 끝나는 곳이 바로 그 주소다 (2026-09-10 실측: 주문상세
+# 레이어·배송조회 둘 다 그대로 착지). 예전에는 세션이 끊기면 홈으로 튕긴 화면 ->
+# 주문목록(-> signin 302) -> 로그인 -> 원래 주소 순으로 페이지를 넷 열었는데,
+# 이 주소로 바로 가면 로그인 페이지 하나로 끝난다 (로그인 경로 4.0초 -> 1.9초).
+SIGNIN_URL = "https://signin.auction.co.kr/Authenticate/MobileLogin.aspx?url={target}"
+# 세션이 없을 때 escrow(주문상세·주문목록)가 302로 보내는 로그인 관문들.
+LOGIN_HOSTS = {LOGIN_HOST, "memberssl.auction.co.kr"}
 LOGIN_WAIT_TIMEOUT_MS = 30 * 1000  # 자동 로그인 후 리다이렉트 대기 최대 30초
+# 옥션이 로그인을 일시 제한했을 때 로그인 직후 넘기는 본인인증(보안지킴이) 화면.
+# 짧은 시간에 로그인이 반복되면(2026-09-10 실측: 40분에 15번쯤) "고객님의 소중한
+# 정보 보호를 위해서 일시적으로 사용 제한 되었습니다" 알림과 함께 여기로 온다 -
+# 사람이 브라우저에서 본인인증을 마쳐야 풀린다. 로그인 경로를 검증할 때는
+# 한두 번만 시도할 것.
+VERIFICATION_URL_PREFIX = "https://login.auction.co.kr/verification/"
 
 # 조회기간: 최근 1개월 (사용자 요청). 목록 페이지의 hidden input을 이 값으로
 # 바꿔두면 "더보기" AJAX가 1개월치만 가져온다.
@@ -157,7 +172,8 @@ PARSE_ORDER_ROWS_JS = """() => {
 }"""
 
 RECIPIENT_LABEL = "받으시는 분"
-DETAIL_TABLE_SELECTOR = "table.order-detail-table"
+DETAIL_TABLE_CLASS = "order-detail-table"
+DETAIL_TABLE_SELECTOR = f"table.{DETAIL_TABLE_CLASS}"
 READ_RECIPIENT_JS = """() => {
     for (const tr of document.querySelectorAll('table.order-detail-table tr')) {
         const th = tr.querySelector('th');
@@ -295,11 +311,24 @@ def recipient_matches(auction_name: str, shopmine_name: str) -> bool:
 # 페이지 열기 / 로그인
 # --------------------------------------------------------------------------
 
+LOGIN_FORM_WAIT_MS = 5 * 1000
+
+
 def _looks_like_login_page(page: Page) -> bool:
-    """로그인 페이지로 튕겼는지. 서버가 302로 보내주므로 주소만 보면 바로 알 수 있다."""
+    """로그인 페이지로 튕겼는지. 서버가 302로 보내주므로 주소만 보면 바로 알 수 있다.
+
+    비밀번호 칸은 잠깐 기다려 준다 - goto가 commit에서 돌아오므로(_goto_settled)
+    주소는 signin인데 폼이 아직 안 그려진 순간이 있다 (2026-09-10 실측: 세션 없는
+    배송조회가 signin/Authenticate/ExpandLogin.aspx로 넘어갔는데 count()가 0이라
+    로그인 페이지가 아니라고 보고 지나쳤다).
+    """
     if LOGIN_HOST not in page.url:
         return False
-    return page.locator("input[type='password']").count() > 0
+    try:
+        page.wait_for_selector("input[type='password']", timeout=LOGIN_FORM_WAIT_MS)
+    except PlaywrightTimeoutError:
+        return False
+    return True
 
 
 # 세션이 만료됐을 때 밀려나는 옥션 홈 주소들. 주문목록(OrderProcessList)은
@@ -345,11 +374,41 @@ def _looks_like_bot_check(page: Page) -> bool:
     return any(p in body_text for p in BOT_CHECK_PATTERNS)
 
 
-def _auto_login(page: Page) -> bool:
+def _landed_on(url: str):
+    """page.wait_for_url용 - 호스트와 경로가 url과 같으면 도착한 것으로 본다
+    (배송조회는 경로가 "/"라 옥션 홈과 구분하려면 호스트까지 봐야 한다).
+
+    옥션 공통 오류 페이지(ERROR_PAGE_PATH)에 떨어진 것도 도착으로 본다 - 발송 전
+    주문의 배송조회를 목적지로 로그인하면 SSO 체인이 배송조회 -> 307 -> 오류
+    페이지로 끝나서(2026-09-10 실측) 목적지 주소는 영영 안 온다. 호출자는
+    _is_error_page로 그 뜻(송장 없음)을 원래대로 읽는다.
+    """
+    wanted = urlparse(url)
+    host, path = (wanted.hostname or "").lower(), (wanted.path or "/").lower()
+
+    def _matches(current: str) -> bool:
+        if current.lower().startswith(VERIFICATION_URL_PREFIX):
+            return True  # 본인인증으로 넘어갔다 - 기다려도 목적지는 안 오니 바로 돌아가 사유를 남긴다
+        got = urlparse(current)
+        got_path = (got.path or "/").lower()
+        if got_path == ERROR_PAGE_PATH:
+            return True
+        return (got.hostname or "").lower() == host and got_path == path
+
+    return _matches
+
+
+def _auto_login(page: Page, target_url: str) -> bool:
     """AUCTION_ID/AUCTION_PW로 완전 자동 로그인한다 (사용자 명시 요청).
 
     SSG/더현대/NS홈쇼핑/11번가 어댑터와 동일한 패턴 - 옥션도 자동 클릭 로그인이
     캡차 등에 막히지 않는 것을 확인했다.
+
+    지금 열린 로그인 페이지의 url= 목적지가 target_url이어야 한다(_login_and_land).
+    로그인 직후 SSO 리다이렉트 체인(memberssl -> escrow ...)이 도는데, 예전에는
+    로그인 페이지를 벗어난 것만 보고 1.5초를 가만히 기다린 뒤 다시 goto했다.
+    이제는 체인이 target_url에 닿을 때까지 기다리므로(wait_for_url) 그 대기도
+    재이동도 없다 - 끝나면 page가 target_url에 서 있다.
     """
     login_id = os.environ.get("AUCTION_ID")
     login_pw = os.environ.get("AUCTION_PW")
@@ -361,18 +420,38 @@ def _auto_login(page: Page) -> bool:
     page.fill(LOGIN_ID_SELECTOR, login_id)
     page.fill(LOGIN_PW_SELECTOR, login_pw)
     page.click(LOGIN_BUTTON_SELECTOR)
+    try:
+        # load가 아니라 domcontentloaded까지만 - 주문목록은 부속 자원 때문에 load가
+        # 한참 안 떠서(2026-09-10 실측: 착지하고도 30초 타임아웃) 화면(DOM)이
+        # 갖춰진 시점이면 충분하다. 호출자는 그 뒤 필요한 요소를 직접 읽는다.
+        page.wait_for_url(_landed_on(target_url), timeout=LOGIN_WAIT_TIMEOUT_MS,
+                          wait_until="domcontentloaded")
+    except PlaywrightTimeoutError:
+        return False
+    return True
 
-    elapsed_ms = 0
-    while elapsed_ms < LOGIN_WAIT_TIMEOUT_MS:
-        if not _looks_like_login_page(page):
-            # 로그인 직후에는 SSO 리다이렉트 체인(memberssl -> escrow ...)이
-            # 아직 도는 중이다. 여기서 바로 goto하면 "다른 이동에
-            # 인터럽트됐다"는 예외가 나므로(2026-09-01 실측) 잠깐 가라앉힌다.
-            page.wait_for_timeout(1500)
-            return True
-        page.wait_for_timeout(500)
-        elapsed_ms += 500
-    return False
+
+def _login_and_land(page: Page, url: str) -> None:
+    """로그인 페이지에 목적지(url)를 실어 열고 자동 로그인한다 - 끝나면 url에 서 있다.
+
+    page가 이미 로그인 페이지면(주문목록처럼 signin으로 302되는 주소) 그 화면의
+    url= 목적지가 곧 요청한 주소라 그대로 로그인한다. 홈으로 조용히 튕긴
+    경우(주문상세·배송조회)와 아직 아무 데도 안 간 경우는 SIGNIN_URL로 간다.
+    """
+    if not _looks_like_login_page(page):
+        _goto_settled(page, SIGNIN_URL.format(target=quote(url, safe="")))
+    if _looks_like_login_page(page) and not _auto_login(page, url):
+        raise BlockedError("옥션 자동 로그인 후에도 로그인 페이지에서 벗어나지 못했습니다.")
+    if page.url.lower().startswith(VERIFICATION_URL_PREFIX):
+        raise BlockedError(
+            "옥션이 로그인을 일시 제한하고 본인 확인(보안지킴이 본인인증)을 요구합니다 - "
+            "짧은 시간에 로그인이 반복되면 이렇게 됩니다. 브라우저에서 옥션에 로그인해 "
+            "본인인증을 마친 뒤 다시 실행해주세요."
+        )
+    if _looks_like_login_page(page) or _bounced_to_home(page, url):
+        raise BlockedError(
+            f"옥션 로그인 후에도 주문 화면 대신 다른 페이지가 열립니다 (열린 주소={page.url})."
+        )
 
 
 def _goto_settled(page: Page, url: str) -> None:
@@ -382,7 +461,7 @@ def _goto_settled(page: Page, url: str) -> None:
 
 
 def _goto_logged_in(page: Page, url: str, expect_selector: str | None = None) -> None:
-    """url로 이동한다. 로그인 페이지로 튕기면 자동 로그인하고 다시 이동한다.
+    """url로 이동한다. 로그인 페이지로 튕기면 자동 로그인해 url에 착지한다(_login_and_land).
 
     expect_selector는 "이동에 성공했다면 화면에 있어야 하는 것"이다. 로그인
     리다이렉트는 서버가 302로 보내주므로 보통 주소만 보면 즉시 알 수 있지만,
@@ -398,18 +477,7 @@ def _goto_logged_in(page: Page, url: str, expect_selector: str | None = None) ->
             return
 
     common.safe_print("[auction] 로그인 세션이 없어 자동 로그인을 시도합니다.")
-    if _bounced_to_home(page, url):
-        # 홈에는 로그인 폼이 없다 - signin으로 확실히 302되는 주문목록을 거쳐
-        # 로그인 화면으로 간다 (위 _bounced_to_home 주석 참고).
-        _goto_settled(page, ORDER_LIST_URL)
-    if _looks_like_login_page(page):
-        if not _auto_login(page):
-            raise BlockedError("옥션 자동 로그인 후에도 로그인 페이지에서 벗어나지 못했습니다.")
-    _goto_settled(page, url)
-    if _looks_like_login_page(page) or _bounced_to_home(page, url):
-        raise BlockedError(
-            f"옥션 로그인 후에도 주문 화면 대신 다른 페이지가 열립니다 (열린 주소={page.url})."
-        )
+    _login_and_land(page, url)
 
 
 def _open_logged_in(context: BrowserContext, url: str, expect_selector: str | None = None) -> Page:
@@ -669,6 +737,75 @@ def _order_status_from_detail(page: Page) -> str:
     return ""
 
 
+DETAIL_FOUND = "found"        # 주문상세 레이어를 읽었다 (주문상태는 비어 있을 수 있다)
+DETAIL_NEED_LOGIN = "login"   # 세션이 없어 로그인 관문으로 302됐다
+
+_STATUS_CELL_RE = re.compile(r'<td[^>]*class="status"[^>]*>(.*?)</td>', re.S)
+_HTML_COMMENT_RE = re.compile(r"<!--.*?-->", re.S)
+_HTML_TAG_RE = re.compile(r"<[^>]+>")
+_CHARSET_RE = re.compile(r"charset=([\w-]+)", re.I)
+
+
+def _html_text(fragment: str) -> str:
+    """HTML 조각에서 주석·태그를 걷어낸 글자 (page.inner_text와 같은 값이 되게)."""
+    text = _HTML_TAG_RE.sub(" ", _HTML_COMMENT_RE.sub("", fragment))
+    return re.sub(r"\s+", " ", text).strip()
+
+
+def _detail_status_direct(context: BrowserContext, order_no: str) -> tuple[str, str] | None:
+    """주문상세 레이어의 주문상태를 페이지 이동 없이 context.request로 읽는다.
+
+    레이어는 서버 렌더링(ASP.NET, EUC-KR)이라 HTML만 받으면 되고, 세션이 없으면
+    302로 로그인 관문(LOGIN_HOSTS)에 보내므로 로그인 여부도 이 한 번으로 안다
+    (2026-09-10 실측: 로그인 상태 200·0.8초 vs 페이지 이동 1.1초, 세션 없음
+    302·0.01초). 예전에는 세션이 끊기면 페이지가 홈으로 조용히 튕기는 것을 보고
+    알았는데(_bounced_to_home) 그 홈 화면을 여는 비용부터 들었다.
+
+    돌려주는 값: (DETAIL_FOUND, 주문상태) / (DETAIL_NEED_LOGIN, "") / None.
+    None은 판정 못 한 응답(없는 주문번호의 500, 봇 확인, 표가 없는 본문 등)이라
+    호출자가 기존 페이지 경로(_goto_logged_in)로 다시 연다.
+    """
+    try:
+        response = context.request.get(ORDER_DETAIL_URL.format(order_no=order_no), max_redirects=0)
+    except Exception:  # noqa: BLE001 - 직행이 안 되면 페이지 경로로 간다
+        return None
+    if 300 <= response.status < 400:
+        host = (urlparse(response.headers.get("location", "")).hostname or "").lower()
+        return (DETAIL_NEED_LOGIN, "") if host in LOGIN_HOSTS else None
+    if response.status != 200:
+        return None
+    charset = _CHARSET_RE.search(response.headers.get("content-type", ""))
+    html = response.body().decode(charset.group(1) if charset else "cp949", errors="replace")
+    if DETAIL_TABLE_CLASS not in html:
+        return None
+    match = _STATUS_CELL_RE.search(html)
+    return DETAIL_FOUND, (_html_text(match.group(1)) if match else "")
+
+
+def _read_detail_status(context: BrowserContext, order_no: str) -> str:
+    """주문상세 레이어의 주문상태 - request 직행을 먼저, 안 되면 페이지로.
+
+    세션이 없으면(직행이 302) 로그인 페이지에 이 레이어를 목적지로 실어 바로
+    간다(_login_and_land) - 로그인이 끝나면 레이어에 서 있으므로 그대로 읽는다.
+    """
+    direct = _detail_status_direct(context, order_no)
+    if direct is not None and direct[0] == DETAIL_FOUND:
+        return direct[1]
+    page = _lookup_page(context)
+    url = ORDER_DETAIL_URL.format(order_no=order_no)
+    if direct is None:
+        _goto_logged_in(page, url, expect_selector=DETAIL_TABLE_SELECTOR)
+    else:
+        common.safe_print("[auction] 로그인 세션이 없어 자동 로그인을 시도합니다.")
+        _login_and_land(page, url)
+    if page.locator(DETAIL_TABLE_SELECTOR).count() == 0:
+        raise ParseError(
+            f"주문상세 레이어가 열리지 않습니다 (주문번호={order_no}, "
+            f"열린 주소={page.url}) - 없는 주문번호이거나 화면 구조가 바뀐 것으로 보입니다."
+        )
+    return _order_status_from_detail(page)
+
+
 def _parse_trace_page(page: Page, order_no: str) -> TrackingResult | None:
     """지금 열려 있는 배송조회 화면에서 송장을 읽는다. 송장이 없으면 None.
 
@@ -737,6 +874,7 @@ _NEXT_DATA_RE = re.compile(r'<script[^>]*id="__NEXT_DATA__"[^>]*>(.*?)</script>'
 TRACE_FOUND = "found"      # 송장이 있다
 TRACE_EMPTY = "empty"      # 배송조회는 열렸는데 송장이 비어 있다 (발송 전이거나 로그인 풀림)
 TRACE_ERROR = "error"      # 옥션 공통 오류 페이지로 넘어갔다 (발송 전 주문의 정상 반응)
+TRACE_NEED_LOGIN = "login" # 세션이 없어 로그인 관문으로 302됐다 (직행에서만 나온다)
 
 
 def _read_trace_direct(context: BrowserContext, order_no: str) -> tuple[str, TrackingResult | None] | None:
@@ -756,9 +894,13 @@ def _read_trace_direct(context: BrowserContext, order_no: str) -> tuple[str, Tra
     except Exception:  # noqa: BLE001 - 직행이 안 되면 페이지 경로로 간다
         return None
     if 300 <= response.status < 400:
-        location = response.headers.get("location", "")
-        if (urlparse(location).path or "").lower() == ERROR_PAGE_PATH:
+        location = urlparse(response.headers.get("location", ""))
+        if (location.path or "").lower() == ERROR_PAGE_PATH:
             return TRACE_ERROR, None
+        if (location.hostname or "").lower() in LOGIN_HOSTS:
+            # 세션이 없다. 페이지로 열어도 로그인 페이지(ExpandLogin)로 갈 뿐이니
+            # 호출자가 로그인 페이지에 배송조회를 목적지로 실어 바로 간다.
+            return TRACE_NEED_LOGIN, None
         return None
     if response.status != 200:
         return None
@@ -780,11 +922,16 @@ def _read_trace(context: BrowserContext, order_no: str, *,
     True면 로그인이 확실한 상태라 바로 이동한다.
     """
     direct = _read_trace_direct(context, order_no)
-    if direct is not None:
+    need_login = direct is not None and direct[0] == TRACE_NEED_LOGIN
+    if direct is not None and not need_login:
         return direct
     page = _lookup_page(context)
     trace_url = TRACE_URL.format(order_no=order_no)
-    if logged_in:
+    if need_login and not logged_in:
+        # 로그인이 끝나면 page가 배송조회(발송 전이면 오류 페이지)에 서 있다.
+        common.safe_print("[auction] 로그인 세션이 없어 자동 로그인을 시도합니다.")
+        _login_and_land(page, trace_url)
+    elif logged_in:
         _goto_settled(page, trace_url)
     else:
         # __NEXT_DATA__는 서버에서 렌더링되어 오므로 기다릴 것이 없다 - 오류 페이지에서
@@ -820,6 +967,8 @@ def _fetch_tracking(context: BrowserContext, order_no: str,
     배송조회는 페이지를 열지 않고 context.request로 먼저 읽는다(_read_trace_direct,
     2026-09-10): 발송된 주문은 GET 한 번(0.07초)으로 끝나고, 발송 전 주문은 302
     응답만 보고 주문상세 레이어로 넘어간다. 직행이 판정 못 한 응답만 페이지로 연다.
+    주문상세 레이어도 같은 방식이다(_read_detail_status) - 세션이 끊겼으면 그
+    302를 보고 로그인 페이지에 레이어를 목적지로 실어 바로 간다.
     """
     _, result = _read_trace(context, order_no, logged_in=False)
     if result is not None:
@@ -832,15 +981,7 @@ def _fetch_tracking(context: BrowserContext, order_no: str,
             f"배송조회 화면에 아직 송장번호가 없습니다 (주문번호={order_no})."
         )
 
-    page = _lookup_page(context)
-    _goto_logged_in(page, ORDER_DETAIL_URL.format(order_no=order_no),
-                    expect_selector=DETAIL_TABLE_SELECTOR)
-    if page.locator(DETAIL_TABLE_SELECTOR).count() == 0:
-        raise ParseError(
-            f"주문상세 레이어가 열리지 않습니다 (주문번호={order_no}, "
-            f"열린 주소={page.url}) - 없는 주문번호이거나 화면 구조가 바뀐 것으로 보입니다."
-        )
-    status = _order_status_from_detail(page)
+    status = _read_detail_status(context, order_no)
     if status:
         # 주문상태를 정확히 읽었으므로 취소/품절 판정을 먼저 한다.
         raise_if_cancelled(status, order_no)
