@@ -15,7 +15,9 @@
   리다이렉트된다. 단, **주문목록만** 그렇다 - 주문상세 레이어와 배송조회는
   세션이 만료되면 signin이 아니라 홈(www.auction.co.kr/?redirect=1)으로 조용히
   리다이렉트된다(2026-09-02 실측). 그래서 홈으로 밀려난 것도 로그인 만료로
-  판정한다(_bounced_to_home). 로그인 폼 셀렉터: 아이디 input#typeMemberInputId, 비밀번호
+  판정한다(_bounced_to_home). 단, 같은 www.auction.co.kr의 공통 오류 페이지
+  (Common/Html/Http500.html)는 예외다 - 발송 전 주문의 배송조회가 307로 거기로
+  넘어가는데(2026-09-10 실측) 세션과 무관하다(_is_error_page). 로그인 폼 셀렉터: 아이디 input#typeMemberInputId, 비밀번호
   input#typeMemberInputPassword, 로그인 버튼 button#btnLogin (지마켓과 같은
   이베이코리아 통합 로그인이다). 사용자가 "첫 로그인부터 쿠키로 자동 로그인"을
   요청했고, 실제로 아이디+비밀번호를 채우고 로그인 버튼을 자동 클릭해도 캡차나
@@ -301,10 +303,30 @@ def _looks_like_login_page(page: Page) -> bool:
 # (2026-09-02 실측 - 어제까지 되던 조회가 세션 만료 하루 만에 이 경로로 전부
 # 실패했다). 홈에는 로그인 폼이 없어 signin 판정으로는 잡히지 않는다.
 _HOME_HOSTS = {"auction.co.kr", "www.auction.co.kr", "m.auction.co.kr"}
+# 옥션 공통 오류 페이지. 배송조회(tracking.auction.co.kr)는 발송 전 주문에서
+# 500을 그 자리에서 그리는 게 아니라 **307로 이 페이지로 넘긴다**(2026-09-10
+# 실측: 배송준비중 주문 3건 모두 tracking 307 -> www.auction.co.kr/Common/Html/
+# Http500.html 200). 호스트만 보면 홈과 같아서 _bounced_to_home이 세션 만료로
+# 오판했고, 자동 로그인 뒤 다시 열어도 같은 오류 페이지라 3건이 전부
+# "로그인 후에도 다른 페이지가 열립니다"로 실패했다 (어제까지는 같은 주문이
+# '발송 전'으로 정상 스킵됐다). 오류 페이지는 세션과 무관하니 홈 판정에서 뺀다 -
+# 그러면 _fetch_tracking이 원래 설계대로 주문상세 레이어에서 상태를 읽는다.
+ERROR_PAGE_PATH = "/common/html/http500.html"
+
+
+def _is_error_page(page: Page) -> bool:
+    """옥션 공통 오류 페이지(Http500.html)에 떨어졌는지."""
+    return (urlparse(page.url).path or "").lower() == ERROR_PAGE_PATH
 
 
 def _bounced_to_home(page: Page, requested_url: str) -> bool:
-    """escrow/tracking 주소를 요청했는데 옥션 홈으로 밀려났는지 (=세션 만료)."""
+    """escrow/tracking 주소를 요청했는데 옥션 홈으로 밀려났는지 (=세션 만료).
+
+    오류 페이지(Http500.html)도 www.auction.co.kr에 있지만 세션 만료가 아니다
+    (위 ERROR_PAGE_PATH 주석) - 그건 호출한 쪽이 화면 내용으로 판단한다.
+    """
+    if _is_error_page(page):
+        return False
     landed_host = (urlparse(page.url).hostname or "").lower()
     requested_host = (urlparse(requested_url).hostname or "").lower()
     return landed_host in _HOME_HOSTS and requested_host not in _HOME_HOSTS
@@ -642,8 +664,13 @@ def _parse_trace_page(page: Page, order_no: str) -> TrackingResult | None:
     송장 데이터만 빈 채로 온다 - 2026-09-02 실측). 구분은 호출자가
     주문상세 레이어(로그인을 강제한다)를 열어서 한다.
     """
+    if _is_error_page(page):
+        # 발송 전 주문의 500이 이제는 공통 오류 페이지로 307된다(ERROR_PAGE_PATH
+        # 주석). 그 자리의 500 페이지와 같은 뜻이므로 '송장 없음'으로 돌려보내
+        # 호출자가 주문상세 레이어에서 발송 전인지 확인하게 한다.
+        return None
     if "tracking.auction.co.kr" not in page.url:
-        # 봇 확인 화면이나 오류 페이지로 우회된 것이다 - 그대로 두면
+        # 봇 확인 화면이나 엉뚱한 페이지로 우회된 것이다 - 그대로 두면
         # '아직 미발급'(스킵)으로 잘못 기록되므로 사유를 정확히 남긴다.
         if _looks_like_bot_check(page):
             raise BlockedError(
@@ -693,7 +720,9 @@ def _fetch_tracking(context: BrowserContext, order_no: str,
 
     배송조회(tracking.auction.co.kr)는 **아직 발송 전인 주문에서 HTTP 500 오류
     페이지로 떨어진다**(2026-09-01 실측: 배송준비중 주문 3건 모두, 로그인된
-    진짜 크롬에서도 동일). 그 500 페이지를 예전에는 '아직 미발급'(스킵)으로
+    진짜 크롬에서도 동일. 2026-09-10부터는 그 자리의 500이 아니라 307로
+    www.auction.co.kr/Common/Html/Http500.html 오류 페이지로 넘긴다 -
+    _is_error_page). 그 500 페이지를 예전에는 '아직 미발급'(스킵)으로
     잘못 읽어서, 주문상세 레이어에서 상태부터 읽고 배송조회를 여는 순서
     (주문마다 2페이지)로 고쳤었다. 하지만 상태가 필요한 것은 배송조회에 송장이
     안 나온 주문뿐이라 순서를 뒤집었다 - 발송된 주문(송장이 나오는, 실제로
@@ -743,6 +772,14 @@ def _fetch_tracking(context: BrowserContext, order_no: str,
     _goto_settled(page, trace_url)
     result = _parse_trace_page(page, order_no)
     if result is None:
+        if _is_error_page(page):
+            # 발송 전이 아닌 주문(또는 상태를 못 읽은 주문)인데 배송조회가 오류
+            # 페이지다 - 옥션 쪽 장애거나 화면이 바뀐 것이니 스킵으로 묻지 않고
+            # 사람이 보게 실패로 남긴다.
+            raise ParseError(
+                f"배송조회가 옥션 오류 페이지로 넘어갑니다 (주문번호={order_no}"
+                + (f", 주문상태={status})." if status else ").")
+            )
         raise TrackingNotAvailableYet(
             f"아직 송장번호가 발급되지 않았습니다 (주문번호={order_no}"
             + (f", 주문상태={status})." if status else ").")
