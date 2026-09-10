@@ -174,11 +174,16 @@ NEXT_DATA_SELECTOR = "#__NEXT_DATA__"
 
 BOT_CHECK_PATTERNS = ["사람인지 확인", "봇(Bot)이란", "로봇이 아닙니다"]
 
-# 요청 간격은 기본값(1.5~4초)을 그대로 쓴다. 지마켓처럼 (6, 12초)로 늘렸었는데,
-# 옥션의 봇 확인은 간격이 아니라 **번들 크로미엄이라는 것 자체**에 걸리는
-# 것이었고(아래 WANTS_CDP_CHROME), 진짜 크롬(CDP)에서는 간격 없이 연속으로
-# 열어도(2026-09-01 프로브 여러 번) 봇 확인이 한 번도 안 떴다. 설령 뜨더라도
-# CDP 크롬에서는 Turnstile이 몇 초 만에 저절로 풀린다(browser.py 주석).
+# 요청 간격. 지마켓처럼 (6, 12초)로 늘렸었는데, 옥션의 봇 확인은 간격이 아니라
+# **번들 크로미엄이라는 것 자체**에 걸리는 것이었고(아래 WANTS_CDP_CHROME), 진짜
+# 크롬(CDP)에서는 간격 없이 연속으로 열어도(2026-09-01 프로브 여러 번) 봇 확인이
+# 한 번도 안 떴다. 설령 뜨더라도 CDP 크롬에서는 Turnstile이 몇 초 만에 저절로
+# 풀린다(browser.py 주석). 그 뒤로도 기본값(1.5~4초)을 두고 있었는데, 조회 한 건이
+# 발송 전 1.1초·발송 후 0.1초라(2026-09-10 실측) 간격이 조회보다 길어 3건에 7.8초
+# 중 절반 넘게가 대기였다. 같은 이베이코리아 통합 계정인 지마켓이 (0.5, 1.2)초로
+# 봇 확인 없이 돌고 있어 같은 값으로 맞춘다 - 봇 확인이 뜨기 시작하면 도로
+# 넓히면 된다.
+REQUEST_GAP = (0.5, 1.2)
 
 # 조회 자체를 우리가 직접 실행한 진짜 크롬(CDP)에서 한다는 표시 (orchestrator.py).
 # 옥션은 간격 문제가 아니라 **번들 크로미엄이라는 것 자체**로 봇 확인에 걸린다 -
@@ -613,6 +618,16 @@ def extract_order_no(product_url: str) -> str | None:
     return None
 
 
+def _shipping_info_from_next_data(raw: str) -> dict | None:
+    """__NEXT_DATA__ JSON 문자열에서 shippingInfo를 꺼낸다 (없거나 깨졌으면 None)."""
+    try:
+        data = json.loads(raw)
+    except Exception:
+        return None
+    info = data.get("props", {}).get("pageProps", {}).get("initialState", {}).get("shippingInfo")
+    return info if isinstance(info, dict) else None
+
+
 def _read_shipping_info(page: Page) -> dict | None:
     """배송조회 페이지의 <script id="__NEXT_DATA__">에서 shippingInfo를 꺼낸다.
 
@@ -623,11 +638,9 @@ def _read_shipping_info(page: Page) -> dict | None:
         return None
     try:
         raw = locator.first.text_content() or ""
-        data = json.loads(raw)
     except Exception:
         return None
-    info = data.get("props", {}).get("pageProps", {}).get("initialState", {}).get("shippingInfo")
-    return info if isinstance(info, dict) else None
+    return _shipping_info_from_next_data(raw)
 
 
 def _parse_delivery_text(page: Page) -> tuple[str, str] | None:
@@ -687,7 +700,11 @@ def _parse_trace_page(page: Page, order_no: str) -> TrackingResult | None:
             return None
         tracking_no, raw_courier = fallback
         return TrackingResult(tracking_no=tracking_no, courier=common.normalize_courier(raw_courier))
+    return _tracking_from_info(info, order_no)
 
+
+def _tracking_from_info(info: dict, order_no: str) -> TrackingResult | None:
+    """shippingInfo(__NEXT_DATA__)에서 송장을 만든다. 송장이 비어 있으면 None."""
     # 엉뚱한 주문의 송장을 가져오지 않았는지 검증한다.
     trace_order_no = str(info.get("orderNo") or "").strip()
     if trace_order_no and trace_order_no != order_no:
@@ -714,6 +731,71 @@ def _parse_trace_page(page: Page, order_no: str) -> TrackingResult | None:
     return TrackingResult(tracking_no=distinct.pop(), courier=courier)
 
 
+# 배송조회 HTML에서 __NEXT_DATA__ 스크립트만 잘라낸다 (request 직행 경로용).
+_NEXT_DATA_RE = re.compile(r'<script[^>]*id="__NEXT_DATA__"[^>]*>(.*?)</script>', re.S)
+
+TRACE_FOUND = "found"      # 송장이 있다
+TRACE_EMPTY = "empty"      # 배송조회는 열렸는데 송장이 비어 있다 (발송 전이거나 로그인 풀림)
+TRACE_ERROR = "error"      # 옥션 공통 오류 페이지로 넘어갔다 (발송 전 주문의 정상 반응)
+
+
+def _read_trace_direct(context: BrowserContext, order_no: str) -> tuple[str, TrackingResult | None] | None:
+    """배송조회를 페이지 이동 없이 context.request로 읽는다. 못 읽었으면 None.
+
+    배송조회는 서버 렌더링(__NEXT_DATA__)이라 HTML만 받으면 되고, CDP 크롬의
+    쿠키를 그대로 쓰는 context.request(지마켓 PAY_DETAIL_API와 같은 경로)로
+    받으면 0.03~0.07초다(페이지 이동은 0.2~0.3초 - 2026-09-10 실측). 발송 전
+    주문은 302 Location이 공통 오류 페이지(ERROR_PAGE_PATH)라 그것만 보고
+    끝난다(오류 페이지를 열지도 않는다). 그 밖의 응답(다른 곳으로 리다이렉트,
+    200이 아닌 상태, __NEXT_DATA__ 없는 본문=봇 확인 화면 등)은 여기서 판정하지
+    않고 None을 돌려줘 호출자가 기존 페이지 경로로 다시 읽게 한다 - 페이지 경로는
+    로그인 튕김·봇 확인을 이미 다루고 있다.
+    """
+    try:
+        response = context.request.get(TRACE_URL.format(order_no=order_no), max_redirects=0)
+    except Exception:  # noqa: BLE001 - 직행이 안 되면 페이지 경로로 간다
+        return None
+    if 300 <= response.status < 400:
+        location = response.headers.get("location", "")
+        if (urlparse(location).path or "").lower() == ERROR_PAGE_PATH:
+            return TRACE_ERROR, None
+        return None
+    if response.status != 200:
+        return None
+    match = _NEXT_DATA_RE.search(response.text())
+    if match is None:
+        return None
+    info = _shipping_info_from_next_data(match.group(1))
+    if info is None:
+        return None
+    result = _tracking_from_info(info, order_no)
+    return (TRACE_FOUND, result) if result is not None else (TRACE_EMPTY, None)
+
+
+def _read_trace(context: BrowserContext, order_no: str, *,
+                logged_in: bool) -> tuple[str, TrackingResult | None]:
+    """배송조회를 읽는다 - request 직행을 먼저, 안 되면 페이지로.
+
+    logged_in=False면 페이지 경로에서 로그인 튕김을 처리한다(_goto_logged_in).
+    True면 로그인이 확실한 상태라 바로 이동한다.
+    """
+    direct = _read_trace_direct(context, order_no)
+    if direct is not None:
+        return direct
+    page = _lookup_page(context)
+    trace_url = TRACE_URL.format(order_no=order_no)
+    if logged_in:
+        _goto_settled(page, trace_url)
+    else:
+        # __NEXT_DATA__는 서버에서 렌더링되어 오므로 기다릴 것이 없다 - 오류 페이지에서
+        # expect_selector로 1.5초를 기다리지 않도록 주소 확인만 맡긴다.
+        _goto_logged_in(page, trace_url)
+    if _is_error_page(page):
+        return TRACE_ERROR, None
+    result = _parse_trace_page(page, order_no)
+    return (TRACE_FOUND, result) if result is not None else (TRACE_EMPTY, None)
+
+
 def _fetch_tracking(context: BrowserContext, order_no: str,
                     *, check_status: bool = True) -> TrackingResult:
     """주문번호로 송장을 읽는다. 배송조회부터 열고, 송장이 없을 때만 상태를 확인한다.
@@ -734,13 +816,12 @@ def _fetch_tracking(context: BrowserContext, order_no: str,
     실측). 그래서 송장이 안 나왔을 때 곧바로 '발송 전'으로 판정하면 로그인이
     풀린 첫 주문을 오판한다 - 주문상세 레이어(로그인을 강제한다)에서 상태를
     읽고, 발송 전이 아니면 로그인된 상태로 배송조회를 한 번 더 연다.
+
+    배송조회는 페이지를 열지 않고 context.request로 먼저 읽는다(_read_trace_direct,
+    2026-09-10): 발송된 주문은 GET 한 번(0.07초)으로 끝나고, 발송 전 주문은 302
+    응답만 보고 주문상세 레이어로 넘어간다. 직행이 판정 못 한 응답만 페이지로 연다.
     """
-    trace_url = TRACE_URL.format(order_no=order_no)
-    page = _lookup_page(context)
-    # __NEXT_DATA__는 서버에서 렌더링되어 오므로 기다릴 것이 없다 - 500 페이지에서
-    # expect_selector로 1.5초를 기다리지 않도록 주소 확인만 맡긴다.
-    _goto_logged_in(page, trace_url)
-    result = _parse_trace_page(page, order_no)
+    _, result = _read_trace(context, order_no, logged_in=False)
     if result is not None:
         return result
 
@@ -751,6 +832,7 @@ def _fetch_tracking(context: BrowserContext, order_no: str,
             f"배송조회 화면에 아직 송장번호가 없습니다 (주문번호={order_no})."
         )
 
+    page = _lookup_page(context)
     _goto_logged_in(page, ORDER_DETAIL_URL.format(order_no=order_no),
                     expect_selector=DETAIL_TABLE_SELECTOR)
     if page.locator(DETAIL_TABLE_SELECTOR).count() == 0:
@@ -769,10 +851,9 @@ def _fetch_tracking(context: BrowserContext, order_no: str,
 
     # 발송 전도 아닌데 송장이 안 나왔었다 - 아까는 로그인이 풀려 있었던 것일 수
     # 있으므로(위 docstring), 로그인이 확실한 지금 배송조회를 한 번 더 연다.
-    _goto_settled(page, trace_url)
-    result = _parse_trace_page(page, order_no)
+    outcome, result = _read_trace(context, order_no, logged_in=True)
     if result is None:
-        if _is_error_page(page):
+        if outcome == TRACE_ERROR:
             # 발송 전이 아닌 주문(또는 상태를 못 읽은 주문)인데 배송조회가 오류
             # 페이지다 - 옥션 쪽 장애거나 화면이 바뀐 것이니 스킵으로 묻지 않고
             # 사람이 보게 실패로 남긴다.
