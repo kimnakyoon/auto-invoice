@@ -216,6 +216,14 @@ def prepare_batch(context: BrowserContext, orders, headless: bool = True) -> Non
     [더보기] 방식으로 읽는다. 둘 다 실패하면 아무것도 읽지 않은 것과 같아서,
     모든 주문이 예전처럼 상세를 여는 경로로 간다. 그래서 여기서는 어떤
     예외도 밖으로 내보내지 않는다.
+
+    API는 브라우저 쿠키로 보낸다. 세션이 없으면 403으로 거부되는데(로그아웃
+    상태 실측), 예전에는 그대로 화면 방식으로 물러났고 그 화면도 로그인
+    페이지라 카드가 0장이었다 - 2026-09-11 10:24 실행에서 롯데온 47건이
+    "0/46건 미리 확인"으로 끝나 전부 상세를 열었고 158초가 걸렸다(전날 같은
+    규모 17초). 그래서 prepare_inquiries와 같이, 거부되면 화면을 한 번 열어
+    로그인하고 API를 다시 묻는다. 로그인은 어차피 첫 상세에서 했을 일이라
+    비용이 늘지 않는다.
     """
     wanted = set()
     for order in orders:
@@ -229,6 +237,14 @@ def prepare_batch(context: BrowserContext, orders, headless: bool = True) -> Non
     found = None
     try:
         found = _prefetch_via_api(context, wanted)
+        if found is None:
+            # 세션이 없어 거부된 것일 수 있다 - 화면으로 로그인하고 한 번 더.
+            page = context.new_page()
+            try:
+                _goto_logged_in(page, ORDER_LIST_URL, headless)
+            finally:
+                page.close()
+            found = _prefetch_via_api(context, wanted)
     except Exception as e:  # noqa: BLE001 - API가 안 되면 화면 방식으로
         common.safe_print(f"[lotteon] 주문목록 API를 읽지 못해 화면 목록으로 대신합니다 ({e}).")
     if found is None:
@@ -270,6 +286,8 @@ def _api_json(context: BrowserContext, url: str, payload: dict | None) -> dict |
             if response.status == 200:
                 return response.json()
             problem = f"응답이 {response.status}입니다"
+            if response.status in (401, 403):
+                break  # 세션이 없는 것이라 잠시 뒤 다시 보내도 같다 - 호출한 쪽이 로그인한다
         except Exception as e:  # noqa: BLE001 - 네트워크 오류도 한 번은 다시 시도한다
             problem = f"요청이 실패했습니다 ({e})"
         if attempt == 1:
