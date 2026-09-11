@@ -57,7 +57,8 @@ from .base import (
     ParseError,
     TrackingNotAvailableYet,
     normalize_option,
-    raise_if_cancelled,
+    raise_if_cancelled_any,
+    raise_if_delayed_any,
     with_order_date,
 )
 
@@ -90,6 +91,13 @@ LOGIN_RESPONSE_TIMEOUT_MS = 15 * 1000  # 로그인 API 응답 대기
 
 TRACKING_LINK_TEXT = "배송조회"
 NOT_YET_PATTERNS = ["배송준비중", "결제완료", "입금대기", "주문확인중"]
+# 상품별 주문상태 칸. 주문상세는 li.mm_product-item 하나가 상품 하나이고 그 안의
+# p.text_status 에 '결제완료' / '배송중' / '환불완료' 같은 상태가 들어있다.
+# 판정은 반드시 이 칸만 본다 - 화면 전체 텍스트에는 왼쪽 메뉴의 "배송지연 신고",
+# "품절취소 신고", "취소/반품/교환/환불 내역" 같은 항목이 항상 같이 잡혀서, 취소·
+# 지연 판정이 주문 상태가 아니라 메뉴 글자에 걸린다 (2026-09-11 실측: '환불완료'
+# 주문 2건이 메뉴의 "배송지연 신고"에 걸려 '발송지연' 스킵으로 잘못 기록됐다).
+STATUS_SELECTOR = "li.mm_product-item p.text_status"
 
 
 def extract_order_no(product_url: str) -> str:
@@ -192,6 +200,21 @@ def _wait_for_manual_login(page) -> bool:
         page, lambda: _looks_like_login_page(page), LOGIN_WAIT_TIMEOUT_MS)
 
 
+def _item_statuses(page) -> list[str]:
+    """상품별 주문상태 값 (화면 순서). 없으면 빈 목록.
+
+    '배송중' 상태 칸에는 [배송조회] 링크가 같은 칸에 붙어 innerText가
+    "배송중
+배송조회"로 나오므로 첫 줄만 상태로 본다.
+    """
+    statuses = []
+    for text in page.locator(STATUS_SELECTOR).all_inner_texts():
+        first_line = text.strip().splitlines()[0].strip() if text.strip() else ""
+        if first_line:
+            statuses.append(first_line)
+    return statuses
+
+
 def _collect_tracking_links(page) -> list[str]:
     """"배송조회" 링크의 href를 화면에 나온 순서 그대로 수집한다.
 
@@ -256,11 +279,18 @@ def _scrape_tracking_from_page(
 ) -> TrackingResult:
     hrefs = _collect_tracking_links(page)
     if not hrefs:
-        body_text = page.inner_text("body")
-        if any(p in body_text for p in NOT_YET_PATTERNS):
-            raise TrackingNotAvailableYet(f"아직 송장번호가 발급되지 않았습니다 (주문번호={order_no}).")
-        raise_if_cancelled(body_text, order_no)
-        raise ParseError(f"배송조회 링크를 찾지 못했습니다 (주문번호={order_no}).")
+        # 상태 칸만 본다 (STATUS_SELECTOR 주석 참고). 상품이 여러 줄이면 하나라도
+        # 진행 중(결제완료 등)이면 아직 미발급, 아니면 취소/품절/환불완료,
+        # 그다음 지연 순으로 본다 - 준비 중인 줄이 있는데 취소 줄 하나로
+        # 취소로 분류하면 다음 실행에서 다시 조회되지 않는다.
+        statuses = _item_statuses(page)
+        status_text = " / ".join(statuses)
+        if any(p in status_text for p in NOT_YET_PATTERNS):
+            raise TrackingNotAvailableYet(f"아직 송장번호가 발급되지 않았습니다 (주문번호={order_no}, 상태={status_text}).")
+        raise_if_cancelled_any(statuses, order_no)
+        raise_if_delayed_any(statuses, order_no)
+        raise ParseError(
+            f"배송조회 링크를 찾지 못했습니다 (주문번호={order_no}, 상태={status_text or '상태 칸 없음'}).")
 
     tracked: list[tuple[str, dict]] = []
     for href in hrefs:
@@ -320,11 +350,14 @@ def get_tracking(
                 raise BlockedError("로그인 후에도 여전히 로그인 페이지입니다.")
 
         # 화면이 아직 덜 그려진 채로 읽으면 '아직 미발급'으로 잘못 넘길 수 있다
-        # (조용히 틀리는 쪽이라 특히 위험하다). [배송조회]든 진행중 상태 문구든
-        # 판단에 쓸 것이 하나라도 보일 때까지만 기다린다 - 보통은 이미 있어서
-        # 그냥 지나간다.
-        common.wait_for_text(page, [TRACKING_LINK_TEXT, *NOT_YET_PATTERNS],
-                             common.ORDER_RENDER_WAIT_MS)
+        # (조용히 틀리는 쪽이라 특히 위험하다). 상품별 상태 칸이 뜰 때까지만
+        # 기다린다 - 보통은 이미 있어서 그냥 지나간다. 예전에는 [배송조회]나
+        # 진행중 문구를 기다렸는데, 환불완료 주문은 둘 다 없어 매번 대기 시간을
+        # 다 채웠다. 안 뜨면 아래에서 '상태 칸 없음' ParseError로 남는다.
+        try:
+            page.wait_for_selector(STATUS_SELECTOR, timeout=common.ORDER_RENDER_WAIT_MS)
+        except PlaywrightTimeoutError:
+            pass
         # 주문상세 화면을 떠나기 전에 주문일부터 읽어둔다 (오래된 주문을 결과에 따로 모으는 데 쓴다).
         return with_order_date(page, lambda: _scrape_tracking_from_page(context, page, order_no, order_option))
     finally:
