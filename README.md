@@ -459,7 +459,11 @@ python scripts/run_all.py --stop-before-apply   # 일괄등록까지만, 마지�
 답변을 어댑터 `fetch_inquiry_answer(context, product_url, recipient_name, since=, inquiry_id=)`로
 읽어 `ReportEntry.inquiry_note`에 싣고, 결과 엑셀 두 시트의 '사유' 칸에 원래 사유 아래 줄로
 `[문의 답변 2026.09.11] ...`(진한 녹색) 또는 `[문의 09-10 남김 - 답변대기]`를 붙인다
-(`result_excel.compose_reason`). 결과는 장부 항목의 `answer_check`에 남고 답변이 온 문의는
+(`result_excel.compose_reason`). 답변은 `condense_answer`가 인사·감사·사과·"노력하겠습니다"·
+추가 문의 안내·일반 양해 같은 상투 문장을 걷어낸 핵심 문장만 싣는다(사용자 요청 2026-09-11) -
+줄을 문장으로 이어 붙이고(사이트가 문장 중간에서 줄을 끊는다) 숫자가 든 문장은 전화번호만 빼고
+무조건 남기며, '~입니다'로 끝나는 소속 소개는 배송 낱말이 없을 때만 지운다. 규칙은 그날까지의
+답변 51건으로 맞췄고 장부에는 원문이 그대로 있어 규칙만 고치면 된다. 결과는 장부 항목의 `answer_check`에 남고 답변이 온 문의는
 다시 묻지 않는다(14일 지난 문의도). `scripts/check_answers.py`는 같은 확인을 따로 돌려 최신
 결과 엑셀의 '사유' 칸을 제자리에서 고친다(`update_excel` - 전에 붙인 메모는 떼고 다시 붙여
 여러 번 돌려도 한 번만 남는다). 읽기만 하고 등록 주소는 건드리지 않는다.

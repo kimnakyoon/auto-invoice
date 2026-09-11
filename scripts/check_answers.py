@@ -40,7 +40,8 @@ def main() -> None:
     print(f"장부 {len(by_id)}건 중 답변 받은 문의 {len(answered)}건")
     for e in answered:
         check = e["answer_check"]
-        first = next((ln for ln in check["answer"].splitlines() if ln.strip()), "")
+        first = next((ln for ln in inquiry_answers.condense_answer(check["answer"], e.get("message") or "").splitlines()
+                      if ln.strip()), "")
         print(f"  {e['site']} {e['order_id']} {e.get('recipient_name') or ''}: "
               f"{check.get('answered_on') or ''} {first[:90]}")
 

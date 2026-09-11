@@ -104,7 +104,7 @@ def note_for(entry: dict) -> str:
     posted_short = posted[5:] if len(posted) == 10 else posted
     if check.get("answer"):
         when = f" {check['answered_on'].replace('-', '.')}" if check.get("answered_on") else ""
-        return f"{NOTE_PREFIX} 답변{when}] {_shorten(check['answer'])}"
+        return f"{NOTE_PREFIX} 답변{when}] {_shorten(condense_answer(check['answer'], str(entry.get('message') or '')))}"
     if check.get("problem"):
         return f"{NOTE_PREFIX} {posted_short} 남김 - 답변 확인 못 함: {check['problem']}]"
     if check.get("state"):
@@ -117,6 +117,88 @@ def _shorten(text: str) -> str:
     if len(text) <= ANSWER_MAX_CHARS:
         return text
     return text[:ANSWER_MAX_CHARS].rstrip() + " …(이하 생략)"
+
+
+# --------------------------------------------------------------------------
+# 답변에서 인사말·상투구를 걷어내고 핵심 문장만 남기기 (사용자 요청 2026-09-11)
+# --------------------------------------------------------------------------
+# 장부에는 답변 원문을 그대로 두고 사유 칸에 실을 때만 줄인다 - 규칙을 고쳐도 다시
+# 읽어올 필요가 없다. 규칙은 2026-09-11까지 받은 답변 51건(7개 사이트)으로 맞췄다:
+#   - 줄을 문장으로 나눈다. 사이트가 문장 중간에서 줄을 끊어 보내기도 해서(GS샵
+#     "먼저 문의하신 내용에 대해 바로 확인해" / "드리지 못해 죄송합니다.") 마침표·
+#     물음표·'다/요'로 끝나지 않고 글머리표(■ - ·)나 숫자로 끝나지도 않는 줄은
+#     다음 줄에 이어 붙인다. 지마켓처럼 한 줄에 여러 문장을 붙여 보내는 것은
+#     '~니다' 뒤 공백에서도 나눈다.
+#   - 우리가 남긴 문구가 답변 앞에 그대로 인용돼 오는 것(지마켓)은 지운다.
+#   - 상투 문장(인사·감사·사과·"노력하겠습니다"·추가 문의 안내·일반 양해·"조금만
+#     기다려")은 버리되, **숫자가 든 문장은 남긴다** - "9/11일까지 배송예정이니
+#     조금만 기다려 주시기 바랍니다"처럼 날짜·송장번호가 있는 문장이 핵심이다.
+#   - 다 걸러져 남는 게 없으면 원문을 그대로 쓴다.
+ANSWER_SENTENCE_END = re.compile(r"[.!?…]\)?$|[다요죠]$|\d$")
+ANSWER_BULLET_START = re.compile(r"^[■\-·•*\[(]")
+ANSWER_SENTENCE_SPLIT = re.compile(r"(?<=[.!?…])\s+|(?<=니다)[.!?]?\s+(?=\S)")
+ANSWER_LEADING_JUNK = re.compile(r"^[\s:;,.)\-]+")
+ANSWER_BOILERPLATE = re.compile(
+    "|".join([
+        r"안녕하세요", r"인사드립니다",
+        r"감사합니다", r"감사드립니다", r"감사드리며", r"이용해 주셔서", r"주문해주셔서",
+        r"죄송합니다", r"죄송스럽", r"죄송하다는", r"사과드립니다", r"사과의 말씀",
+        r"불편을 드려", r"불편 드려", r"기다리시게", r"기다리게 해", r"기다리셨", r"기다려주셔서",
+        r"노력하겠습니다", r"최선을 다", r"되겠습니다", r"보답하겠", r"약속드립니다", r"도와드리겠습니다",
+        r"행복한", r"편안한 하루", r"편안하고", r"좋은 하루", r"건강하시", r"기원합니다", r"되십시오", r"보내세요",
+        r"평온하고", r"가득하길",
+        r"추가 문의", r"다른 문의", r"문의 부탁", r"고객센터 ☎", r"유선 안내", r"발신번호", r"연락드릴 수 있는 점",
+        r"자세한 배송현황", r"교환/반품이 필요", r"마이롯데'를 통해", r"확인하실 수 있습니다",
+        r"양해 부탁", r"양해 바랍", r"참고 부탁", r"사정에 따라", r"달라질 수 있", r"변동될 수 있",
+        r"품절될 수 있", r"지연될 수 있", r"발생될 수 있", r"소요되는 점",
+        r"조금만 기다려", r"조금만 더 기다려", r"기다려 주시기", r"기다려주세요",
+        r"다시 연락드리", r"즉시 고객님께 연락", r"^\[.*\]$",
+    ]))
+ANSWER_HAS_DIGIT = re.compile(r"\d")
+# 전화번호(1899-4500, 1588-2121)는 날짜·송장번호가 아니다 - 숫자 보호에서 뺀다.
+ANSWER_PHONE = re.compile(r"\d{2,4}-\d{3,4}(?:-\d{4})?")
+# 소속 소개("롯데홈쇼핑 ○○○입니다", "NS홈쇼핑 상담사 ○○○입니다") - '~입니다'로 끝나면서
+# 배송 정보 낱말이 하나도 없는 짧은 문장. "금일 출고 예정입니다"는 정보 낱말이 있어 남는다.
+ANSWER_INTRO_END = re.compile(r"입니다[.!]?$")
+ANSWER_INFO_WORD = re.compile(r"출고|발송|배송|예정|송장|재고|품절|입고|취소|환불|확인|수급|접수|문자|이동|택배|주문")
+ANSWER_LEADING_CUSTOMER = re.compile(r"^고객님[,.!]?\s+")
+
+
+def _is_boilerplate(sentence: str) -> bool:
+    if ANSWER_HAS_DIGIT.search(ANSWER_PHONE.sub("", sentence)):
+        return False    # 날짜·송장번호가 든 문장은 어떤 상투구가 섞여 있어도 남긴다
+    if ANSWER_BOILERPLATE.search(sentence):
+        return True
+    return bool(ANSWER_INTRO_END.search(sentence)) and not ANSWER_INFO_WORD.search(sentence)
+
+
+def _answer_sentences(text: str) -> list[str]:
+    """줄을 이어 붙여 문장 단위로 나눈다 (헤더 주석의 규칙)."""
+    joined: list[str] = []
+    for raw in text.splitlines():
+        line = re.sub(r"\s+", " ", raw).strip()
+        if not line:
+            continue
+        if (joined and not ANSWER_SENTENCE_END.search(joined[-1])
+                and not ANSWER_BULLET_START.match(line) and not ANSWER_BULLET_START.match(joined[-1])):
+            joined[-1] = f"{joined[-1]} {line}"
+        else:
+            joined.append(line)
+    sentences: list[str] = []
+    for line in joined:
+        for part in ANSWER_SENTENCE_SPLIT.split(line):
+            part = ANSWER_LEADING_JUNK.sub("", part or "").strip()
+            part = ANSWER_LEADING_CUSTOMER.sub("", part)   # "안녕하세요. 고객님" 줄이 다음 줄에 붙은 흔적
+            if part:
+                sentences.append(part)
+    return sentences
+
+
+def condense_answer(text: str, message: str = "") -> str:
+    """답변에서 인사말·상투구를 걷어내고 핵심 문장만 (없으면 원문)."""
+    body = text.replace(message, " ") if message else text
+    kept = [s for s in _answer_sentences(body) if not _is_boilerplate(s)]
+    return "\n".join(kept) if kept else re.sub(r"\n{2,}", "\n", text.strip())
 
 
 # --------------------------------------------------------------------------
