@@ -281,11 +281,20 @@ class App:
         to_post = sum(len(v) for v in by_site.values())
         site_lines = "\n".join(f"   · {site} {len(items)}건" for site, items in by_site.items())
         if to_post == 0:
-            messagebox.showinfo(
+            # 남길 게 없어도 전에 남긴 문의의 답변은 가져온다 (사용자 요청 2026-09-11 -
+            # 답변 확인은 송장조회가 아니라 [문의]를 눌렀을 때).
+            if not messagebox.askokcancel(
                 "문의할 주문 없음",
                 f"{path.name}\n\n'{inquiry.STALE_SHEET_NAME}' 시트의 {inquiry.TARGET_DAYS_TEXT} 지남 "
                 f"{len(targets)}건 중 남길 건이 없습니다.\n"
-                f"(이미 남긴 주문이거나 아직 자동화하지 않은 사이트입니다 - {len(skipped)}건)")
+                f"(이미 남긴 주문이거나 아직 자동화하지 않은 사이트입니다 - {len(skipped)}건)\n\n"
+                "전에 남긴 문의의 답변만 확인해 이 엑셀의 '사유' 칸에 적을까요?\n"
+                "(엑셀은 닫아두세요)",
+            ):
+                return
+            self._set_busy(True, "문의 답변 확인 중...")
+            self._log("전에 남긴 문의의 답변 확인을 시작합니다.\n")
+            threading.Thread(target=self._inquiry_worker, args=(str(path),), daemon=True).start()
             return
         if not messagebox.askokcancel(
             "문의 남기기",
@@ -296,7 +305,8 @@ class App:
             f"   · 넘김 {len(skipped)}건 (이미 남김 / 아직 지원하지 않는 사이트)\n\n"
             "· 공급사 사이트에 실제로 문의 글이 올라갑니다\n"
             "· 로그인이 필요하면 브라우저 창이 뜹니다 (지마켓은 항상 크롬 창이 뜹니다)\n"
-            "· 지마켓은 연속 등록 제한 때문에 한 건에 1분씩 걸립니다\n\n"
+            "· 지마켓은 연속 등록 제한 때문에 한 건에 1분씩 걸립니다\n"
+            "· 남긴 뒤 전에 남긴 문의의 답변을 확인해 이 엑셀의 '사유' 칸에 적습니다 (엑셀은 닫아두세요)\n\n"
             "진행할까요?",
         ):
             return

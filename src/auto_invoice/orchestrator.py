@@ -22,7 +22,7 @@ from typing import Callable, Iterable
 from playwright.sync_api import sync_playwright
 
 from . import browser as browser_mod
-from . import inquiry_answers, rate_limit
+from . import rate_limit
 from .config import load_settings
 from .report import RunReport
 from .shopmine import excel_io
@@ -332,18 +332,6 @@ def _lookup_site(site_key: str, jobs: list, *, settings, headless: bool,
                                            product_url=order.product_url)
                 finally:
                     shared.finished(order.order_id, message)
-
-            # 이 사이트에 남긴 1:1 문의의 답변을 브라우저를 닫기 전에 읽어 결과에 싣는다
-            # (inquiry_answers) - 세션이 살아 있는 지금이 가장 싸고, 사이트별 스레드라
-            # 다른 사이트 조회와 겹친다. 여기서 무엇이 잘못돼도 조회 결과는 그대로다.
-            try:
-                wanted = {order.order_id for order, _ in jobs}
-                with shared.lock:
-                    mine = [e for e in shared.report.entries if e.order_id in wanted]
-                inquiry_answers.check_in_context(site_key, jobs[0][1], context, mine,
-                                                 headless=headless, log=common.safe_print)
-            except Exception as e:  # noqa: BLE001
-                common.safe_print(f"[{site_key}] 문의 답변 확인을 건너뜁니다 - {e}")
         finally:
             # CDP 크롬은 프로필 자체가 남아 세션 저장이 필수는 아니고,
             # 실패해도 조회 결과를 잃으면 안 되므로 조용히 넘어간다.

@@ -1,10 +1,19 @@
-"""남긴 1:1 문의에 공급사 답변이 달렸는지 확인해 장부에 적고, 결과 엑셀의 '사유' 칸에 싣는다.
+"""남긴 1:1 문의에 공급사 답변이 달렸는지 확인해 장부에 적고, 송장조회 결과 엑셀의 '사유' 칸에 싣는다.
 
 왜 필요한가: [문의] 버튼으로 "○○○ 배송 언제 시작하나요?"를 남기면 공급사가
 하루 안팎에 "9/15까지 재고 확보 후 발송" 같은 답을 단다. 그 답을 보려면 사람이
-사이트마다 문의내역을 열어야 했다. 다음 송장조회 때 그 주문이 '주문일지연'에
-그대로 남아 있으면(3일 지남, 4일 지남...) 답변을 같이 보여줘야 '기다리면 되는지'를
-한눈에 판단할 수 있다.
+사이트마다 문의내역을 열어야 했다. 다음 날 [문의]를 누를 때 그 답을 같이 가져와
+결과 엑셀에 붙여두면 '주문일지연'에 남은 건을 기다리면 되는지 한눈에 판단할 수 있다.
+
+언제 확인하나 - [문의] 버튼(inquiry.run)을 눌렀을 때다 (사용자 요청 2026-09-11 - 그 전엔
+송장조회가 조회 직후에 했다). 문의를 남기는 김에 전에 남긴 문의의 답을 읽는다:
+  - 사이트별로 문의를 다 남기고 브라우저를 닫기 전에 check_site_with_context가 그
+    사이트의 답 없는 문의를 같은 로그인 세션으로 읽는다 - 브라우저를 다시 열지 않는다.
+  - 이번에 남길 문의가 없는 사이트는 refresh가 사이트마다 스레드 하나로 브라우저를
+    열어 병렬로 읽는다(2026-09-11 실측 장부 71건 4.3초).
+  - 오늘 남긴 문의는 묻지 않는다 - 답이 있을 수 없다(2일 지남은 그날 남기는 건이고,
+    다음 날부터 답을 본다는 사용자 기준).
+  - 남길 문의가 하나도 없어도 [문의]를 누르면 답변 확인만 한다.
 
 무엇을 하나:
   - 장부(logs/inquiries.json)의 문의 중 아직 답변을 못 받은 것(최근
@@ -13,13 +22,11 @@
     상세를 열고, 없으면 등록 때와 같은 방법으로 문의내역을 뒤진다.
   - 결과는 장부 항목의 answer_check에 적는다 {checked_at, state, inquiry_id, answer,
     answered_on, problem}. 답변이 온 문의는 다시 묻지 않는다(답변이 바뀌는 일은 없다).
-  - 송장조회 파이프라인은 조회가 끝난 뒤 attach()로 장부에 있는 주문(송장을 받은
-    성공 건 제외 - 대부분 '주문일지연' 건)만 확인해 ReportEntry.inquiry_note에 싣는다 -
-    결과 엑셀 두 시트의 '사유' 칸에 원래 사유 아래 줄로 "[문의 답변 2026.09.11] ..." 또는
-    "[문의 09-10 남김 - 답변대기]"가 붙는다(result_excel.compose_reason). 답변이 온 칸은
-    진한 녹색 글자.
-  - scripts/check_answers.py는 이것을 따로 돌려 최신 결과 엑셀의 '사유' 칸을 제자리에서
-    고친다(update_excel) - 파이프라인을 다시 돌리지 않고도 오늘 온 답변을 볼 수 있다.
+  - update_excel이 [문의]가 읽은 송장조회 결과 엑셀(바탕화면 최신)의 두 시트 '사유' 칸에
+    원래 사유 아래 줄로 "[문의 답변 2026.09.11] ..."(진한 녹색) 또는
+    "[문의 09-10 남김 - 답변대기]"를 제자리에서 붙인다(result_excel.compose_reason). 전에
+    붙인 메모는 떼고 다시 붙여 여러 번 돌려도 한 줄만 남는다.
+  - scripts/check_answers.py는 같은 확인을 [문의] 없이 따로 돌린다.
 
 읽기만 한다 - 문의내역 목록·상세는 GET(롯데아이몰 상세 레이어·NS홈쇼핑 상세는 화면이
 쓰는 조회용 POST)이고 등록 주소는 건드리지 않는다. 롯데온은 화면에서 항목을 펼치면
@@ -42,10 +49,8 @@ from openpyxl import load_workbook
 from playwright.sync_api import sync_playwright
 
 from . import browser as browser_mod
-from . import order_date as order_date_mod
 from .inquiry import LEDGER_PATH, load_ledger, posted_order_ids
-from .models import ReportEntry
-from .result_excel import SHEET_NAME, STALE_SHEET_NAME, compose_reason, strip_note
+from .result_excel import SHEET_NAME, STALE_SHEET_NAME, compose_reason, strip_note, style_reason_cell
 from .suppliers import common
 from .suppliers.base import AdapterError, BlockedError
 from .suppliers.registry import get_adapter
@@ -227,15 +232,12 @@ def _record_checks(checks: dict[str, dict]) -> dict[str, dict]:
     return {str(e.get("order_id")): e for e in ledger if e.get("order_id")}
 
 
-def refresh(order_ids: set[str] | None = None, *, headless: bool = True, force: bool = False,
-            sites: set[str] | None = None, log: LogFn = print) -> dict[str, dict]:
-    """장부의 문의에 답변이 달렸는지 사이트에 물어 장부를 갱신하고, 주문번호 -> 장부 항목을 돌려준다.
+def pending_by_site(*, order_ids: set[str] | None = None, sites: set[str] | None = None,
+                    force: bool = False, skip_today: bool = False) -> dict[str, list[dict]]:
+    """사이트에 물어볼 장부 항목을 사이트별로 묶는다 (답 없는 최근 문의).
 
-    order_ids를 주면 그 주문만, 없으면 최근 문의 전부. 사이트마다 스레드 하나가 자기
-    브라우저를 열어 한 건씩 묻는다 - 송장조회(orchestrator)와 같은 병렬 구조라 전체
-    시간은 가장 느린 사이트 하나만큼이다(2026-09-11 실측: 7개 사이트 1건씩 순차 9.1초 →
-    병렬 3초 안팎). 사이트 하나가 끝날 때마다 장부를 저장해 도중에 멈춰도 확인한 것은
-    남고, 한 사이트의 실패는 그 사이트 항목에만 적힌다.
+    skip_today면 오늘 남긴 문의는 뺀다 - [문의] 실행이 방금 남긴 것에는 답이 있을 수
+    없다(다음 날부터 본다는 사용자 기준 2026-09-11).
     """
     today = date.today()
     by_site: dict[str, list[dict]] = {}
@@ -246,7 +248,24 @@ def refresh(order_ids: set[str] | None = None, *, headless: bool = True, force: 
             continue
         if not needs_check(entry, today, force=force):
             continue
+        if skip_today and _posted_on(entry) == today:
+            continue
         by_site.setdefault(str(entry.get("site") or ""), []).append(entry)
+    return by_site
+
+
+def refresh(order_ids: set[str] | None = None, *, headless: bool = True, force: bool = False,
+            sites: set[str] | None = None, skip_today: bool = False,
+            log: LogFn = print) -> dict[str, dict]:
+    """장부의 문의에 답변이 달렸는지 사이트에 물어 장부를 갱신하고, 주문번호 -> 장부 항목을 돌려준다.
+
+    order_ids를 주면 그 주문만, 없으면 최근 문의 전부. 사이트마다 스레드 하나가 자기
+    브라우저를 열어 한 건씩 묻는다 - 송장조회(orchestrator)와 같은 병렬 구조라 전체
+    시간은 가장 느린 사이트 하나만큼이다(2026-09-11 실측: 7개 사이트 1건씩 순차 9.1초 →
+    병렬 3초 안팎). 사이트 하나가 끝날 때마다 장부를 저장해 도중에 멈춰도 확인한 것은
+    남고, 한 사이트의 실패는 그 사이트 항목에만 적힌다.
+    """
+    by_site = pending_by_site(order_ids=order_ids, sites=sites, force=force, skip_today=skip_today)
 
     def _one_site(site: str, items: list[dict]) -> None:
         adapter = get_adapter(items[0].get("product_url") or "")
@@ -367,75 +386,36 @@ def _first_line(text: str, limit: int = 80) -> str:
 # 결과에 싣기
 # --------------------------------------------------------------------------
 
-# 조회 직후 답변을 볼 최소 '지난 일수' - 2일 지남은 그날 문의를 남기는 건이라 뺀다.
-ANSWER_MIN_DAYS = order_date_mod.STALE_DAYS + 1
+def check_site_with_context(site: str, adapter, context, *, headless: bool,
+                            log: LogFn = print) -> dict[str, dict]:
+    """[문의]가 한 사이트의 문의를 다 남기고 브라우저를 닫기 전에 부른다 - 그 사이트의 답 없는 문의를 읽어 장부에 적는다.
 
-
-def _old_enough_to_answer(entry: ReportEntry) -> bool:
-    """주문일을 모르면(실패 건 등) 장부에 있다는 것만으로 본다 - 문의를 남긴 건 확실하다."""
-    days = order_date_mod.days_since(entry.order_date)
-    return days is None or days >= ANSWER_MIN_DAYS
-
-
-def _targets(entries: list[ReportEntry], by_id: dict[str, dict]) -> list[ReportEntry]:
-    """답변을 실을 조회 결과 - 장부에 있고, 송장을 못 받았고, 3일 이상 지났고, 아직 안 실은 것.
-
-    실패·취소/품절로 분류된 건도 장부에 있으면 본다 - 품절 답변("취소만 가능")이 거기서
-    나온다. 성공(송장 받음)은 답이 더 필요 없다. '2일 지남'은 뺀다(사용자 기준 2026-09-11):
-    2일 지남은 이 조회가 끝난 뒤 [문의]로 그날 남기는 건이라 확인할 답변이 없고, 3일
-    지남부터가 '2일이던 날 남긴 문의'의 답을 볼 차례다.
-    """
-    return [e for e in entries
-            if e.status != "success" and e.inquiry_note is None and e.order_id in by_id
-            and _old_enough_to_answer(e)]
-
-
-def check_in_context(site: str, adapter, context, entries: list[ReportEntry], *, headless: bool,
-                     log: LogFn = print) -> int:
-    """송장조회가 한 사이트를 끝내고 브라우저를 닫기 전에 부른다 - 그 사이트 주문의 답변을 확인해 싣는다.
-
-    브라우저·로그인 세션을 그대로 쓰고 사이트별 스레드 안에서 도니 조회 시간에 거의
-    묻힌다(브라우저를 다시 여는 방식은 사이트마다 1~3초). 답변을 이미 받은 문의는
-    장부의 것을 그대로 싣고 사이트에 묻지 않는다. 실은 건수를 돌려준다.
+    브라우저·로그인 세션을 그대로 쓰니 사이트마다 브라우저를 다시 여는 refresh보다
+    싸다. 오늘 남긴 문의는 뺀다. 주문번호 -> 확인 결과를 돌려주고, 여기서 무엇이
+    잘못돼도 문의 남기기 결과는 그대로다(문제는 장부 항목의 problem에 적힌다).
     """
     if getattr(adapter, "fetch_inquiry_answer", None) is None:
-        return 0
-    by_id = _ledger_by_id()
-    targets = _targets(entries, by_id)
-    if not targets:
-        return 0
-    pending = [by_id[e.order_id] for e in targets if needs_check(by_id[e.order_id])]
-    if pending:
-        try:
-            checks = check_with_context(site, adapter, context, pending, headless=headless, log=log)
-        except Exception as e:  # noqa: BLE001 - 답변 확인이 조회 결과를 덮으면 안 된다
-            problem = str(e) if isinstance(e, AdapterError) else f"{type(e).__name__}: {e}"
-            log(f"  [{site}] 답변 확인 실패 - {problem}")
-            checks = {str(entry.get("order_id")): _check(problem=problem) for entry in pending}
-        by_id = _record_checks(checks)
-    for e in targets:
-        e.inquiry_note = note_for(by_id[e.order_id])
-    return len(targets)
+        return {}
+    items = pending_by_site(sites={site}, skip_today=True).get(site) or []
+    if not items:
+        return {}
+    try:
+        checks = check_with_context(site, adapter, context, items, headless=headless, log=log)
+    except Exception as e:  # noqa: BLE001
+        problem = str(e) if isinstance(e, AdapterError) else f"{type(e).__name__}: {e}"
+        log(f"  [{site}] 답변 확인 실패 - {problem}")
+        checks = {str(entry.get("order_id")): _check(problem=problem) for entry in items}
+    _record_checks(checks)
+    return checks
 
 
-def attach(entries: list[ReportEntry], *, headless: bool = True, log: LogFn = print) -> int:
-    """조회 결과 중 아직 답변을 안 실은 건(check_in_context를 거치지 않은 것)에 답변을 싣는다. 실은 건수.
+def answered_ids(by_id: dict[str, dict]) -> set[str]:
+    """답변을 받은 문의의 주문번호들 (실행 전후를 견줘 '새로 온 답변'을 고르는 데 쓴다)."""
+    return {oid for oid, e in by_id.items() if (e.get("answer_check") or {}).get("answer")}
 
-    송장조회 파이프라인이 조회 직후에 부른다. 이번 실행에서 조회한 사이트는
-    check_in_context가 브라우저를 닫기 전에 이미 실었으므로, 여기 남는 것은 지난 실행의
-    진행 상황(checkpoint)에서 이어받은 건 정도다 - 그때만 사이트별 브라우저를 다시 연다.
-    """
-    by_id = _ledger_by_id()
-    targets = _targets(entries, by_id)
-    if not targets:
-        return 0
-    wanted = {e.order_id for e in targets}
-    if any(needs_check(by_id[oid]) for oid in wanted):
-        log(f"  문의를 남긴 주문 {len(wanted)}건의 답변을 확인합니다.")
-        by_id = refresh(wanted, headless=headless, log=log)
-    for e in targets:
-        e.inquiry_note = note_for(by_id[e.order_id])
-    return len(targets)
+
+def ledger_by_id() -> dict[str, dict]:
+    return _ledger_by_id()
 
 
 def update_excel(path: str | Path, by_id: dict[str, dict]) -> int:
@@ -461,9 +441,11 @@ def update_excel(path: str | Path, by_id: dict[str, dict]) -> int:
                 if entry is None:
                     continue
                 cell = row[col_reason]
-                new_value = compose_reason(note_for(entry), strip_note(str(cell.value or "")))
+                note = note_for(entry)
+                new_value = compose_reason(note, strip_note(str(cell.value or "")))
                 if cell.value != new_value:
                     cell.value = new_value
+                    style_reason_cell(cell, note)
                     changed += 1
         if changed:
             wb.save(path)

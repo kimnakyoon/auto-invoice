@@ -27,6 +27,12 @@ AlreadyInquired를 내면(지마켓·SSG·네이버·GSSHOP·롯데아이몰·NS
 같은 문의를 찾는다) 그 주문은 '넘김'으로 적고 장부에도 올려, 다음 실행부터는
 문의내역을 다시 뒤지지 않는다. 송장조회처럼 WANTS_CDP_CHROME 어댑터(지마켓)는
 우리가 직접 띄운 진짜 크롬(CDP)에서 남긴다 - 번들 크로미엄은 봇 확인에 걸린다.
+
+문의를 남긴 뒤에는 전에 남긴 문의의 답변도 가져온다 (inquiry_answers, 사용자 요청
+2026-09-11 - 송장조회 때가 아니라 [문의]를 눌렀을 때). 사이트별 브라우저를 닫기 전에
+그 사이트의 답 없는 문의를 같은 세션으로 읽고, 이번에 남길 게 없던 사이트는 따로
+병렬로 읽은 뒤, 읽은 송장조회 결과 엑셀의 '사유' 칸에 답변/답변대기를 제자리에서
+붙인다. 남길 문의가 없어도 답변 확인은 한다.
 """
 
 from __future__ import annotations
@@ -118,6 +124,8 @@ class InquiryRun:
     targets: list[InquiryTarget] = field(default_factory=list)
     results: list[InquiryResult] = field(default_factory=list)
     stopped_reason: str | None = None
+    # 전에 남긴 문의의 답변 확인 (inquiry_answers) - 요약에 그대로 싣는 줄들.
+    answer_lines: list[str] = field(default_factory=list)
 
     def counts(self) -> dict[str, int]:
         out = {"success": 0, "fail": 0, "skip": 0}
@@ -256,13 +264,15 @@ def plan(excel_path: str | Path | None = None
 
 
 def run(excel_path: str | Path | None = None, *, limit: int | None = None,
-        headless: bool = False, dry_run: bool = False, log: LogFn = print) -> InquiryRun:
-    """결과 엑셀의 '2일 지남' 건에 문의를 남긴다.
+        headless: bool = False, dry_run: bool = False, check_answers: bool = True,
+        log: LogFn = print) -> InquiryRun:
+    """결과 엑셀의 '2일 지남' 건에 문의를 남기고, 전에 남긴 문의의 답변을 가져온다.
 
     사이트별로 브라우저 하나를 열어 한 건씩 순서대로 남긴다(같은 사이트에
     몰아치지 않도록 송장조회와 같은 요청 간격을 지킨다). 한 사이트가 로그인
     등으로 막히면 그 사이트의 나머지는 바로 넘기고 다른 사이트는 계속한다.
-    dry_run이면 무엇을 남길지만 보여주고 아무것도 남기지 않는다.
+    dry_run이면 무엇을 남길지만 보여주고 아무것도 남기지 않는다(답변 확인도 안 한다).
+    check_answers면 남긴 뒤 답변을 확인해 결과 엑셀 '사유' 칸을 고친다(_check_answers).
     """
     result = InquiryRun()
     path, targets, by_site, skipped = plan(excel_path)
@@ -297,10 +307,64 @@ def run(excel_path: str | Path | None = None, *, limit: int | None = None,
 
     settings = load_settings()
     for site, items in by_site.items():
-        _post_site(site, items, settings=settings, headless=headless, result=result, log=log)
+        _post_site(site, items, settings=settings, headless=headless, result=result, log=log,
+                   check_answers=check_answers)
     counts = result.counts()
     log(f"문의 남기기 끝: 성공 {counts['success']} / 실패 {counts['fail']} / 넘김 {counts['skip']}")
+    if check_answers:
+        _check_answers(result, handled=set(by_site), headless=headless, log=log)
     return result
+
+
+def _check_answers(result: InquiryRun, *, handled: set[str], headless: bool, log: LogFn) -> None:
+    """전에 남긴 문의의 답변을 읽어 장부에 적고, 읽은 결과 엑셀의 '사유' 칸을 고친다.
+
+    handled(이번에 문의를 남긴 사이트)는 _post_site가 브라우저를 닫기 전에 이미
+    읽었으니, 나머지 사이트만 inquiry_answers.refresh로 병렬로 읽는다. 여기서 무엇이
+    잘못돼도 문의 남기기 결과는 그대로다 - 요약 줄에만 적힌다.
+    """
+    from . import inquiry_answers  # 순환 import(inquiry_answers -> inquiry)라 여기서
+
+    started = time.monotonic()
+    try:
+        before = inquiry_answers.answered_ids(inquiry_answers.ledger_by_id())
+        remaining = set(inquiry_answers.pending_by_site(skip_today=True)) - handled
+        if remaining:
+            log(f"전에 남긴 문의의 답변을 확인합니다 ({', '.join(sorted(remaining))}).")
+            by_id = inquiry_answers.refresh(None, sites=remaining, skip_today=True,
+                                            headless=headless, log=log)
+        else:
+            by_id = inquiry_answers.ledger_by_id()
+    except Exception as e:  # noqa: BLE001
+        result.answer_lines.append(f"문의 답변 확인 실패 - {e}")
+        log(result.answer_lines[-1])
+        return
+    new_answers = [by_id[oid] for oid in sorted(inquiry_answers.answered_ids(by_id) - before)]
+    waiting = sum(len(v) for v in inquiry_answers.pending_by_site(skip_today=True).values())
+    result.answer_lines.append(
+        f"전에 남긴 문의 답변 확인: 새 답변 {len(new_answers)}건, 아직 답변대기 {waiting}건 "
+        f"({time.monotonic() - started:.1f}초)")
+    for e in new_answers:
+        check = e["answer_check"]
+        first = next((ln for ln in inquiry_answers.condense_answer(
+            check["answer"], e.get("message") or "").splitlines() if ln.strip()), "")
+        result.answer_lines.append(
+            f"  {e['site']} {e['order_id']} ({e.get('recipient_name') or ''}) "
+            f"{check.get('answered_on') or ''}: {first[:90]}")
+    path = result.excel_path
+    if path is None or not path.exists():
+        return
+    try:
+        changed = inquiry_answers.update_excel(path, by_id)
+    except PermissionError:
+        result.answer_lines.append(f"{path.name}이 열려 있어 '사유' 칸을 고치지 못했습니다 - 닫고 "
+                                   "python scripts/check_answers.py 를 돌리면 됩니다.")
+    except Exception as e:  # noqa: BLE001
+        result.answer_lines.append(f"{path.name} '사유' 칸 갱신 실패 - {e}")
+    else:
+        result.answer_lines.append(f"{path.name}: '사유' 칸 {changed}개에 문의 답변/상태를 붙였습니다.")
+    for line in result.answer_lines:
+        log(line)
 
 
 def _message_for(target: InquiryTarget) -> str:
@@ -318,8 +382,8 @@ def _message_for(target: InquiryTarget) -> str:
 
 
 def _post_site(site: str, items: list[InquiryTarget], *, settings, headless: bool,
-               result: InquiryRun, log: LogFn) -> None:
-    """한 사이트의 주문들을 브라우저 하나로 한 건씩 남긴다.
+               result: InquiryRun, log: LogFn, check_answers: bool = True) -> None:
+    """한 사이트의 주문들을 브라우저 하나로 한 건씩 남기고, 닫기 전에 이 사이트의 지난 문의 답변을 읽는다.
 
     요청 간격은 송장조회와 같은 방식이다 - '앞 건을 시작한 시각 + 간격' 전에는
     다음 건을 시작하지 않는다(간격에 조회 시간이 포함된다). 로그인이 막히면
@@ -404,7 +468,12 @@ def _post_site(site: str, items: list[InquiryTarget], *, settings, headless: boo
                 "confirmation": done,   # 어댑터가 확인한 완료 문구 (롯데온·지마켓·SSG·네이버·GSSHOP·롯데아이몰·NS홈쇼핑: 문의내역의 접수 상태·문의번호)
             })
             record(i, t, "success", done, message)
-    log(f"[{site}] {total}건에 {time.monotonic() - started:.1f}초 걸렸습니다.")
+        log(f"[{site}] {total}건에 {time.monotonic() - started:.1f}초 걸렸습니다.")
+        # 전에 남긴 문의의 답변은 세션이 살아 있는 지금 읽는다 - 브라우저를 다시 열지
+        # 않는다. 로그인이 막힌 사이트는 답변도 못 읽으니 로그인 대기를 되풀이하지 않는다.
+        if check_answers and blocked_reason is None:
+            from . import inquiry_answers  # 순환 import라 여기서
+            inquiry_answers.check_site_with_context(site, adapter, context, headless=headless, log=log)
 
 
 def summarize(run_result: InquiryRun) -> str:
@@ -422,6 +491,9 @@ def summarize(run_result: InquiryRun) -> str:
         lines.append("아직 자동화하지 않은 사이트 (직접 남겨주세요):")
         lines.extend(f"  {r.order_id} ({r.recipient_name}) - {r.site_key}: {r.product_url}"
                      for r in unsupported)
+    if run_result.answer_lines:
+        lines.append("")
+        lines.extend(run_result.answer_lines)
     if run_result.stopped_reason:
         lines.append("")
         lines.append(run_result.stopped_reason)

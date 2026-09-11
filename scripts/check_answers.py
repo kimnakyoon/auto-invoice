@@ -6,8 +6,9 @@
     python scripts/check_answers.py --force         # 이미 답변을 받은 문의도 다시 확인
     python scripts/check_answers.py --excel 바탕화면\송장조회결과_20260911_101500.xlsx
 
-송장조회(run_all.py, GUI [전부 자동])는 조회 직후 '주문일지연' 건에 대해 같은 확인을
-스스로 하므로, 이 스크립트는 그 사이에 온 답변을 바로 보고 싶을 때 쓴다.
+[문의] 버튼(inquiry.run)이 문의를 남긴 뒤 같은 확인을 스스로 하므로(오늘 남긴 것은
+제외), 이 스크립트는 문의를 남기지 않고 답변만 바로 보고 싶을 때 쓴다. 송장조회는
+답변을 보지 않는다(사용자 요청 2026-09-11).
 """
 
 import argparse

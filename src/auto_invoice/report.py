@@ -257,13 +257,8 @@ def _stale_line(entry: ReportEntry) -> str:
     who = f" (수령인: {entry.recipient_name})" if entry.recipient_name else ""
     eta = f" - {entry.delivery_note}" if entry.delivery_note else ""
     url = f"\n      {entry.product_url}" if entry.product_url else ""
-    # 남긴 문의의 답변(inquiry_answers)은 첫 줄만 - 전체는 결과 엑셀 '사유' 칸에 있다.
-    note = ""
-    if entry.inquiry_note:
-        first = entry.inquiry_note.splitlines()[0]
-        note = f"\n      {first if len(first) <= 120 else first[:120] + '…'}"
     return (f"  - {entry.order_id}{who}: 주문일 {order_date_mod.describe(entry.order_date)}"
-            f" - 조회결과 {result_label(entry)}{eta}{note}{url}")
+            f" - 조회결과 {result_label(entry)}{eta}{url}")
 
 
 def mark_apply_errors(entries: list[ReportEntry],

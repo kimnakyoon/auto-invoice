@@ -218,7 +218,7 @@ def _write_entries_sheet(ws, entries: list[ReportEntry], applied_label: str,
             entry.courier or "",
             entry.tracking_no or "",
             _applied_cell(entry, applied_label),
-            reason_text(entry),
+            entry.reason or "",
         ])
         # 덩어리가 바뀌는 자리(그룹 끝)에는 굵은 선을 그어 나눈다. 결과
         # 이름이 아니라 정렬 자리(키 앞 두 값)로 비교해야 '주문일지연으로
@@ -227,7 +227,6 @@ def _write_entries_sheet(ws, entries: list[ReportEntry], applied_label: str,
         group_end = i + 1 == len(rows) or keys[i + 1][:2] != keys[i][:2]
         _style_row(ws[ws.max_row], label, group_end=group_end,
                    stale=is_stale_entry(entry))
-        _style_reason(ws[ws.max_row][COL_REASON], entry)
 
     for i, width in enumerate(COLUMN_WIDTHS, start=1):
         ws.column_dimensions[get_column_letter(i)].width = width
@@ -237,7 +236,8 @@ def _write_entries_sheet(ws, entries: list[ReportEntry], applied_label: str,
 
 
 # 문의 답변 메모(inquiry_answers.note_for)가 사유 칸에 붙을 때의 글자색 - 답변이 온
-# 건은 눈에 띄게, 답변대기는 원래 사유와 같은 색.
+# 건은 눈에 띄게, 답변대기는 원래 사유와 같은 색. 메모는 [문의] 실행이 이미 저장된
+# 결과 엑셀에 inquiry_answers.update_excel로 제자리에서 붙인다 (조회 때는 안 붙는다).
 _ANSWERED_FONT = Font(color="0B6B2E", bold=True)
 _NOTE_PREFIX = "[문의"
 _ANSWER_MARK = "[문의 답변"
@@ -262,16 +262,12 @@ def strip_note(reason: str) -> str:
     return reason[:idx].rstrip() if idx >= 0 else reason
 
 
-def reason_text(entry: ReportEntry) -> str:
-    return compose_reason(entry.inquiry_note, entry.reason)
-
-
-def _style_reason(cell, entry: ReportEntry) -> None:
-    """문의 메모가 붙은 사유 칸은 줄바꿈을 살리고, 답변이 온 건은 진한 녹색으로."""
-    if not entry.inquiry_note:
+def style_reason_cell(cell, note: str | None) -> None:
+    """문의 메모가 붙은 사유 칸은 줄바꿈을 살리고, 답변이 온 건은 진한 녹색으로 (update_excel이 쓴다)."""
+    if not note:
         return
     cell.alignment = Alignment(wrap_text=True, vertical="center")
-    if entry.inquiry_note.startswith(_ANSWER_MARK):
+    if note.startswith(_ANSWER_MARK):
         cell.font = _ANSWERED_FONT
 
 
@@ -372,7 +368,7 @@ def _write_stale_sheet(ws, stale: list[ReportEntry]) -> None:
             entry.delivery_note or "",
             entry.product_url or "",
             label,
-            reason_text(entry),
+            entry.reason or "",
         ])
         row = ws[ws.max_row]
         badge_fill, badge_font, row_fill = _COLORS.get(label, _DEFAULT_COLOR)
@@ -388,7 +384,6 @@ def _write_stale_sheet(ws, stale: list[ReportEntry]) -> None:
         row[STALE_COL_RESULT].font = Font(bold=True, color=badge_font)
         row[STALE_COL_RESULT].alignment = Alignment(horizontal="center", vertical="center")
         row[STALE_COL_REASON].alignment = Alignment(wrap_text=True, vertical="center")
-        _style_reason(row[STALE_COL_REASON], entry)
 
     for i, width in enumerate(STALE_WIDTHS, start=1):
         ws.column_dimensions[get_column_letter(i)].width = width
