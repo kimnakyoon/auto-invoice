@@ -31,7 +31,9 @@ from __future__ import annotations
 import contextlib
 import json
 import re
+import threading
 import time
+from concurrent.futures import ThreadPoolExecutor
 from datetime import date, datetime, timedelta
 from pathlib import Path
 from typing import Callable
@@ -43,7 +45,6 @@ from . import browser as browser_mod
 from . import order_date as order_date_mod
 from .inquiry import LEDGER_PATH, load_ledger, posted_order_ids
 from .models import ReportEntry
-from .report import is_stale_entry
 from .result_excel import SHEET_NAME, STALE_SHEET_NAME, compose_reason, strip_note
 from .suppliers import common
 from .suppliers.base import AdapterError, BlockedError
@@ -205,20 +206,40 @@ def condense_answer(text: str, message: str = "") -> str:
 # --------------------------------------------------------------------------
 # 사이트에 물어보기
 # --------------------------------------------------------------------------
+# 장부는 여러 스레드(사이트마다 하나)가 동시에 고치므로 읽기-고치기-쓰기를 잠금 안에서 한다.
+_LEDGER_LOCK = threading.Lock()
+
+
+def _ledger_by_id() -> dict[str, dict]:
+    return {str(e.get("order_id")): e for e in load_ledger() if e.get("order_id")}
+
+
+def _record_checks(checks: dict[str, dict]) -> dict[str, dict]:
+    """주문번호별 확인 결과를 장부에 적어 저장하고, 주문번호 -> 장부 항목을 돌려준다."""
+    with _LEDGER_LOCK:
+        ledger = load_ledger()
+        for entry in ledger:
+            check = checks.get(str(entry.get("order_id")))
+            if check is not None:
+                entry["answer_check"] = check
+        if checks:
+            save_ledger(ledger)
+    return {str(e.get("order_id")): e for e in ledger if e.get("order_id")}
+
 
 def refresh(order_ids: set[str] | None = None, *, headless: bool = True, force: bool = False,
             sites: set[str] | None = None, log: LogFn = print) -> dict[str, dict]:
     """장부의 문의에 답변이 달렸는지 사이트에 물어 장부를 갱신하고, 주문번호 -> 장부 항목을 돌려준다.
 
-    order_ids를 주면 그 주문만(파이프라인은 이번 조회에 나온 주문만 준다), 없으면 최근
-    문의 전부. 사이트마다 브라우저 하나를 열어 한 건씩 묻고, 사이트 하나가 끝날 때마다
-    장부를 저장한다 - 도중에 멈춰도 확인한 것은 남는다. 한 사이트의 실패는 그
-    사이트 항목에만 적히고 다른 사이트는 계속한다.
+    order_ids를 주면 그 주문만, 없으면 최근 문의 전부. 사이트마다 스레드 하나가 자기
+    브라우저를 열어 한 건씩 묻는다 - 송장조회(orchestrator)와 같은 병렬 구조라 전체
+    시간은 가장 느린 사이트 하나만큼이다(2026-09-11 실측: 7개 사이트 1건씩 순차 9.1초 →
+    병렬 3초 안팎). 사이트 하나가 끝날 때마다 장부를 저장해 도중에 멈춰도 확인한 것은
+    남고, 한 사이트의 실패는 그 사이트 항목에만 적힌다.
     """
-    ledger = load_ledger()
     today = date.today()
     by_site: dict[str, list[dict]] = {}
-    for entry in ledger:
+    for entry in load_ledger():
         if order_ids is not None and entry.get("order_id") not in order_ids:
             continue
         if sites is not None and entry.get("site") not in sites:
@@ -227,26 +248,29 @@ def refresh(order_ids: set[str] | None = None, *, headless: bool = True, force: 
             continue
         by_site.setdefault(str(entry.get("site") or ""), []).append(entry)
 
-    for site, items in by_site.items():
+    def _one_site(site: str, items: list[dict]) -> None:
         adapter = get_adapter(items[0].get("product_url") or "")
-        fetch = getattr(adapter, "fetch_inquiry_answer", None)
-        if adapter is None or fetch is None:
+        if adapter is None or getattr(adapter, "fetch_inquiry_answer", None) is None:
             log(f"  [{site}] 답변 확인을 지원하지 않는 사이트 - {len(items)}건 건너뜀")
-            continue
+            return
         try:
-            _check_site(site, adapter, items, headless=headless, log=log)
+            checks = _check_site(site, adapter, items, headless=headless, log=log)
         except Exception as e:  # noqa: BLE001 - 브라우저를 못 여는 등 사이트 단위 실패
             problem = str(e) if isinstance(e, AdapterError) else f"{type(e).__name__}: {e}"
             log(f"  [{site}] 답변 확인 실패 - {problem}")
-            for entry in items:
-                _mark(entry, problem=problem)
-        save_ledger(ledger)
-    return {str(e.get("order_id")): e for e in ledger if e.get("order_id")}
+            checks = {str(entry.get("order_id")): _check(problem=problem) for entry in items}
+        _record_checks(checks)
+
+    if by_site:
+        with ThreadPoolExecutor(max_workers=len(by_site)) as pool:
+            futures = [pool.submit(_one_site, site, items) for site, items in by_site.items()]
+            for future in futures:
+                future.result()
+    return _ledger_by_id()
 
 
-def _check_site(site: str, adapter, items: list[dict], *, headless: bool, log: LogFn) -> None:
-    started = time.monotonic()
-    answered = 0
+def _check_site(site: str, adapter, items: list[dict], *, headless: bool, log: LogFn) -> dict[str, dict]:
+    """브라우저를 열어 한 사이트의 문의들을 묻는다 (주문번호 -> 확인 결과). 스레드마다 자기 Playwright."""
     with sync_playwright() as p, contextlib.ExitStack() as stack:
         if getattr(adapter, "WANTS_CDP_CHROME", False):
             # 지마켓은 번들 크로미엄이 봇 확인에 걸려 문의를 남길 때처럼 진짜 크롬(CDP)으로 읽는다.
@@ -263,37 +287,53 @@ def _check_site(site: str, adapter, items: list[dict], *, headless: bool, log: L
                 browser_mod.save_state(context, site)
 
         stack.callback(_save_state)
-        blocked: str | None = None
-        for entry in items:
-            label = f"{entry.get('order_id')} {entry.get('recipient_name') or ''}".strip()
-            if blocked is not None:
-                _mark(entry, problem=f"앞 문의에서 막혀 건너뜀: {blocked}")
-                continue
-            try:
-                found = fetch_one(adapter, context, entry, headless=headless)
-            except BlockedError as e:
-                blocked = str(e)
-                _mark(entry, problem=blocked)
-                log(f"  [{site}] {label}: 확인 실패 - {blocked}")
-                continue
-            except Exception as e:  # noqa: BLE001 - 한 건의 오류가 나머지를 막으면 안 된다
-                problem = str(e) if isinstance(e, AdapterError) else f"{type(e).__name__}: {e}"
-                _mark(entry, problem=problem)
-                log(f"  [{site}] {label}: 확인 실패 - {problem}")
-                continue
-            if found is None:
-                _mark(entry, state="문의내역에 없음")
-                log(f"  [{site}] {label}: 문의내역에서 찾지 못함")
-                continue
-            _mark(entry, state=found.get("state") or "", inquiry_id=found.get("inquiry_id"),
-                  answer=found.get("answer"), answered_on=found.get("answered_on"))
-            if found.get("answer"):
-                answered += 1
-                log(f"  [{site}] {label}: 답변 {found.get('answered_on') or ''} - "
-                    f"{_first_line(found['answer'])}")
-            else:
-                log(f"  [{site}] {label}: {found.get('state') or '답변 없음'}")
-    log(f"  [{site}] {len(items)}건 확인, 답변 {answered}건, {time.monotonic() - started:.1f}초")
+        return check_with_context(site, adapter, context, items, headless=headless, log=log)
+
+
+def check_with_context(site: str, adapter, context, items: list[dict], *, headless: bool,
+                       log: LogFn) -> dict[str, dict]:
+    """열려 있는 컨텍스트로 장부 항목들을 한 건씩 묻는다 (주문번호 -> 확인 결과).
+
+    송장조회가 그 사이트 브라우저를 아직 열어둔 채로 부르면(orchestrator._lookup_site)
+    브라우저를 다시 열지도, 로그인을 다시 하지도 않는다. 로그인이 막히면(BlockedError)
+    남은 건은 바로 넘긴다.
+    """
+    started = time.monotonic()
+    answered = 0
+    checks: dict[str, dict] = {}
+    blocked: str | None = None
+    for entry in items:
+        order_id = str(entry.get("order_id"))
+        label = f"{order_id} {entry.get('recipient_name') or ''}".strip()
+        if blocked is not None:
+            checks[order_id] = _check(problem=f"앞 문의에서 막혀 건너뜀: {blocked}")
+            continue
+        try:
+            found = fetch_one(adapter, context, entry, headless=headless)
+        except BlockedError as e:
+            blocked = str(e)
+            checks[order_id] = _check(problem=blocked)
+            log(f"  [{site}] {label}: 답변 확인 실패 - {blocked}")
+            continue
+        except Exception as e:  # noqa: BLE001 - 한 건의 오류가 나머지를 막으면 안 된다
+            problem = str(e) if isinstance(e, AdapterError) else f"{type(e).__name__}: {e}"
+            checks[order_id] = _check(problem=problem)
+            log(f"  [{site}] {label}: 답변 확인 실패 - {problem}")
+            continue
+        if found is None:
+            checks[order_id] = _check(state="문의내역에 없음")
+            log(f"  [{site}] {label}: 문의내역에서 찾지 못함")
+            continue
+        checks[order_id] = _check(state=found.get("state") or "", inquiry_id=found.get("inquiry_id"),
+                                  answer=found.get("answer"), answered_on=found.get("answered_on"))
+        if found.get("answer"):
+            answered += 1
+            log(f"  [{site}] {label}: 답변 {found.get('answered_on') or ''} - "
+                f"{_first_line(condense_answer(found['answer'], str(entry.get('message') or '')))}")
+        else:
+            log(f"  [{site}] {label}: {found.get('state') or '답변 없음'}")
+    log(f"  [{site}] 문의 {len(items)}건 확인, 답변 {answered}건, {time.monotonic() - started:.1f}초")
+    return checks
 
 
 def fetch_one(adapter, context, entry: dict, *, headless: bool) -> dict | None:
@@ -303,8 +343,8 @@ def fetch_one(adapter, context, entry: dict, *, headless: bool) -> dict | None:
         since=since_of(entry), inquiry_id=inquiry_id_of(entry), headless=headless)
 
 
-def _mark(entry: dict, *, state: str = "", inquiry_id: str | None = None, answer: str | None = None,
-          answered_on: str | None = None, problem: str | None = None) -> None:
+def _check(*, state: str = "", inquiry_id: str | None = None, answer: str | None = None,
+           answered_on: str | None = None, problem: str | None = None) -> dict:
     check = {"checked_at": datetime.now().isoformat(timespec="seconds")}
     if problem:
         check["problem"] = problem
@@ -315,7 +355,7 @@ def _mark(entry: dict, *, state: str = "", inquiry_id: str | None = None, answer
         if answer:
             check["answer"] = answer.strip()
             check["answered_on"] = answered_on or ""
-    entry["answer_check"] = check
+    return check
 
 
 def _first_line(text: str, limit: int = 80) -> str:
@@ -327,37 +367,6 @@ def _first_line(text: str, limit: int = 80) -> str:
 # 결과에 싣기
 # --------------------------------------------------------------------------
 
-def attach(entries: list[ReportEntry], *, headless: bool = True, log: LogFn = print) -> int:
-    """문의를 남긴 주문 중 아직 송장을 못 받은 건의 답변을 확인해 inquiry_note에 싣는다. 실은 건수를 돌려준다.
-
-    송장조회 파이프라인이 조회 직후에 부른다. 대상은 '주문일지연' 건이 대부분이지만
-    실패·취소/품절로 분류된 건도 장부에 있으면 같이 본다 - 품절 답변("취소만 가능")이
-    거기서 나온다. 성공(송장 받음)은 답이 더 필요 없어 뺀다. 장부에 없는 주문(문의를 안
-    남겼거나 아직 2일이 안 된 것)은 사이트에 묻지 않으므로 대개 몇 초면 끝난다.
-
-    '2일 지남'은 뺀다(사용자 기준 2026-09-11): 2일 지남은 이 조회가 끝난 뒤 [문의]로
-    그날 남기는 건이라 확인할 답변이 없다. 3일 지남부터가 '2일이던 날 남긴 문의'의
-    답을 볼 차례다.
-    """
-    posted = posted_order_ids(load_ledger())
-    targets = [e for e in entries
-               if e.status != "success" and e.order_id in posted and _old_enough_to_answer(e)]
-    wanted = {e.order_id for e in targets}
-    if not wanted:
-        return 0
-    stale_count = sum(1 for e in targets if is_stale_entry(e))
-    log(f"  문의를 남긴 주문 {len(wanted)}건(주문일지연 {stale_count}건)의 답변을 확인합니다.")
-    by_id = refresh(wanted, headless=headless, log=log)
-    count = 0
-    for e in targets:
-        ledger_entry = by_id.get(e.order_id)
-        if ledger_entry is None:
-            continue
-        e.inquiry_note = note_for(ledger_entry)
-        count += 1
-    return count
-
-
 # 조회 직후 답변을 볼 최소 '지난 일수' - 2일 지남은 그날 문의를 남기는 건이라 뺀다.
 ANSWER_MIN_DAYS = order_date_mod.STALE_DAYS + 1
 
@@ -366,6 +375,67 @@ def _old_enough_to_answer(entry: ReportEntry) -> bool:
     """주문일을 모르면(실패 건 등) 장부에 있다는 것만으로 본다 - 문의를 남긴 건 확실하다."""
     days = order_date_mod.days_since(entry.order_date)
     return days is None or days >= ANSWER_MIN_DAYS
+
+
+def _targets(entries: list[ReportEntry], by_id: dict[str, dict]) -> list[ReportEntry]:
+    """답변을 실을 조회 결과 - 장부에 있고, 송장을 못 받았고, 3일 이상 지났고, 아직 안 실은 것.
+
+    실패·취소/품절로 분류된 건도 장부에 있으면 본다 - 품절 답변("취소만 가능")이 거기서
+    나온다. 성공(송장 받음)은 답이 더 필요 없다. '2일 지남'은 뺀다(사용자 기준 2026-09-11):
+    2일 지남은 이 조회가 끝난 뒤 [문의]로 그날 남기는 건이라 확인할 답변이 없고, 3일
+    지남부터가 '2일이던 날 남긴 문의'의 답을 볼 차례다.
+    """
+    return [e for e in entries
+            if e.status != "success" and e.inquiry_note is None and e.order_id in by_id
+            and _old_enough_to_answer(e)]
+
+
+def check_in_context(site: str, adapter, context, entries: list[ReportEntry], *, headless: bool,
+                     log: LogFn = print) -> int:
+    """송장조회가 한 사이트를 끝내고 브라우저를 닫기 전에 부른다 - 그 사이트 주문의 답변을 확인해 싣는다.
+
+    브라우저·로그인 세션을 그대로 쓰고 사이트별 스레드 안에서 도니 조회 시간에 거의
+    묻힌다(브라우저를 다시 여는 방식은 사이트마다 1~3초). 답변을 이미 받은 문의는
+    장부의 것을 그대로 싣고 사이트에 묻지 않는다. 실은 건수를 돌려준다.
+    """
+    if getattr(adapter, "fetch_inquiry_answer", None) is None:
+        return 0
+    by_id = _ledger_by_id()
+    targets = _targets(entries, by_id)
+    if not targets:
+        return 0
+    pending = [by_id[e.order_id] for e in targets if needs_check(by_id[e.order_id])]
+    if pending:
+        try:
+            checks = check_with_context(site, adapter, context, pending, headless=headless, log=log)
+        except Exception as e:  # noqa: BLE001 - 답변 확인이 조회 결과를 덮으면 안 된다
+            problem = str(e) if isinstance(e, AdapterError) else f"{type(e).__name__}: {e}"
+            log(f"  [{site}] 답변 확인 실패 - {problem}")
+            checks = {str(entry.get("order_id")): _check(problem=problem) for entry in pending}
+        by_id = _record_checks(checks)
+    for e in targets:
+        e.inquiry_note = note_for(by_id[e.order_id])
+    return len(targets)
+
+
+def attach(entries: list[ReportEntry], *, headless: bool = True, log: LogFn = print) -> int:
+    """조회 결과 중 아직 답변을 안 실은 건(check_in_context를 거치지 않은 것)에 답변을 싣는다. 실은 건수.
+
+    송장조회 파이프라인이 조회 직후에 부른다. 이번 실행에서 조회한 사이트는
+    check_in_context가 브라우저를 닫기 전에 이미 실었으므로, 여기 남는 것은 지난 실행의
+    진행 상황(checkpoint)에서 이어받은 건 정도다 - 그때만 사이트별 브라우저를 다시 연다.
+    """
+    by_id = _ledger_by_id()
+    targets = _targets(entries, by_id)
+    if not targets:
+        return 0
+    wanted = {e.order_id for e in targets}
+    if any(needs_check(by_id[oid]) for oid in wanted):
+        log(f"  문의를 남긴 주문 {len(wanted)}건의 답변을 확인합니다.")
+        by_id = refresh(wanted, headless=headless, log=log)
+    for e in targets:
+        e.inquiry_note = note_for(by_id[e.order_id])
+    return len(targets)
 
 
 def update_excel(path: str | Path, by_id: dict[str, dict]) -> int:
