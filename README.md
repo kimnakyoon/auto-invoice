@@ -455,8 +455,9 @@ python scripts/run_all.py --stop-before-apply   # 일괄등록까지만, 마지�
 
 문의를 남기면 공급사가 하루 안팎에 "9/15까지 재고 확보 후 발송" 같은 답을 단다.
 그 답을 보러 사이트마다 문의내역을 열지 않도록, 송장조회가 끝나면(`pipeline.lookup_tracking`)
-장부에 있는 주문(송장을 받은 성공 건 제외 - 대부분 '주문일지연' 건, 실패·취소/품절도 포함)의
-답변을 어댑터 `fetch_inquiry_answer(context, product_url, recipient_name, since=, inquiry_id=)`로
+장부에 있는 주문(송장을 받은 성공 건 제외 - 대부분 '주문일지연' 건, 실패·취소/품절도 포함,
+**지난 일수 3일부터** - 2일 지남은 그날 [문의]로 남기는 건이라 답이 있을 수 없다, 사용자 기준
+2026-09-11)의 답변을 어댑터 `fetch_inquiry_answer(context, product_url, recipient_name, since=, inquiry_id=)`로
 읽어 `ReportEntry.inquiry_note`에 싣고, 결과 엑셀 두 시트의 '사유' 칸에 원래 사유 아래 줄로
 `[문의 답변 2026.09.11] ...`(진한 녹색) 또는 `[문의 09-10 남김 - 답변대기]`를 붙인다
 (`result_excel.compose_reason`). 답변은 `condense_answer`가 인사·감사·사과·"노력하겠습니다"·

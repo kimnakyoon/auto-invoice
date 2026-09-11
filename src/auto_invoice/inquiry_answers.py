@@ -40,6 +40,7 @@ from openpyxl import load_workbook
 from playwright.sync_api import sync_playwright
 
 from . import browser as browser_mod
+from . import order_date as order_date_mod
 from .inquiry import LEDGER_PATH, load_ledger, posted_order_ids
 from .models import ReportEntry
 from .report import is_stale_entry
@@ -333,9 +334,14 @@ def attach(entries: list[ReportEntry], *, headless: bool = True, log: LogFn = pr
     실패·취소/품절로 분류된 건도 장부에 있으면 같이 본다 - 품절 답변("취소만 가능")이
     거기서 나온다. 성공(송장 받음)은 답이 더 필요 없어 뺀다. 장부에 없는 주문(문의를 안
     남겼거나 아직 2일이 안 된 것)은 사이트에 묻지 않으므로 대개 몇 초면 끝난다.
+
+    '2일 지남'은 뺀다(사용자 기준 2026-09-11): 2일 지남은 이 조회가 끝난 뒤 [문의]로
+    그날 남기는 건이라 확인할 답변이 없다. 3일 지남부터가 '2일이던 날 남긴 문의'의
+    답을 볼 차례다.
     """
     posted = posted_order_ids(load_ledger())
-    targets = [e for e in entries if e.status != "success" and e.order_id in posted]
+    targets = [e for e in entries
+               if e.status != "success" and e.order_id in posted and _old_enough_to_answer(e)]
     wanted = {e.order_id for e in targets}
     if not wanted:
         return 0
@@ -350,6 +356,16 @@ def attach(entries: list[ReportEntry], *, headless: bool = True, log: LogFn = pr
         e.inquiry_note = note_for(ledger_entry)
         count += 1
     return count
+
+
+# 조회 직후 답변을 볼 최소 '지난 일수' - 2일 지남은 그날 문의를 남기는 건이라 뺀다.
+ANSWER_MIN_DAYS = order_date_mod.STALE_DAYS + 1
+
+
+def _old_enough_to_answer(entry: ReportEntry) -> bool:
+    """주문일을 모르면(실패 건 등) 장부에 있다는 것만으로 본다 - 문의를 남긴 건 확실하다."""
+    days = order_date_mod.days_since(entry.order_date)
+    return days is None or days >= ANSWER_MIN_DAYS
 
 
 def update_excel(path: str | Path, by_id: dict[str, dict]) -> int:
