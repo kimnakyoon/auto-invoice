@@ -35,6 +35,22 @@
   "배송준비중", "주문접수")은 다른 어댑터에서 흔히 보이는 값으로 추정해둔 것이라
   다르게 나오면 조정이 필요하다.
 - 1:1 문의 남기기(post_inquiry)는 아래 '1:1 문의 남기기' 구간에 실측을 적어뒀다 (2026-09-09).
+- **주문목록 API 한 번으로 여러 건 답하기 (prepare_batch, 2026-09-11 실측).** 화면 경로는
+  주문마다 화면을 열고 [배송조회]를 눌러 건당 1~3초에 요청 간격(REQUEST_GAP 1~2초)까지
+  더해져 4~5초였다(최근 다섯 실행 모두). 문의 등록이 쓰는 mapi(Bearer accessToken)에
+  주문목록 API가 있다 - 문의 레이어의 [상품 선택]이 부르는 GET
+  order/order/order-list?pageNum=&pageSize=&orderDttm1=&orderDttm2=&inqrCond=list&reqSpr=mobile
+  &stat=&goodsNm=&totalPage= (날짜는 YYYY-MM-DD, 화면 기본은 최근 1개월·10건씩인데 pageSize=50도
+  받고 0.13초). 응답 resultData.orders[]마다 orderNum·orderDttm과 orderItems[](상품별
+  wblNum(송장)·dlvrEntCd(택배사 코드)·orderRtnClssfCdNm(주문/취소)·reltStatCdNm(출고지시/
+  출고완료/배송완료/출고지시후취소)·unitNm(옵션)·dlvrSchdDttm(도착예정일)·배송조회 API
+  파라미터(custDstnClssfNum/orderRtnClssfCd/reltStatCd/goodsCd/unitCd))가 있어 화면 없이
+  결론이 난다. 택배사 **이름**은 목록에 코드뿐이라, 송장이 있는 건만 배송조회 API
+  (order-dlvr-detail-with-gift - 화면의 [배송조회]가 부르는 그 요청, unitCd까지 다섯 파라미터가
+  전부 있어야 하고 하나라도 빠지면 400)를 한 번 불러 lscNm을 읽고 코드별로 기억한다
+  (실측 코드 20=롯데택배). 세션(accessToken)은 문의와 같은 _inquiry_session으로 주문상세
+  화면을 한 번 열어 읽는다(0.6초, 로그인 필요하면 자동 로그인). 목록에 없는 주문(1개월보다
+  오래됨)과 목록을 못 읽은 경우만 예전 화면 경로로 간다.
 """
 
 from __future__ import annotations
@@ -45,23 +61,29 @@ import json
 import os
 import re
 import time
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
 from urllib.parse import parse_qs, urlparse
 
 from dotenv import load_dotenv
 from playwright.sync_api import BrowserContext, Page
 from playwright.sync_api import TimeoutError as PlaywrightTimeoutError
 
+from .. import eta as eta_mod
 from ..models import TrackingResult
 from . import common
 from .base import (
+    AdapterError,
     AlreadyInquired,
     BlockedError,
+    OrderCancelled,
     ParseError,
     TrackingNotAvailableYet,
+    attach_order_date,
+    find_cancelled_keyword,
     normalize_option,
     raise_if_cancelled,
     raise_if_cancelled_any,
+    raise_if_delayed_any,
     with_order_date,
 )
 
@@ -293,6 +315,15 @@ def get_tracking(
     context: BrowserContext, product_url: str, headless: bool = True, order_option: str | None = None
 ) -> TrackingResult:
     order_no = extract_order_no(product_url)
+
+    # 주문목록 API로 이미 읽어둔 주문이면 화면을 열지 않고 여기서 끝낸다
+    # (prepare_batch - 파일 맨 아래 구간). 목록에 없던 주문만 화면으로.
+    listed = _listed_orders.get(id(context), {}).get(order_no)
+    if listed is not None:
+        answered = _answer_from_list(context, product_url, listed, order_no, order_option)
+        if answered is not None:
+            return answered
+
     page = context.new_page()
     try:
         _open_order_screen(page, product_url, order_no)
@@ -838,3 +869,186 @@ def post_inquiry(context: BrowserContext, product_url: str, recipient_name: str,
         done = _submit_via_form(context, product_url, order, message)
     listed = _confirm_inquiry_listed(context, product_url, order, message)
     return f"{done} · 상담내역 확인: {listed}"
+
+
+# ---------------------------------------------------------------------------
+# 주문목록 API 한 번으로 여러 건 답하기 (prepare_batch) - 2026-09-11 실측, 맨 위 docstring
+# ---------------------------------------------------------------------------
+ORDER_LIST_API_URL = (INQUIRY_API_BASE + "/order/order/order-list?pageNum={page}&pageSize={size}"
+                      "&orderDttm1={from_date}&orderDttm2={to_date}&inqrCond=list&reqSpr=mobile"
+                      "&stat=&goodsNm=&totalPage=")
+# 화면의 [배송조회]가 부르는 요청 - 다섯 파라미터가 전부 있어야 한다(하나라도 빠지면 400).
+TRACKING_API_URL = (INQUIRY_API_BASE + "/order/order/order-dlvr-detail-with-gift?orderNum={orderNum}"
+                    "&custDstnClssfNum={custDstnClssfNum}&orderRtnClssfCd={orderRtnClssfCd}"
+                    "&reltStatCd={reltStatCd}&goodsCd={goodsCd}&unitCd={unitCd}")
+TRACKING_API_PARAMS = ("orderNum", "custDstnClssfNum", "orderRtnClssfCd", "reltStatCd", "goodsCd", "unitCd")
+LIST_PAGE_SIZE = 50       # 화면은 10건씩이지만 50도 받는다(16건 0.13초) - 보통 한 페이지로 끝난다.
+LIST_MAX_PAGES = 4        # 최대 200건. 못 덮은 주문은 화면 폴백으로.
+LIST_DAYS_BACK = 30       # 화면 기본 조회 기간(최근 1개월)과 같게.
+DEFAULT_COURIER = "택배"  # 배송조회 API에서 택배사명을 못 읽었을 때만
+
+# prepare_batch가 읽어둔 {주문번호: 목록의 그 주문 JSON} - 컨텍스트(=이번 실행의 브라우저)별.
+_listed_orders: dict[int, dict[str, dict]] = {}
+# 한 실행 안에서 알아낸 {dlvrEntCd: 택배사명}. 같은 코드는 같은 택배사라 두 번째부터는 요청이 없다.
+_courier_by_code: dict[str, str] = {}
+
+
+def prepare_batch(context: BrowserContext, orders, headless: bool = True) -> None:
+    """이번에 조회할 주문들을 주문목록 API로 미리 통째로 읽어둔다.
+
+    오케스트레이터가 이 공급사의 첫 조회 전에 한 번 불러준다. 세션은 주문상세 화면을
+    한 번 열어 받고(_inquiry_session - 로그인이 필요하면 자동 로그인), 실패하면
+    아무것도 읽지 않은 것과 같아서 모든 주문이 예전처럼 화면 경로로 간다 - 그래서
+    어떤 예외도 밖으로 내보내지 않는다.
+    """
+    wanted: dict[str, str] = {}  # 주문번호 -> 상품URL (세션을 받을 때 하나 쓴다)
+    for order in orders:
+        try:
+            wanted[extract_order_no(order.product_url)] = order.product_url
+        except ParseError:
+            continue  # 이런 주문은 어차피 화면 경로에서 같은 이유로 실패한다
+    if not wanted:
+        return
+    sample_no, sample_url = next(iter(wanted.items()))
+    to_date = date.today()
+    from_date = to_date - timedelta(days=LIST_DAYS_BACK)
+    try:
+        found: dict[str, dict] = {}
+        for page_no in range(1, LIST_MAX_PAGES + 1):
+            result = _api_logged_in(context, sample_url, sample_no, ORDER_LIST_API_URL.format(
+                page=page_no, size=LIST_PAGE_SIZE, from_date=from_date.isoformat(), to_date=to_date.isoformat()))
+            listed = (result or {}).get("orders") or []
+            if not listed:
+                break
+            for order in listed:
+                found[str(order.get("orderNum") or "")] = order
+            if not (wanted.keys() - found.keys()) or page_no >= int((result or {}).get("totalPage") or 1):
+                break
+        _listed_orders[id(context)] = found
+        common.safe_print(
+            f"[nsmall] 주문목록에서 {len(wanted.keys() & found.keys())}/{len(wanted)}건을 미리 읽었습니다.")
+    except Exception as e:  # noqa: BLE001 - 목록을 못 읽으면 그냥 화면 경로로 간다
+        common.safe_print(f"[nsmall] 주문목록을 읽지 못해 주문마다 상세 화면을 엽니다 ({e}).")
+
+
+def _item_status(item: dict) -> str:
+    """상품 줄의 상태 - '주문 출고지시', '취소 출고지시후취소'처럼 두 값을 붙인다."""
+    return f"{item.get('orderRtnClssfCdNm') or ''} {item.get('reltStatCdNm') or ''}".strip()
+
+
+def _find_item_by_order_option(shipped: list[dict], order_option: str | None) -> dict | None:
+    """샵마인 엑셀의 "주문옵션"으로 상품을 정확히 짚을 수 있으면 그걸 쓴다 - 옵션은
+    unitNm("검정, M")에, 상품명은 goodsNm에. 0개나 2개 이상이면 None(개수 비교로)."""
+    if len(shipped) <= 1 or not order_option:
+        return None
+    target = normalize_option(order_option)
+    if not target:
+        return None
+    matched = [it for it in shipped
+               if target in normalize_option(it.get("unitNm")) or target in normalize_option(it.get("goodsNm"))]
+    return matched[0] if len(matched) == 1 else None
+
+
+def _select_item(order: dict, order_no: str, order_option: str | None) -> dict:
+    """목록의 주문에서 송장을 읽을 상품 줄을 고른다 - 화면 경로와 같은 규칙.
+
+    취소된 줄('취소' 등 CANCELLED_KEYWORDS)은 빼고 본다 - 전부 취소면 OrderCancelled,
+    남은 줄에 송장이 하나도 없으면 아직 미발급(지연 표기가 있으면 ShipmentDelayed),
+    송장이 여럿인데 상품 수와 다르면 사람이 보게 ParseError.
+    """
+    items = [it for it in order.get("orderItems") or []
+             if str(it.get("orderNum") or order_no) == order_no]
+    if not items:
+        raise ParseError(f"주문목록 항목에 상품이 없습니다 (주문번호={order_no}).")
+    live = [it for it in items if not find_cancelled_keyword(_item_status(it))]
+    if not live:
+        raise OrderCancelled(
+            f"주문 상태가 '{_item_status(items[0])}'입니다 (주문번호={order_no}) - 취소/품절 주문인지 확인해주세요.")
+    shipped = [it for it in live if str(it.get("wblNum") or "").strip()]
+    if not shipped:
+        raise_if_delayed_any([_item_status(it) for it in live], order_no)
+        raise TrackingNotAvailableYet(
+            f"아직 송장번호가 발급되지 않았습니다 (주문번호={order_no}, 상태={_item_status(live[0])}).")
+    matched = _find_item_by_order_option(shipped, order_option)
+    if matched is not None:
+        return matched
+    tracking_nos = {re.sub(r"[^0-9]", "", str(it["wblNum"])) for it in shipped}
+    if len(tracking_nos) > 1 and len(live) != len(tracking_nos):
+        raise ParseError(f"한 주문에 서로 다른 송장번호가 여러 개 있습니다 (주문번호={order_no}) - 상품별로 나눠 배송된 것으로 보입니다.")
+    return shipped[0]
+
+
+def _courier_name(context: BrowserContext, product_url: str, order_no: str, item: dict) -> tuple[str, bool]:
+    """상품 줄의 택배사명과, 그걸 알아내려고 요청을 보냈는지.
+
+    dlvrEntCd가 이미 아는 코드면 요청 없이 답한다. 아니면 화면의 [배송조회]가 부르는
+    배송조회 API를 그대로 불러 lscNm을 읽고(_parse_tracking_response) 코드별로 기억해둔다.
+    """
+    code = str(item.get("dlvrEntCd") or "").strip()
+    if code and code in _courier_by_code:
+        return _courier_by_code[code], False
+    # 목록의 상품 줄에는 orderNum이 없다(주문 단위에만 있다) - 빈 값이면 400.
+    params = {k: str(item.get(k) or "") for k in TRACKING_API_PARAMS}
+    params["orderNum"] = order_no
+    result_data = _api_logged_in(context, product_url, order_no, TRACKING_API_URL.format(**params)) or {}
+    _, courier = _parse_tracking_response({"data": {"resultData": result_data}}, order_no)
+    if code and courier != DEFAULT_COURIER:
+        _courier_by_code[code] = courier
+    return courier, True
+
+
+def _order_date_of(order: dict) -> date | None:
+    """주문 단위 orderDttm("20260911081657" - 14자리라 공용 파서(order_date.parse)가 못 읽는다)의 앞 8자리."""
+    try:
+        return datetime.strptime(str(order.get("orderDttm") or "")[:8], "%Y%m%d").date()
+    except ValueError:
+        return None
+
+
+def _delivery_note_of(order: dict) -> str | None:
+    """취소 안 된 상품 줄의 도착예정일(dlvrSchdDttm "20260912")을 화면 문구와 같은 파서(eta.from_text)에 넣는다."""
+    lines = []
+    for item in order.get("orderItems") or []:
+        if find_cancelled_keyword(_item_status(item)):
+            continue
+        raw = str(item.get("dlvrSchdDttm") or "").strip()
+        if len(raw) >= 8 and raw[:8].isdigit():
+            lines.append(f"도착예정 {raw[:4]}-{raw[4:6]}-{raw[6:8]}")
+    return eta_mod.from_text("\n".join(lines)) if lines else None
+
+
+class _FallBackToScreen(Exception):
+    """목록으로 답하다 배송조회 API가 거부돼 화면 경로로 넘긴다는 표시 (밖으로 안 나간다)."""
+
+
+def _answer_from_list(context: BrowserContext, product_url: str, order: dict, order_no: str,
+                      order_option: str | None) -> TrackingResult | None:
+    """미리 읽어둔 주문목록 항목으로 결론을 낸다. 택배사명 때문에 요청을 보낸 경우만
+    sent_request=True로 표시해서 오케스트레이터가 간격을 지키게 한다.
+
+    배송조회 API가 거부되면(ParseError, 파라미터가 바뀐 경우 등) None - 그 주문만
+    예전 화면 경로로 간다. 미발급/취소 판정은 목록만으로 나므로 그대로 올린다.
+    """
+    sent_request = False
+
+    def fetch() -> TrackingResult:
+        nonlocal sent_request
+        item = _select_item(order, order_no, order_option)
+        try:
+            courier, sent_request = _courier_name(context, product_url, order_no, item)
+        except ParseError as e:
+            common.safe_print(f"[nsmall] 배송조회 API가 거부돼 이 주문은 화면으로 조회합니다 ({e}).")
+            raise _FallBackToScreen() from e
+        return TrackingResult(tracking_no=re.sub(r"[^0-9]", "", str(item["wblNum"])), courier=courier)
+
+    try:
+        result = attach_order_date(_order_date_of(order), fetch,
+                                   delivery_note=_delivery_note_of(order))
+    except _FallBackToScreen:
+        return None
+    except AdapterError as e:
+        e.sent_request = sent_request
+        raise
+    result.sent_request = sent_request
+    return result
+
