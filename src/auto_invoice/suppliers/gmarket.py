@@ -617,7 +617,8 @@ def _parse_inquiry_list(html: str) -> list[dict]:
         block = m.group(3)
 
         def grab(cls: str) -> str:
-            mm = re.search(rf'class="{cls}"[^>]*>\s*(.*?)\s*</', block, re.S)
+            # 답변완료 줄은 class="text__status text__status--done"이라 class 값의 앞부분만 맞춘다.
+            mm = re.search(rf'class="{cls}[^"]*"[^>]*>\s*(.*?)\s*</', block, re.S)
             return html_mod.unescape(mm.group(1)).strip() if mm else ""
 
         items.append({
@@ -870,3 +871,92 @@ def post_inquiry(context: BrowserContext, product_url: str, recipient_name: str,
     _last_inquiry_posted_at = time.monotonic()
     listed = _confirm_inquiry_listed(context, recipient_name, message, item_nos, today)
     return f"문의가 정상적으로 등록되었습니다 · 문의내역 확인: {listed}"
+
+
+# ---------------------------------------------------------------------------
+# 문의 답변 확인 (inquiry_answers.py)
+# 2026-09-11 실측: 문의 상세(MyInquiryDetail?WriteNo=..&ViewAddQna=true) HTML의
+# ul.list__inquiry-history에 li.list-item--question(우리 문의)과 li.list-item--answer
+# (판매자 답변, 여럿일 수 있음)가 있고 각각 text__subject·text__date("2026-09-11 오전
+# 11:12:17")·text__content를 가진다. 목록의 상태는 text__status--done이 답변완료.
+# ---------------------------------------------------------------------------
+INQUIRY_DETAIL_ITEM = re.compile(r'<li class="list-item list-item--(question|answer)">(.*?)</li>', re.S)
+INQUIRY_DETAIL_SUBJECT = re.compile(r'<p class="text__subject">\s*(.*?)\s*</p>', re.S)
+INQUIRY_DETAIL_DATE = re.compile(r'<p class="text__date">\s*(.*?)\s*</p>', re.S)
+INQUIRY_DETAIL_CONTENT = re.compile(r'<div class="text__content">(.*?)</div>', re.S)
+INQUIRY_DETAIL_MARK = "list__inquiry-history"
+
+
+def _fetch_inquiry_detail_html(context: BrowserContext, write_no: str) -> str | None:
+    try:
+        response = context.request.get(INQUIRY_DETAIL_API.format(write_no=write_no))
+        if response.status != 200:
+            return None
+        html = response.text()
+    except Exception:  # noqa: BLE001
+        return None
+    return html if INQUIRY_DETAIL_MARK in html else None
+
+
+def _answer_from_detail(html: str, write_no: str) -> dict | None:
+    question = None
+    answers: list[tuple[str, str]] = []
+    for kind, block in INQUIRY_DETAIL_ITEM.findall(html):
+        d = INQUIRY_DETAIL_DATE.search(block)
+        c = INQUIRY_DETAIL_CONTENT.search(block)
+        when = html_mod.unescape(d.group(1)).strip() if d else ""
+        text = common.html_to_text(c.group(1)) if c else ""
+        if kind == "question" and question is None:
+            subject = INQUIRY_DETAIL_SUBJECT.search(block)
+            question = {"subject": html_mod.unescape(subject.group(1)).strip() if subject else "", "date": when}
+        elif kind == "answer" and text:
+            answers.append((when, text))
+    if question is None:
+        return None
+    return {
+        "inquiry_id": write_no,
+        "subject": question["subject"],
+        "state": "답변완료" if answers else "접수완료",
+        "written_on": question["date"][:10],
+        "answer": "\n\n".join(text for _, text in answers) or None,
+        "answered_on": answers[-1][0][:10] if answers else None,
+    }
+
+
+def fetch_inquiry_answer(context: BrowserContext, product_url: str, recipient_name: str, *,
+                         since: date, inquiry_id: str | None = None, headless: bool = False) -> dict | None:
+    """이 주문에 남긴 판매자 문의의 상태·답변 - {inquiry_id, state, written_on, answer, answered_on}, 없으면 None.
+
+    장부의 문의번호가 있으면 상세 한 번(제목이 우리 문구인지 확인)으로 끝낸다. 없으면
+    등록 때처럼 주문상세 API로 상품번호를 읽어 문의내역(수령인 이름 검색)에서 맞춘다.
+    세션이 끊겼으면 주문상세 화면을 열어 지나간다.
+    """
+    cart_no = extract_order_id(product_url)
+    message = inquiry_message(recipient_name)
+    if inquiry_id:
+        html = _fetch_inquiry_detail_html(context, inquiry_id)
+        if html is None:
+            _open_logged_in(_lookup_page(context), product_url)
+            html = _fetch_inquiry_detail_html(context, inquiry_id)
+        found = _answer_from_detail(html, inquiry_id) if html else None
+        if found is not None and found["subject"] == message:
+            return found
+    data = _fetch_pay_detail(context, cart_no)
+    if data is None:
+        _open_logged_in(_lookup_page(context), product_url)
+        data = _fetch_pay_detail(context, cart_no)
+    if data is None:
+        raise BlockedError(f"주문상세 API가 답하지 않아 문의를 찾을 수 없습니다 (cartNo={cart_no}).")
+    orders = data.get("orderList") or []
+    item_nos = {str((o.get("orderItem") or {}).get("itemNo") or "") for o in orders} - {""}
+    if not item_nos:
+        raise ParseError(f"주문상세 API에 상품번호가 없습니다 (cartNo={cart_no}).")
+    listed = _find_listed_inquiry(context, recipient_name, message, item_nos, since, datetime.now(KST).date())
+    if listed is None:
+        return None
+    html = _fetch_inquiry_detail_html(context, listed["write_no"])
+    found = _answer_from_detail(html, listed["write_no"]) if html else None
+    if found is None:
+        return {"inquiry_id": listed["write_no"], "state": listed["status"] or "접수완료",
+                "written_on": listed["date"], "answer": None, "answered_on": None}
+    return found

@@ -1133,3 +1133,65 @@ def post_inquiry(context: BrowserContext, product_url: str, recipient_name: str,
         done = _submit_via_form(context, ord_no, item, message)
     listed = _confirm_inquiry_listed(context, ord_no, message)
     return f"{done} · 나의 상담 내역: {listed}"
+
+
+# ---------------------------------------------------------------------------
+# 문의 답변 확인 (inquiry_answers.py)
+# 2026-09-11 실측: 상세(oneConslDtl.gs?oneConslId=)는 HTML 조각 - div.panel-columns에
+# 문의 내용, div.panel-contents에 p.reply-title(span.rdate 답변일 "2026.09.08 20:21")과
+# 그 뒤 답변 본문(통째로 <html> 문서, <p> 나열). 답변이 없으면 reply-title이 없다.
+# ---------------------------------------------------------------------------
+INQUIRY_DETAIL_URL = "https://www.gsshop.com/cust/myshop/oneConslDtl.gs?oneConslId={inquiry_id}"
+INQUIRY_DETAIL_QUESTION = re.compile(r'<div class="panel-columns">(.*?)</div>', re.S)
+INQUIRY_DETAIL_REPLY = re.compile(r'<p class="reply-title">(.*?)</p>(.*)', re.S)
+INQUIRY_DETAIL_REPLY_DATE = re.compile(r'<span class="rdate">\s*(.*?)\s*</span>', re.S)
+
+
+def _parse_inquiry_detail(fragment: str) -> dict:
+    q = INQUIRY_DETAIL_QUESTION.search(fragment)
+    parsed = {"question": common.html_to_text(q.group(1)) if q else "", "answer": None, "answered_on": None}
+    reply = INQUIRY_DETAIL_REPLY.search(fragment)
+    if reply is None:
+        return parsed
+    d = INQUIRY_DETAIL_REPLY_DATE.search(reply.group(1))
+    body = reply.group(2)
+    end = body.rfind("</div>")     # panel-contents 닫힘 앞까지가 본문
+    answer = common.html_to_text(body[:end] if end >= 0 else body)
+    if answer:
+        parsed["answer"] = answer
+        parsed["answered_on"] = html_mod.unescape(d.group(1)).strip()[:10] if d else ""
+    return parsed
+
+
+def fetch_inquiry_answer(context: BrowserContext, product_url: str, recipient_name: str, *,
+                         since: date, inquiry_id: str | None = None, headless: bool = False) -> dict | None:
+    """이 주문에 남긴 1:1 상담의 상태·답변 - {inquiry_id, state, written_on, answer, answered_on}, 없으면 None.
+
+    상담내역(주문일 이후)을 읽어 장부의 문의번호 줄을, 없으면 이 주문의 '배송 언제' 줄을
+    고르고 상세로 답변을 읽는다. 세션이 없으면 자동 로그인 뒤 다시 읽는다.
+    """
+    ord_no = extract_order_no(product_url)
+    try:
+        rows = _load_inquiry_rows(context, since)
+    except ParseError:
+        common.safe_print("[gsshop] 로그인 세션이 없어 자동 로그인을 시도합니다 (로그인용 크롬 창이 잠깐 뜹니다).")
+        if not _auto_login(context, product_url, headless=headless):
+            raise BlockedError("GSSHOP 로그인이 필요합니다. 송장조회를 한 번 돌려 로그인해두거나 "
+                               "--headless 없이 실행해주세요.") from None
+        rows = _load_inquiry_rows(context, since, refresh=True)
+    listed = None
+    if inquiry_id:
+        listed = next((r for r in rows if r["inquiry_id"] == inquiry_id and ord_no in r["text"]), None)
+    if listed is None:
+        listed = _find_listed_inquiry(context, ord_no, since)
+    if listed is None:
+        return None
+    fragment = _get_html(context, INQUIRY_DETAIL_URL.format(inquiry_id=listed["inquiry_id"]))
+    parsed = _parse_inquiry_detail(fragment) if fragment else {}
+    return {
+        "inquiry_id": listed["inquiry_id"],
+        "state": listed.get("state") or ("답변완료" if parsed.get("answer") else "답변대기"),
+        "written_on": f"{listed['written_on']:%Y.%m.%d}",
+        "answer": parsed.get("answer"),
+        "answered_on": parsed.get("answered_on"),
+    }

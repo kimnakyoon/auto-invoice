@@ -269,3 +269,28 @@ def wait_for_match(page, read_text, pattern, timeout_ms: int = MODAL_RENDER_WAIT
             return text
         page.wait_for_timeout(poll_ms)
         waited_ms += poll_ms
+
+
+def html_to_text(fragment: str | None) -> str:
+    """HTML 조각을 사람이 읽는 글자로 - 문의 답변 본문용.
+
+    <br>·문단 닫힘은 줄바꿈으로, 나머지 태그는 지우고, 엔티티를 풀고, 줄마다
+    공백을 하나로 모으고 빈 줄은 하나만 남긴다. 사이트마다 답변이 <p> 나열
+    (GSSHOP은 통째로 <html> 문서), <br> 나열(네이버·롯데아이몰), 줄바꿈 글자
+    (롯데온·NS홈쇼핑 \r\n)로 와서 어느 쪽이든 같은 모양이 되게 한다.
+    """
+    if not fragment:
+        return ""
+    import html as html_mod
+    import re
+
+    text = re.sub(r"<(script|style)\b.*?</\1>", "", fragment, flags=re.S | re.I)
+    text = re.sub(r"<br\s*/?>|</(p|div|li|tr|h\d)>", "\n", text, flags=re.I)
+    text = re.sub(r"<[^>]+>", "", text)
+    text = html_mod.unescape(text).replace("\xa0", " ").replace("\r", "")
+    lines: list[str] = []
+    for line in text.split("\n"):
+        line = re.sub(r"[ \t]+", " ", line).strip()
+        if line or (lines and lines[-1]):
+            lines.append(line)
+    return "\n".join(lines).strip()

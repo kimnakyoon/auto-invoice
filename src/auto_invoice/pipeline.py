@@ -50,7 +50,7 @@ import traceback
 from datetime import datetime
 from pathlib import Path
 
-from . import checkpoint, report as report_mod, result_excel
+from . import checkpoint, inquiry_answers, report as report_mod, result_excel
 from .orchestrator import run as run_orchestrator
 from .shopmine import connect, excel_io, export, grid, tabs, upload
 
@@ -252,6 +252,15 @@ def lookup_tracking(result: PipelineResult, *, limit=None, headless=False,
                               done_entries=state.entries if state else None,
                               done_rows=state.rows if state else None,
                               on_checkpoint=on_checkpoint)
+
+    # 남긴 1:1 문의의 답변 - 장부에 있는 주문(송장을 받은 건 제외, 대부분 '주문일지연')만
+    # 사이트에 물어 결과 엑셀 '사유' 칸에 싣는다. 여기서 실패해도 조회 결과를 덮으면 안 된다.
+    try:
+        attached = inquiry_answers.attach(report.entries, headless=headless, log=log)
+        if attached:
+            log(f"  문의 답변/상태를 {attached}건에 붙였습니다 (결과 엑셀 '사유' 칸).")
+    except Exception as e:  # noqa: BLE001
+        log(f"  경고: 문의 답변 확인을 건너뜁니다 - {e}")
 
     result.lookup_counts = report.summary()
     result.lookup_entries = list(report.entries)

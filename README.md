@@ -451,6 +451,38 @@ python scripts/run_all.py --stop-before-apply   # 일괄등록까지만, 마지�
   결과 엑셀과 같은 생김새이고, 정렬은 실패 → 미지원 사이트 넘김 → 남김 →
   이미 남긴 주문 순 - 앞의 둘이 사람이 직접 남겨야 하는 건이다.
 
+### 남긴 문의의 답변을 결과 엑셀 '사유' 칸에 싣는다 (`inquiry_answers.py`)
+
+문의를 남기면 공급사가 하루 안팎에 "9/15까지 재고 확보 후 발송" 같은 답을 단다.
+그 답을 보러 사이트마다 문의내역을 열지 않도록, 송장조회가 끝나면(`pipeline.lookup_tracking`)
+장부에 있는 주문(송장을 받은 성공 건 제외 - 대부분 '주문일지연' 건, 실패·취소/품절도 포함)의
+답변을 어댑터 `fetch_inquiry_answer(context, product_url, recipient_name, since=, inquiry_id=)`로
+읽어 `ReportEntry.inquiry_note`에 싣고, 결과 엑셀 두 시트의 '사유' 칸에 원래 사유 아래 줄로
+`[문의 답변 2026.09.11] ...`(진한 녹색) 또는 `[문의 09-10 남김 - 답변대기]`를 붙인다
+(`result_excel.compose_reason`). 결과는 장부 항목의 `answer_check`에 남고 답변이 온 문의는
+다시 묻지 않는다(14일 지난 문의도). `scripts/check_answers.py`는 같은 확인을 따로 돌려 최신
+결과 엑셀의 '사유' 칸을 제자리에서 고친다(`update_excel` - 전에 붙인 메모는 떼고 다시 붙여
+여러 번 돌려도 한 번만 남는다). 읽기만 하고 등록 주소는 건드리지 않는다.
+
+- 어댑터는 장부의 문의번호(확인 문구의 '문의번호 N')가 있으면 상세 한 번으로 끝내고, 없으면
+  등록 때와 같은 문의내역 뒤지기(`_find_listed_inquiry`)로 찾는다. 2026-09-11 실측(장부 71건,
+  사이트마다 1.2~2.7초, 51건 답변):
+  - **롯데온**: 목록 API는 `pageNo`로 넘어가고 상세 API `data`에 `ansCnts`·`ansDttm`·
+    `tskProcStatCd`(CMPT=답변완료)가 있다. 문의번호 없는 초기 3건도 목록을 넘겨 찾았다.
+  - **지마켓**: 상세 HTML `ul.list__inquiry-history`의 `li.list-item--answer`(여럿일 수 있음)
+    `text__date`·`text__content`. 목록의 답변완료 줄은 `class="text__status text__status--done"`
+    이라 예전 파서(`class="text__status"` 정확 일치)가 상태를 빈 값으로 읽던 것을 고쳤다.
+  - **SSG**: 상세 `counselDetail.ssg`의 `div.answer`(답변 작성일 + `span[white-space:pre-wrap]`).
+  - **네이버**: 문의내역 항목의 `dd.answer_txt`(`<br>` 나열)와 `답변일<em>` - 상세 없음.
+  - **GS샵**: 상세 `oneConslDtl.gs?oneConslId=`의 `p.reply-title span.rdate`와 그 뒤 본문
+    (통째로 `<html>` 문서, `<p>` 나열 - `common.html_to_text`로 편다).
+  - **롯데아이몰**: 상담내역 링크 `fn_goDetailLayer(ccn_no, ord_gubun, no, ord_no, goods_no)`가
+    POST `mypage/searchinquirePagingViewLayer.lotte`(조회용)로 레이어를 받는다 - 같은 주문·상품의
+    문의가 `<li>`마다 오고 숨은 `#ccn_no`로 우리 것을 고른 뒤 `div.answer p.q_txt`·`p.date`.
+  - **NS홈쇼핑**: 상세 POST `customercenter/qst-dtl {custCmplnNum}`의 `ansrYn`·`ansr`·`ansrDate`.
+    목록·상세의 제목은 이름이 글자마다 `*`로 가려지고 25자에서 잘려(`*** ******* *********** 배`)
+    `_title_matches`가 가린 이름 형태까지 맞춘다 - 이걸 안 하면 2026-09-09 실등록 건을 못 찾았다.
+
 ### 기다리는 시간은 '시계'가 아니라 '화면'을 보고 정한다
 
 주문 하나를 조회하는 데 걸리는 시간의 대부분은 통신이 아니라 **고정 대기**였다.

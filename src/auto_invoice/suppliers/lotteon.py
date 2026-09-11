@@ -1159,3 +1159,79 @@ def post_inquiry(context: BrowserContext, product_url: str, recipient_name: str,
             with contextlib.suppress(Exception):
                 form.close()
         page.close()
+
+
+# ---------------------------------------------------------------------------
+# 문의 답변 확인 (inquiry_answers.py)
+# 2026-09-11 실측: 문의내역 목록 API는 pageNo로 넘길 수 있고, 상세 API의 data에
+# 답변 본문(ansCnts)·답변일(ansDttm)·상태(tskProcStatCd CMPT=답변완료)가 있다.
+# 상세는 GET이라 화면에서 펼칠 때 나가는 '확인함' 갱신 같은 부작용이 없다.
+# ---------------------------------------------------------------------------
+INQUIRY_HISTORY_PAGE_API = "https://pbf.lotteon.com/customer/v2/oneToOneInquiry?pageNo={page}&rowsPerPage=10"
+INQUIRY_ANSWER_MAX_PAGES = 5   # 문의번호 없이 목록을 뒤질 때 보는 페이지 수
+
+
+def _inquiry_detail(context: BrowserContext, cnsl_no: str | int) -> dict | None:
+    detail = _get_json(context, INQUIRY_DETAIL_API.format(cnsl_no=cnsl_no))
+    data = (detail or {}).get("data")
+    return data if isinstance(data, dict) and data else None
+
+
+def _answer_from_detail(data: dict) -> dict:
+    code = str(data.get("tskProcStatCd") or "")
+    answer = common.html_to_text(str(data.get("ansCnts") or ""))
+    return {
+        "inquiry_id": str(data.get("cnslNo") or ""),
+        "state": INQUIRY_STATUS_TEXT.get(code, code or "상태 모름"),
+        "written_on": str(data.get("accpDttm") or ""),
+        "answer": answer or None,
+        "answered_on": str(data.get("ansDttm") or "") if answer else None,
+    }
+
+
+def _is_this_order(data: dict | None, od_no: str) -> bool:
+    return bool(data) and str(data.get("odNo") or "") == od_no and data.get("delYn") != "Y"
+
+
+def fetch_inquiry_answer(context: BrowserContext, product_url: str, recipient_name: str, *,
+                         since: date, inquiry_id: str | None = None, headless: bool = False) -> dict | None:
+    """이 주문에 남긴 문의의 상태·답변 - {inquiry_id, state, written_on, answer, answered_on}, 없으면 None.
+
+    장부의 문의번호가 있으면 상세 한 번으로 끝낸다(odNo가 이 주문인지 확인). 없으면
+    목록을 최신순으로 넘기며 같은 문구의 고객센터 문의를 상세로 열어 맞춘다 - since
+    (주문일)보다 오래된 줄이 나오면 그만둔다. 세션이 없으면 주문내역 화면을 한 번
+    열어 로그인한다.
+    """
+    od_no = extract_od_no(product_url)
+    message = inquiry_message(recipient_name)
+    listed = _get_json(context, INQUIRY_HISTORY_PAGE_API.format(page=1))
+    if listed is None:
+        page = context.new_page()
+        try:
+            _goto_logged_in(page, ORDER_LIST_URL, headless)
+        finally:
+            page.close()
+        listed = _get_json(context, INQUIRY_HISTORY_PAGE_API.format(page=1))
+        if listed is None:
+            raise BlockedError("롯데온 문의내역을 읽지 못했습니다 (로그인 세션이 없습니다).")
+    if inquiry_id:
+        data = _inquiry_detail(context, inquiry_id)
+        if _is_this_order(data, od_no):
+            return _answer_from_detail(data)
+    since_text = f"{since:%Y.%m.%d}"
+    for page_no in range(1, INQUIRY_ANSWER_MAX_PAGES + 1):
+        if page_no > 1:
+            listed = _get_json(context, INQUIRY_HISTORY_PAGE_API.format(page=page_no))
+        items = (listed or {}).get("data") or []
+        if not items:
+            return None
+        for item in items:
+            if str(item.get("accpDttm") or "") < since_text:
+                return None   # 최신순이라 여기부터는 전부 주문일 이전
+            if (item.get("inqTypCd") != INQUIRY_HISTORY_TYPE or not item.get("cnslNo")
+                    or str(item.get("inqTtl") or "").strip() != message):
+                continue
+            data = _inquiry_detail(context, item["cnslNo"])
+            if _is_this_order(data, od_no):
+                return _answer_from_detail(data)
+    return None

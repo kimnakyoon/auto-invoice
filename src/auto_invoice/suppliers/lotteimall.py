@@ -482,7 +482,7 @@ INQUIRY_LIST_URL = "https://www.lotteimall.com/mypage/searchinquirePagingList.lo
 INQUIRY_LIST_MARKER = "일대일 답변 목록"
 INQUIRY_ROW_PATTERN = re.compile(r'<tr id="eventBBSQ_\d+">(.*?)</tr>', re.S)
 INQUIRY_ROW_LINK = re.compile(
-    r"fn_goDetailLayer\('(\d+)',\s*'[^']*',\s*'[^']*',\s*'([^']*)',\s*'([^']*)'\);?\"[^>]*>(.*?)</a>", re.S)
+    r"fn_goDetailLayer\('(\d+)',\s*'([^']*)',\s*'[^']*',\s*'([^']*)',\s*'([^']*)'\);?\"[^>]*>(.*?)</a>", re.S)
 INQUIRY_ROW_CELL = re.compile(r"<td[^>]*>(.*?)</td>", re.S)
 INQUIRY_PAGE_ON = re.compile(r'class="on">\s*(\d+)\s*<')
 INQUIRY_PAGE_LINK = re.compile(r"pageIdx=(\d+)")
@@ -581,9 +581,10 @@ def _parse_inquiry_rows(html: str) -> list[dict]:
             continue
         rows.append({
             "inquiry_id": link.group(1),
-            "ord_no": link.group(2).replace("-", ""),
-            "goods_no": link.group(3),
-            "text": html_mod.unescape(re.sub(r"\s+", " ", re.sub(r"<[^>]+>", " ", link.group(4)))).strip(),
+            "ord_gubun": link.group(2),      # 상세 레이어 요청에 그대로 보내는 구분값 (NEC 등)
+            "ord_no": link.group(3).replace("-", ""),
+            "goods_no": link.group(4),
+            "text": html_mod.unescape(re.sub(r"\s+", " ", re.sub(r"<[^>]+>", " ", link.group(5)))).strip(),
             "written_on": datetime.strptime(written.group(0), "%Y.%m.%d").date(),
             "state": _cell_state(cells[4]),
         })
@@ -895,3 +896,82 @@ def post_inquiry(context: BrowserContext, product_url: str, recipient_name: str,
         done = _submit_via_form(context, order, message, headless)
     listed = _confirm_inquiry_listed(context, ord_no, message)
     return f"{done} · 상담내역 확인: {listed}"
+
+
+# ---------------------------------------------------------------------------
+# 문의 답변 확인 (inquiry_answers.py)
+# 2026-09-11 실측: 상담내역의 제목 링크 fn_goDetailLayer(ccn_no, ord_gubun, no, ord_no,
+# goods_no)는 POST mypage/searchinquirePagingViewLayer.lotte {ccn_no, ord_gubun, ord_no,
+# goods_no}로 '1:1 답변 확인' 레이어 HTML을 받는다(조회용 - 부작용 없음). 같은 주문·상품의
+# 문의가 <li>마다 하나씩 오고(제목 p.tit, span.status_txt, 답변 div.answer > p.q_txt·p.date,
+# 숨은 input#ccn_no가 문의번호) 우리 문의번호의 <li>에서 답변을 읽는다.
+# ---------------------------------------------------------------------------
+INQUIRY_DETAIL_URL = "https://www.lotteimall.com/mypage/searchinquirePagingViewLayer.lotte"
+INQUIRY_DETAIL_MARK = "1:1 답변 확인"
+INQUIRY_DETAIL_ITEM = re.compile(r"<li>(.*?)</li>", re.S)
+INQUIRY_DETAIL_CCN = re.compile(r'id="ccn_no"[^>]*value="(\d+)"')
+INQUIRY_DETAIL_STATUS = re.compile(r'<span class="status_txt">\s*(.*?)\s*</span>', re.S)
+INQUIRY_DETAIL_ANSWER = re.compile(r'<div class="answer">\s*<p class="q_txt">(.*?)</p>\s*<p class="date">\s*(.*?)\s*</p>', re.S)
+
+
+def _fetch_inquiry_detail(context: BrowserContext, row: dict) -> str | None:
+    try:
+        response = context.request.post(INQUIRY_DETAIL_URL, form={
+            "ccn_no": row["inquiry_id"], "ord_gubun": row.get("ord_gubun") or "NEC",
+            "ord_no": row["ord_no"], "goods_no": row["goods_no"]})
+    except Exception:  # noqa: BLE001
+        return None
+    if not response.ok or _url_needs_login(response.url):
+        return None
+    html = response.text()
+    return html if INQUIRY_DETAIL_MARK in html else None
+
+
+def _answer_from_detail(html: str, inquiry_id: str) -> dict:
+    """레이어에서 이 문의번호의 <li>를 골라 상태·답변. 못 고르면 답변 없음으로."""
+    for block in INQUIRY_DETAIL_ITEM.findall(html):
+        ccn = INQUIRY_DETAIL_CCN.search(block)
+        if ccn is None or ccn.group(1) != inquiry_id:
+            continue
+        status = INQUIRY_DETAIL_STATUS.search(block)
+        answer = INQUIRY_DETAIL_ANSWER.search(block)
+        text = common.html_to_text(answer.group(1)) if answer else ""
+        return {"state": html_mod.unescape(status.group(1)).strip() if status else "",
+                "answer": text or None,
+                "answered_on": html_mod.unescape(answer.group(2)).strip()[:10] if answer and text else None}
+    return {"state": "", "answer": None, "answered_on": None}
+
+
+def fetch_inquiry_answer(context: BrowserContext, product_url: str, recipient_name: str, *,
+                         since: date, inquiry_id: str | None = None, headless: bool = False) -> dict | None:
+    """이 주문에 남긴 1:1 문의의 상태·답변 - {inquiry_id, state, written_on, answer, answered_on}, 없으면 None.
+
+    상담내역(주문일 이후)에서 장부의 문의번호 줄을, 없으면 이 주문의 '배송 언제' 줄을 고르고
+    상세 레이어로 답변을 읽는다. 세션이 없으면 상담내역 화면을 열어 로그인하고 다시 읽는다.
+    """
+    ord_no = extract_order_no(product_url)
+    try:
+        rows = _load_inquiry_rows(context, since)
+    except ParseError:
+        page = context.new_page()
+        try:
+            _goto_logged_in(context, page, INQUIRY_LIST_URL.format(page=1), headless)
+        finally:
+            page.close()
+        rows = _load_inquiry_rows(context, since, refresh=True)
+    listed = None
+    if inquiry_id:
+        listed = next((r for r in rows if r["inquiry_id"] == inquiry_id and r["ord_no"] == ord_no), None)
+    if listed is None:
+        listed = _find_listed_inquiry(context, ord_no, since)
+    if listed is None:
+        return None
+    html = _fetch_inquiry_detail(context, listed)
+    parsed = _answer_from_detail(html, listed["inquiry_id"]) if html else {}
+    return {
+        "inquiry_id": listed["inquiry_id"],
+        "state": parsed.get("state") or listed.get("state") or "상태 모름",
+        "written_on": f"{listed['written_on']:%Y.%m.%d}",
+        "answer": parsed.get("answer"),
+        "answered_on": parsed.get("answered_on"),
+    }

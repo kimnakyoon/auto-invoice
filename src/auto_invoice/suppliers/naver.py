@@ -659,6 +659,8 @@ INQUIRY_ROW_ORDER_NO = re.compile(r"주문번호\s*(\d+)")
 INQUIRY_ROW_SUBJECT = re.compile(r'<span class="subject">\s*(.*?)\s*</span>', re.S)
 INQUIRY_ROW_DATE = re.compile(r"작성일\s*<em>(\d{4}\.\d{2}\.\d{2})</em>")
 INQUIRY_ROW_ID = re.compile(r'_delete_inquiry_btn[^>]*value="(\d+)"')
+INQUIRY_ROW_ANSWER = re.compile(r'<dd class="answer_txt">(.*?)</dd>', re.S)
+INQUIRY_ROW_ANSWER_DATE = re.compile(r'<span class="date">\s*답변일\s*<em>(\d{4}\.\d{2}\.\d{2})</em>\s*</span>')
 INQUIRY_TOTAL_COUNT = re.compile(r"totalCount\s*:\s*(\d+)")
 INQUIRY_ROW_PER_PAGE = re.compile(r"rowPerPage\s*:\s*(\d+)")
 INQUIRY_LIST_HEADERS = {"referer": "https://orders.pay.naver.com/"}
@@ -755,12 +757,17 @@ def _parse_inquiry_rows(fragment: str) -> list[dict]:
             continue
         status = INQUIRY_ROW_STATUS.search(chunk)
         inquiry_id = INQUIRY_ROW_ID.search(chunk)
+        # 판매자 답변은 같은 항목의 dd.answer_txt에 본문(<br> 나열)과 '답변일<em>날짜</em>'로 붙어 있다.
+        answer = INQUIRY_ROW_ANSWER.search(chunk)
+        answered = INQUIRY_ROW_ANSWER_DATE.search(answer.group(1)) if answer else None
         rows.append({
             "order_no": order_no.group(1),
             "subject": re.sub(r"\s+", " ", subject.group(1)).strip(),
             "date": written.group(1),
             "status": re.sub(r"\s+", " ", status.group(1)).strip() if status else "",
             "id": inquiry_id.group(1) if inquiry_id else "",
+            "answer": common.html_to_text(INQUIRY_ROW_ANSWER_DATE.sub("", answer.group(1))) if answer else "",
+            "answered_on": answered.group(1) if answered else "",
         })
     return rows
 
@@ -1004,6 +1011,41 @@ def post_inquiry(context: BrowserContext, product_url: str, recipient_name: str,
     finally:
         # 둘째 계정 세션은 여기서 직접 저장한다 (조회의 finally와 같은 이유 - 이
         # context는 오케스트레이터가 실행 끝에 저장해 주지 않는다).
+        if account_label == "2":
+            with contextlib.suppress(Exception):
+                account_context.storage_state(path=str(browser_mod.state_path(SECOND_ACCOUNT_STATE_KEY)))
+
+
+# ---------------------------------------------------------------------------
+# 문의 답변 확인 (inquiry_answers.py)
+# 문의내역 항목에 답변 본문이 같이 오므로(_parse_inquiry_rows의 answer/answered_on)
+# 상세를 열 필요가 없다. 어느 계정인지는 등록 때와 같이 주문상세로 가른다.
+# ---------------------------------------------------------------------------
+
+def fetch_inquiry_answer(context: BrowserContext, product_url: str, recipient_name: str, *,
+                         since: date, inquiry_id: str | None = None, headless: bool = False) -> dict | None:
+    """이 주문에 남긴 1:1 문의의 상태·답변 - {inquiry_id, state, written_on, answer, answered_on}, 없으면 None."""
+    order_no = extract_order_no(product_url)
+    message = inquiry_message(recipient_name)
+    account_context, account_label, _detail = _account_for_order(context, order_no, headless)
+    try:
+        rows = _load_inquiry_rows(account_context, since, refresh=False, max_pages=INQUIRY_HISTORY_MAX_PAGES)
+        entry = None
+        if inquiry_id:
+            entry = next((r for r in rows if r["id"] == inquiry_id and r["order_no"] == order_no), None)
+        if entry is None:
+            entry = _find_listed_inquiry(account_context, order_no, message, since)
+        if entry is None:
+            return None
+        return {
+            "inquiry_id": entry["id"],
+            "state": entry["status"] or "접수",
+            "written_on": entry["date"],
+            "answer": entry.get("answer") or None,
+            "answered_on": entry.get("answered_on") or None,
+            "account": account_label,
+        }
+    finally:
         if account_label == "2":
             with contextlib.suppress(Exception):
                 account_context.storage_state(path=str(browser_mod.state_path(SECOND_ACCOUNT_STATE_KEY)))

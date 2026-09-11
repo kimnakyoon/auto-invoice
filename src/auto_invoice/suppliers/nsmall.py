@@ -643,12 +643,21 @@ def _describe_listed(entry: dict) -> str:
 
 
 def _same_inquiry(entry: dict, order: dict, message: str) -> bool:
-    """이 상품의 [배송] 문의이고, 제목이 우리 문구의 앞부분(제목은 25자에서 잘린다 - 2026-09-09 실등록
-    'CHI MICHAEL CHRISTOPHER 배')이거나 사람이 남긴 '배송 언제' 문의면 같은 문의로 본다."""
-    title = entry["title"]
+    """이 상품의 [배송] 문의이고 제목이 우리 문의(_title_matches)면 같은 문의로 본다."""
     return (entry["goods_cd"] == order["goods_cd"] and entry["category"] == INQUIRY_LIST_CATEGORY
-            and (INQUIRY_SAME_MARK in title
-                 or (len(title) >= INQUIRY_TITLE_MIN and message.startswith(title))))
+            and _title_matches(entry["title"], message))
+
+
+def _title_matches(title: str, message: str) -> bool:
+    """상담내역 제목이 우리 문구인가 - 제목은 25자에서 잘리고(2026-09-09 실등록 'CHI MICHAEL
+    CHRISTOPHER 배') 목록·상세에서는 이름 글자가 *로 가려진다('*** ******* *********** 배',
+    '*** 배송 언제 시작하나요?' - 2026-09-11 실측). 사람이 남긴 '배송 언제' 문의도 같은 것으로."""
+    title = (title or "").strip()
+    if len(title) < INQUIRY_TITLE_MIN:
+        return False
+    name, sep, tail = message.partition(" 배송 언제")
+    masked = re.sub(r"\S", "*", name) + sep + tail if sep else message
+    return INQUIRY_SAME_MARK in title or message.startswith(title) or masked.startswith(title)
 
 
 def _find_listed_inquiry(context: BrowserContext, product_url: str, order: dict, message: str, since: date | None, *,
@@ -1052,3 +1061,61 @@ def _answer_from_list(context: BrowserContext, product_url: str, order: dict, or
     result.sent_request = sent_request
     return result
 
+
+
+# ---------------------------------------------------------------------------
+# 문의 답변 확인 (inquiry_answers.py)
+# 2026-09-11 실측: 상세 POST customercenter/qst-dtl {custCmplnNum}(조회용, 부작용 없음)의
+# resultData에 ansrYn·ansr(답변 본문, \r\n 줄바꿈)·ansrDate("2026.09.10")·title·ctnt·goodsCd가
+# 있다. 목록·상세 모두 제목의 이름이 ***로 가려질 수 있어(2026-09-10 실등록 "*** 배송 언제
+# 시작하나요?") 제목 대조는 '배송 언제' 표식 또는 문구의 앞부분으로 한다(_title_matches).
+# ---------------------------------------------------------------------------
+INQUIRY_DETAIL_URL = INQUIRY_API_BASE + "/cust/customercenter/qst-dtl"
+
+
+def _fetch_inquiry_detail(context: BrowserContext, product_url: str, order_no: str, inquiry_id: str) -> dict | None:
+    try:
+        detail = _api_logged_in(context, product_url, order_no, INQUIRY_DETAIL_URL,
+                                data={"custCmplnNum": int(inquiry_id)})
+    except (ValueError, ParseError):
+        return None
+    return detail if isinstance(detail, dict) and detail.get("custCmplnNum") else None
+
+
+def _answer_from_detail(detail: dict) -> dict:
+    answered = str(detail.get("ansrYn")) == "Y"
+    answer = common.html_to_text(str(detail.get("ansr") or "")) if answered else ""
+    return {
+        "inquiry_id": str(detail.get("custCmplnNum") or ""),
+        "state": "답변완료" if answered else "답변대기",
+        "written_on": str(detail.get("qstDate") or ""),
+        "answer": answer or None,
+        "answered_on": str(detail.get("ansrDate") or "") if answer else None,
+    }
+
+
+def fetch_inquiry_answer(context: BrowserContext, product_url: str, recipient_name: str, *,
+                         since: date, inquiry_id: str | None = None, headless: bool = False) -> dict | None:
+    """이 주문에 남긴 1:1 문의의 상태·답변 - {inquiry_id, state, written_on, answer, answered_on}, 없으면 None.
+
+    장부의 문의번호가 있으면 상세 한 번(제목이 우리 문의인지 확인)으로 끝낸다. 없으면
+    등록 때처럼 주문상세의 상품코드로 상담내역을 뒤진다. 세션은 _api_logged_in이 챙긴다.
+    """
+    order_no = extract_order_no(product_url)
+    message = f"{recipient_name.strip()} 배송 언제 시작하나요?"
+    if inquiry_id:
+        detail = _fetch_inquiry_detail(context, product_url, order_no, inquiry_id)
+        if detail is not None and _title_matches(str(detail.get("title") or ""), message):
+            return _answer_from_detail(detail)
+    try:
+        order = _order_for_inquiry(context, product_url, order_no)
+    except OrderCancelled:
+        return None   # 취소된 주문은 상품코드를 못 읽는다 - 문의는 있어도 더 볼 일이 없다
+    listed = _find_listed_inquiry(context, product_url, order, message, since)
+    if listed is None:
+        return None
+    detail = _fetch_inquiry_detail(context, product_url, order_no, listed["inquiry_id"])
+    if detail is None:
+        return {"inquiry_id": listed["inquiry_id"], "state": listed["state"],
+                "written_on": f"{listed['written_on']:%Y.%m.%d}", "answer": None, "answered_on": None}
+    return _answer_from_detail(detail)

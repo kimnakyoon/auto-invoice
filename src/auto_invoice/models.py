@@ -61,3 +61,7 @@ class ReportEntry(BaseModel):
     # 샵마인 엑셀의 상품URL. 주문일이 오래된 건은 사람이 그 화면을 직접 열어
     # 확인해야 해서 결과 엑셀에 링크로 같이 낸다.
     product_url: Optional[str] = None
+    # 이 주문에 남긴 1:1 문의의 답변 (inquiry_answers.py). 결과 엑셀의 '사유' 칸에
+    # 원래 사유 아래 줄로 붙는다 - 답변이 왔으면 그 내용, 아직이면 '답변대기'. 문의를
+    # 남긴 적 없는 주문은 None.
+    inquiry_note: Optional[str] = None

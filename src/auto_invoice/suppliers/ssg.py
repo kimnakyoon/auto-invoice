@@ -661,6 +661,8 @@ def _fetch_counsel_detail(context: BrowserContext, cnsl_id: str) -> dict | None:
         "written_at": datetime.strptime(d.group(1), "%Y.%m.%d %H:%M"),
         "title": html_mod.unescape(re.sub(r"\s+", " ", t.group(1))).strip(),
         "item_ids": set(COUNSEL_DETAIL_ITEM_PATTERN.findall(detail_html)),
+        # 답변들 [(답변일 "2026.09.09 09:56", 본문)] - 상담사 답변이 여럿 달릴 수 있다.
+        "answers": _answers_in_detail(detail_html),
     }
 
 
@@ -775,3 +777,69 @@ def post_inquiry(context: BrowserContext, product_url: str, recipient_name: str,
         return f"{done[0].strip().split('.')[0]} · E-mail 답변확인: {listed}"
     finally:
         page.close()
+
+
+# ---------------------------------------------------------------------------
+# 문의 답변 확인 (inquiry_answers.py)
+# 2026-09-11 실측: 상세(counselDetail.ssg?cnslId=) HTML에 div.question 다음으로
+# 답변마다 <div class="answer"><span class="date">답변 작성일 2026.09.09 09:56</span>
+# <span style="white-space:pre-wrap">본문</span></div>가 온다. 목록의 상태는
+# 답변준비중/처리중 -> 답변완료.
+# ---------------------------------------------------------------------------
+COUNSEL_DETAIL_ANSWER_PATTERN = re.compile(r'<div class="answer">(.*?)</div>', re.S)
+COUNSEL_ANSWER_DATE_PATTERN = re.compile(r"(\d{4}\.\d{2}\.\d{2} \d{2}:\d{2})")
+COUNSEL_ANSWER_TEXT_PATTERN = re.compile(r'<span style="white-space:pre-wrap">(.*?)</span>', re.S)
+
+
+def _answers_in_detail(detail_html: str) -> list[tuple[str, str]]:
+    answers: list[tuple[str, str]] = []
+    for block in COUNSEL_DETAIL_ANSWER_PATTERN.findall(detail_html):
+        d = COUNSEL_ANSWER_DATE_PATTERN.search(block)
+        t = COUNSEL_ANSWER_TEXT_PATTERN.search(block)
+        text = common.html_to_text(t.group(1)) if t else common.html_to_text(block)
+        if text:
+            answers.append((d.group(1) if d else "", text))
+    return answers
+
+
+def _answer_from_detail(detail: dict, state: str | None) -> dict:
+    answers = detail.get("answers") or []
+    return {
+        "inquiry_id": detail["cnsl_id"],
+        "state": state or ("답변완료" if answers else "답변준비중"),
+        "written_on": f"{detail['written_at']:%Y.%m.%d}",
+        "answer": "\n\n".join(text for _, text in answers) or None,
+        "answered_on": (answers[-1][0][:10] or None) if answers else None,
+    }
+
+
+def fetch_inquiry_answer(context: BrowserContext, product_url: str, recipient_name: str, *,
+                         since: date, inquiry_id: str | None = None, headless: bool = False) -> dict | None:
+    """이 주문에 남긴 E-mail 상담의 상태·답변 - {inquiry_id, state, written_on, answer, answered_on}, 없으면 None.
+
+    E-mail 답변확인 첫 페이지로 세션을 확인하고(없으면 자동 로그인) 상태를 읽는다.
+    장부의 문의번호가 있으면 상세 한 번(제목이 우리 문구이고 주문일 이후인지 확인)으로
+    끝내고, 없으면 등록 때처럼 [주문상품 선택] 목록의 itemId로 문의내역을 뒤진다.
+    """
+    order_no = extract_order_no(product_url)
+    message = inquiry_message(recipient_name)
+    rows = _fetch_counsel_list(context, 1)
+    if rows is None:
+        page = context.new_page()
+        try:
+            _goto_logged_in(page, COUNSEL_LIST_URL.format(page=1))
+        finally:
+            page.close()
+        rows = _fetch_counsel_list(context, 1)
+        if rows is None:
+            raise BlockedError("SSG E-mail 답변확인을 읽지 못했습니다 (로그인 세션이 없습니다).")
+    state_by_id = {r["cnsl_id"]: r.get("state") for r in rows}
+    if inquiry_id:
+        detail = _fetch_counsel_detail(context, inquiry_id)
+        if detail is not None and detail["title"] == message and detail["written_at"].date() >= since:
+            return _answer_from_detail(detail, state_by_id.get(inquiry_id))
+    _, _, item_ids = _fetch_order_items(context, order_no)
+    listed = _find_listed_inquiry(context, message, item_ids, since)
+    if listed is None:
+        return None
+    return _answer_from_detail(listed, listed.get("state") or state_by_id.get(listed["cnsl_id"]))
