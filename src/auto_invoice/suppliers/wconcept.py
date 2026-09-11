@@ -45,6 +45,15 @@
   예외를 던진다.
 - 주문일은 화면의 "주문번호 Z13335855 주문일 2026.08.30"에서 읽힌다
   (order_date.py의 라벨 규칙).
+- 2026-09-11 실행에서 세션이 만료된 채 첫 건을 열었더니 로그인 화면으로
+  판정되지 않은 채 상품 목록(table.tbl_order_list)만 15초 기다리다 타임아웃으로
+  실패했고, 바로 다음 건에서야 로그인 화면이 잡혀 자동 로그인이 됐다. 쿠키가
+  없거나 인증 쿠키를 망가뜨린 상태로는 서버가 바로 302로 로그인 화면으로 넘겨
+  재현되지 않아(둘 다 실측) 정확히 어떤 화면이었는지는 모른다. 그래서
+  (1) 표만이 아니라 '표 또는 로그인 입력창' 중 먼저 뜨는 쪽을 기다려 뒤늦게
+  로그인 화면이 되는 경우도 자동 로그인으로 이어가고, (2) 둘 다 안 뜨면 한 번
+  다시 열어 보고, (3) 그래도 안 되면 그때의 주소·제목·화면 첫 줄을 사유에
+  실어 다음에는 원인을 알 수 있게 한다(_wait_for_order_table).
 """
 
 from __future__ import annotations
@@ -333,6 +342,59 @@ def _scrape_tracking_from_page(page: Page, context: BrowserContext, order_no: st
     return TrackingResult(tracking_no=tracking_no, courier=courier)
 
 
+def _login_and_reopen(context: BrowserContext, page: Page, product_url: str) -> None:
+    common.safe_print("[wconcept] 로그인 세션이 없어 자동 로그인을 시도합니다.")
+    _auto_login(context)
+    # 로그인 후에는 주문상세로 돌아오지 않는다(리다이렉트 값에 orderno가
+    # 빠져 있다) - 항상 원래 주소로 다시 들어간다.
+    page.goto(product_url, wait_until="domcontentloaded")
+    if _looks_like_login_page(page):
+        raise BlockedError("W컨셉 로그인 후에도 여전히 로그인 페이지입니다.")
+
+
+def _page_summary(page: Page) -> str:
+    """타임아웃 사유에 실을 '지금 무슨 화면인가' 한 줄 (주소·제목·본문 첫 줄)."""
+    try:
+        text = " ".join(page.inner_text("body").split())[:120]
+    except Exception:  # noqa: BLE001 - 본문을 못 읽어도 주소·제목은 남긴다
+        text = ""
+    return f"주소={page.url}, 제목={page.title()!r}, 화면='{text}'"
+
+
+def _wait_for_order_table(context: BrowserContext, page: Page, product_url: str,
+                          order_no: str) -> None:
+    """주문상세의 상품 목록(table.tbl_order_list)이 그려질 때까지 기다린다.
+
+    표만 기다리지 않고 로그인 입력창도 같이 본다 - 세션이 만료된 채 열면
+    goto 직후에는 로그인 화면으로 판정되지 않다가 뒤늦게 로그인 화면이 되는
+    경우가 있었다(2026-09-11, 이 파일 docstring). 그때는 자동 로그인 뒤 다시
+    연다. 둘 다 안 뜨면 한 번 다시 열어 보고(일시 오류 화면일 수 있다), 그래도
+    안 되면 그때 화면이 무엇이었는지를 사유에 실어 ParseError로 남긴다.
+    """
+    either = page.locator(GOODS_TABLE_SELECTOR).or_(page.locator("input[type='password']")).first
+    logged_in = False
+    for attempt in range(2):
+        try:
+            either.wait_for(state="attached", timeout=GOODS_TABLE_TIMEOUT_MS)
+        except Exception:  # noqa: BLE001 - 타임아웃: 표도 로그인 창도 안 떴다
+            if attempt == 0:
+                common.safe_print(f"[wconcept] 주문상세가 그려지지 않아 다시 엽니다 ({_page_summary(page)}).")
+                page.goto(product_url, wait_until="domcontentloaded")
+                continue
+            raise ParseError(
+                f"주문상세의 상품 목록을 {GOODS_TABLE_TIMEOUT_MS // 1000}초 안에 찾지 못했습니다 "
+                f"(주문번호={order_no}, {_page_summary(page)})."
+            )
+        if page.locator(GOODS_TABLE_SELECTOR).count():
+            return
+        # 로그인 입력창이 먼저 떴다 - 뒤늦게 로그인 화면으로 넘어온 것이다.
+        if logged_in:
+            raise BlockedError("W컨셉 로그인 후에도 여전히 로그인 페이지입니다.")
+        _login_and_reopen(context, page, product_url)
+        logged_in = True
+    page.wait_for_selector(GOODS_TABLE_SELECTOR, timeout=GOODS_TABLE_TIMEOUT_MS)
+
+
 def get_tracking(
     context: BrowserContext, product_url: str, headless: bool = True, order_option: str | None = None
 ) -> TrackingResult:
@@ -342,15 +404,9 @@ def get_tracking(
         page.goto(product_url, wait_until="domcontentloaded")
 
         if _looks_like_login_page(page):
-            common.safe_print("[wconcept] 로그인 세션이 없어 자동 로그인을 시도합니다.")
-            _auto_login(context)
-            # 로그인 후에는 주문상세로 돌아오지 않는다(리다이렉트 값에 orderno가
-            # 빠져 있다) - 항상 원래 주소로 다시 들어간다.
-            page.goto(product_url, wait_until="domcontentloaded")
-            if _looks_like_login_page(page):
-                raise BlockedError("W컨셉 로그인 후에도 여전히 로그인 페이지입니다.")
+            _login_and_reopen(context, page, product_url)
 
-        page.wait_for_selector(GOODS_TABLE_SELECTOR, timeout=GOODS_TABLE_TIMEOUT_MS)
+        _wait_for_order_table(context, page, product_url, order_no)
         # 주문상세 화면을 떠나기 전에 주문일부터 읽어둔다 (오래된 주문을 결과에 따로 모으는 데 쓴다).
         return with_order_date(
             page, lambda: _scrape_tracking_from_page(page, context, order_no, order_option))

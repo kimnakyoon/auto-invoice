@@ -57,10 +57,22 @@ def is_stale_entry(entry: ReportEntry) -> bool:
             and order_date_mod.is_stale(entry.order_date))
 
 
+def stale_sort_key(entry: ReportEntry) -> tuple[int, int]:
+    """주문일지연 묶음 안의 순서: '2일 지남'이 맨 위, 그다음 3일, 4일… (사용자 요청).
+
+    지난 일수는 주말을 뺀 값(order_date.days_since)이라 달력 날짜와 1:1이 아니다
+    - 토·일 주문은 월요일 주문과 같은 일수다. 그래서 날짜가 아니라 그 일수로
+    먼저 줄을 세우고, 일수가 같으면 최근 주문이 위다. 결과 엑셀의 본 시트·
+    '주문일지연' 시트·실행 요약(stale_lines) 세 곳이 이 키를 같이 쓴다.
+    """
+    days = order_date_mod.days_since(entry.order_date)
+    return (days if days is not None else 0,
+            -(entry.order_date.toordinal() if entry.order_date else 0))
+
+
 def stale_entries(entries: list[ReportEntry]) -> list[ReportEntry]:
-    """주문일이 오래된 스킵 건만, 오래된 순서로."""
-    return sorted((e for e in entries if is_stale_entry(e)),
-                  key=lambda e: e.order_date)
+    """주문일이 오래된 스킵 건만, 2일 지남부터 (stale_sort_key 순서)."""
+    return sorted((e for e in entries if is_stale_entry(e)), key=stale_sort_key)
 
 
 class RunReport:

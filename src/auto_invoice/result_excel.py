@@ -10,9 +10,10 @@
 (실패 -> 취소/품절 -> 반영오류 -> 주문일지연 -> 미지원 사이트 -> 스킵 -> 성공).
 성공
 건은 이미 업로드용 CSV로 처리되므로 맨 뒤여도 되고, 확인이 필요한 건이 위로
-올라온다. 주문일지연 묶음 안은 주문일 오름차순(오래된 주문부터)이다 - 별도
-'주문일지연' 시트, 실행 요약 문구(report.stale_lines)와 같은 순서라 세 곳을
-번갈아 봐도 같은 줄이 같은 자리에 있다.
+올라온다. 주문일지연 묶음 안은 '2일 지남'이 맨 위, 그다음 3일, 4일… 순이다
+(report.stale_sort_key) - 별도 '주문일지연' 시트, 실행 요약 문구
+(report.stale_lines)와 같은 순서라 세 곳을 번갈아 봐도 같은 줄이 같은 자리에
+있다.
 
 보기 편하라고 넣은 것들: 맨 위에 실행 시각과 결과별 건수 한 줄, '결과' 칸은
 색깔 배지, 줄 전체는 같은 계열 옅은 색, 결과가 바뀌는 자리에는 굵은 가로선.
@@ -32,7 +33,7 @@
 
 from __future__ import annotations
 
-from datetime import date, datetime
+from datetime import datetime
 from pathlib import Path
 
 from openpyxl import Workbook
@@ -41,7 +42,7 @@ from openpyxl.utils import get_column_letter
 
 from . import order_date as order_date_mod
 from .models import ReportEntry
-from .report import is_stale_entry, result_label, stale_entries
+from .report import is_stale_entry, result_label, stale_entries, stale_sort_key
 
 # 사람이 바로 열어볼 수 있게 바탕화면에 둔다 (내보내기 엑셀/업로드 CSV와 같은 곳).
 DEFAULT_DIR = Path.home() / "Desktop"
@@ -120,7 +121,7 @@ _TEXT_FORMAT = "@"
 _HEADER_ROW = 3
 
 
-def _sort_key(entry: ReportEntry) -> tuple[int, int, date]:
+def _sort_key(entry: ReportEntry) -> tuple[int, int, tuple[int, int]]:
     """실패 -> 취소/품절 -> 반영오류 -> 주문일지연 -> 미지원 사이트 -> 스킵 -> 성공.
 
     주문일이 오래된 건은 결과가 무엇이든 주문일지연 자리까지 끌어올린다. 이미
@@ -129,19 +130,20 @@ def _sort_key(entry: ReportEntry) -> tuple[int, int, date]:
     결과 순서를 쓴다(예: 주문일지연 칸의 스킵 건과 성공 건이 섞이지 않게).
     앞 두 값이 곧 '묶음'이다 - 굵은 가로선은 이 두 값이 바뀌는 자리에 긋는다.
 
-    세 번째 값은 주문일지연 묶음 안의 순서: 주문일 오름차순(사용자 요청).
-    '며칠째 안 나가고 있나'가 핵심이라 오래된 주문부터 보여야 하는데, 파일
-    순서 그대로 두면 09-06·09-05·09-07·09-03이 섞여 4일 지난 건이 2일 지난 건
-    사이에 묻힌다. 별도 '주문일지연' 시트(report.stale_entries)와 같은
-    키(order_date)라 두 시트의 줄 순서가 같다. 나머지 묶음은 전부 date.min이라
-    파일(샵마인 내보내기) 순서를 그대로 유지한다 - 그쪽은 주문일이 아니라
-    결과·사유로 보는 건들이다.
+    세 번째 값은 주문일지연 묶음 안의 순서: '2일 지남'이 맨 위, 그다음 3일,
+    4일… (사용자 요청, 2026-09-11 - 그 전에는 오래된 주문부터였다). 오늘 막
+    2일이 된 건이 문의를 남길 대상이라(inquiry.py) 그 줄이 먼저 보여야 하고,
+    파일 순서 그대로 두면 09-06·09-05·09-07·09-03이 섞여 2일 지난 건이 4일
+    지난 건 사이에 묻힌다. 별도 '주문일지연' 시트(report.stale_entries)와 같은
+    키(report.stale_sort_key)라 두 시트의 줄 순서가 같다. 나머지 묶음은 전부
+    같은 값이라 파일(샵마인 내보내기) 순서를 그대로 유지한다 - 그쪽은
+    주문일이 아니라 결과·사유로 보는 건들이다.
     """
     label = result_label(entry)
     rank = _SORT_ORDER.index(label) if label in _SORT_ORDER else len(_SORT_ORDER)
     if is_stale_entry(entry):        # 주문일이 있어야 stale이라 order_date는 None이 아니다
-        return min(rank, _SORT_ORDER.index(_STALE_SORT_LABEL)), rank, entry.order_date
-    return rank, rank, date.min
+        return min(rank, _SORT_ORDER.index(_STALE_SORT_LABEL)), rank, stale_sort_key(entry)
+    return rank, rank, (0, 0)
 
 
 def label_counts(entries: list[ReportEntry]) -> list[tuple[str, int]]:
