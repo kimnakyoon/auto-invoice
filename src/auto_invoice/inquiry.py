@@ -40,6 +40,8 @@ from __future__ import annotations
 import contextlib
 import inspect
 import json
+import os
+import threading
 import time
 from dataclasses import asdict, dataclass, field
 from datetime import datetime
@@ -75,6 +77,9 @@ TARGET_DAYS_TEXT = "2일"
 
 # 남긴 문의 장부. 같은 마켓 주문번호에 두 번 남기지 않는 근거다.
 LEDGER_PATH = LOG_DIR / "inquiries.json"
+# 장부는 문의를 남기는 스레드와 답변을 확인하는 스레드(사이트별)가 동시에 고친다 -
+# 읽기-고치기-쓰기를 이 잠금 안에서 해야 한쪽의 기록이 사라지지 않는다.
+LEDGER_LOCK = threading.RLock()
 
 # 결과 엑셀 파일 이름 (result_excel.save_run_result와 같은 규칙).
 RESULT_GLOB = "송장조회결과_*.xlsx"
@@ -205,13 +210,23 @@ def load_targets(excel_path: str | Path) -> list[InquiryTarget]:
 # --------------------------------------------------------------------------
 
 def load_ledger(path: Path = LEDGER_PATH) -> list[dict]:
-    if not path.exists():
-        return []
-    try:
-        data = json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, ValueError):
-        return []
+    with LEDGER_LOCK:
+        if not path.exists():
+            return []
+        try:
+            data = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            return []
     return data if isinstance(data, list) else []
+
+
+def save_ledger(ledger: list[dict], path: Path = LEDGER_PATH) -> None:
+    """임시 파일에 쓰고 바꿔 넣는다 - 다른 스레드가 쓰다 만 파일을 읽지 않도록."""
+    with LEDGER_LOCK:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        tmp = path.with_suffix(".json.tmp")
+        tmp.write_text(json.dumps(ledger, ensure_ascii=False, indent=2), encoding="utf-8")
+        os.replace(tmp, path)
 
 
 def posted_order_ids(ledger: list[dict]) -> set[str]:
@@ -220,10 +235,10 @@ def posted_order_ids(ledger: list[dict]) -> set[str]:
 
 def _append_ledger(entry: dict, path: Path = LEDGER_PATH) -> None:
     """한 건 남길 때마다 바로 적는다 - 도중에 멈춰도 남긴 건은 장부에 있어야 한다."""
-    ledger = load_ledger(path)
-    ledger.append(entry)
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps(ledger, ensure_ascii=False, indent=2), encoding="utf-8")
+    with LEDGER_LOCK:
+        ledger = load_ledger(path)
+        ledger.append(entry)
+        save_ledger(ledger, path)
 
 
 # --------------------------------------------------------------------------
@@ -306,39 +321,81 @@ def run(excel_path: str | Path | None = None, *, limit: int | None = None,
         return result
 
     settings = load_settings()
+    # 이번에 남길 게 없는 사이트의 답변 확인은 문의를 남기는 동안 뒤에서 같이 돈다 -
+    # 사이트별 브라우저를 열고 닫는 1~2초(+로그인)가 남기기 시간(지마켓은 건당 62초)에
+    # 묻힌다. 이번에 남기는 사이트는 _post_site가 브라우저를 닫기 전에 같은 세션으로 읽는다.
+    answers = _AnswerCheck(handled=set(by_site), headless=headless, log=log) if check_answers else None
+    if answers is not None:
+        answers.start()
     for site, items in by_site.items():
         _post_site(site, items, settings=settings, headless=headless, result=result, log=log,
                    check_answers=check_answers)
     counts = result.counts()
     log(f"문의 남기기 끝: 성공 {counts['success']} / 실패 {counts['fail']} / 넘김 {counts['skip']}")
-    if check_answers:
-        _check_answers(result, handled=set(by_site), headless=headless, log=log)
+    if answers is not None:
+        answers.finish(result)
     return result
 
 
-def _check_answers(result: InquiryRun, *, handled: set[str], headless: bool, log: LogFn) -> None:
-    """전에 남긴 문의의 답변을 읽어 장부에 적고, 읽은 결과 엑셀의 '사유' 칸을 고친다.
+class _AnswerCheck:
+    """전에 남긴 문의의 답변 확인 - 남기기와 겹쳐 돌리고(start), 끝난 뒤 결과 엑셀을 고친다(finish).
 
-    handled(이번에 문의를 남긴 사이트)는 _post_site가 브라우저를 닫기 전에 이미
-    읽었으니, 나머지 사이트만 inquiry_answers.refresh로 병렬로 읽는다. 여기서 무엇이
+    handled(이번에 문의를 남기는 사이트)는 _post_site가 브라우저를 닫기 전에 읽으니,
+    나머지 사이트만 inquiry_answers.refresh(사이트별 스레드)로 읽는다. 여기서 무엇이
     잘못돼도 문의 남기기 결과는 그대로다 - 요약 줄에만 적힌다.
     """
-    from . import inquiry_answers  # 순환 import(inquiry_answers -> inquiry)라 여기서
 
-    started = time.monotonic()
-    try:
-        before = inquiry_answers.answered_ids(inquiry_answers.ledger_by_id())
-        remaining = set(inquiry_answers.pending_by_site(skip_today=True)) - handled
-        if remaining:
-            log(f"전에 남긴 문의의 답변을 확인합니다 ({', '.join(sorted(remaining))}).")
-            by_id = inquiry_answers.refresh(None, sites=remaining, skip_today=True,
-                                            headless=headless, log=log)
-        else:
-            by_id = inquiry_answers.ledger_by_id()
-    except Exception as e:  # noqa: BLE001
-        result.answer_lines.append(f"문의 답변 확인 실패 - {e}")
-        log(result.answer_lines[-1])
-        return
+    def __init__(self, *, handled: set[str], headless: bool, log: LogFn) -> None:
+        self.handled = handled
+        self.headless = headless
+        self.log = log
+        self.started = time.monotonic()
+        self.before: set[str] = set()
+        self.problem: str | None = None
+        self.thread: threading.Thread | None = None
+
+    def start(self) -> None:
+        from . import inquiry_answers  # 순환 import(inquiry_answers -> inquiry)라 여기서
+
+        try:
+            self.before = inquiry_answers.answered_ids(inquiry_answers.ledger_by_id())
+            remaining = set(inquiry_answers.pending_by_site(skip_today=True)) - self.handled
+        except Exception as e:  # noqa: BLE001
+            self.problem = str(e)
+            return
+        if not remaining:
+            return
+        self.log(f"전에 남긴 문의의 답변을 확인합니다 ({', '.join(sorted(remaining))}).")
+
+        def _run() -> None:
+            try:
+                inquiry_answers.refresh(None, sites=remaining, skip_today=True,
+                                        headless=self.headless, log=self.log)
+            except Exception as e:  # noqa: BLE001
+                self.problem = str(e)
+
+        self.thread = threading.Thread(target=_run, name="inquiry-answers", daemon=True)
+        self.thread.start()
+
+    def finish(self, result: InquiryRun) -> None:
+        from . import inquiry_answers
+
+        if self.thread is not None:
+            self.thread.join()
+        if self.problem:
+            result.answer_lines.append(f"문의 답변 확인 실패 - {self.problem}")
+            self.log(result.answer_lines[-1])
+            return
+        by_id = inquiry_answers.ledger_by_id()
+        _report_answers(result, by_id, before=self.before, started=self.started)
+        for line in result.answer_lines:
+            self.log(line)
+
+
+def _report_answers(result: InquiryRun, by_id: dict[str, dict], *, before: set[str],
+                    started: float) -> None:
+    from . import inquiry_answers
+
     new_answers = [by_id[oid] for oid in sorted(inquiry_answers.answered_ids(by_id) - before)]
     waiting = sum(len(v) for v in inquiry_answers.pending_by_site(skip_today=True).values())
     result.answer_lines.append(
@@ -363,8 +420,6 @@ def _check_answers(result: InquiryRun, *, handled: set[str], headless: bool, log
         result.answer_lines.append(f"{path.name} '사유' 칸 갱신 실패 - {e}")
     else:
         result.answer_lines.append(f"{path.name}: '사유' 칸 {changed}개에 문의 답변/상태를 붙였습니다.")
-    for line in result.answer_lines:
-        log(line)
 
 
 def _message_for(target: InquiryTarget) -> str:

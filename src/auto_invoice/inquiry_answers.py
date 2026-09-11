@@ -36,9 +36,7 @@
 from __future__ import annotations
 
 import contextlib
-import json
 import re
-import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
 from datetime import date, datetime, timedelta
@@ -49,7 +47,7 @@ from openpyxl import load_workbook
 from playwright.sync_api import sync_playwright
 
 from . import browser as browser_mod
-from .inquiry import LEDGER_PATH, load_ledger, posted_order_ids
+from .inquiry import LEDGER_LOCK, LEDGER_PATH, load_ledger, posted_order_ids, save_ledger
 from .result_excel import SHEET_NAME, STALE_SHEET_NAME, compose_reason, strip_note, style_reason_cell
 from .suppliers import common
 from .suppliers.base import AdapterError, BlockedError
@@ -69,11 +67,6 @@ LogFn = Callable[[str], None]
 # --------------------------------------------------------------------------
 # 장부
 # --------------------------------------------------------------------------
-
-def save_ledger(ledger: list[dict], path: Path = LEDGER_PATH) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps(ledger, ensure_ascii=False, indent=2), encoding="utf-8")
-
 
 def inquiry_id_of(entry: dict) -> str | None:
     """장부 항목의 확인 문구에서 사이트 문의번호. 없으면(초기 항목) None - 어댑터가 목록을 뒤진다."""
@@ -212,7 +205,6 @@ def condense_answer(text: str, message: str = "") -> str:
 # 사이트에 물어보기
 # --------------------------------------------------------------------------
 # 장부는 여러 스레드(사이트마다 하나)가 동시에 고치므로 읽기-고치기-쓰기를 잠금 안에서 한다.
-_LEDGER_LOCK = threading.Lock()
 
 
 def _ledger_by_id() -> dict[str, dict]:
@@ -221,7 +213,7 @@ def _ledger_by_id() -> dict[str, dict]:
 
 def _record_checks(checks: dict[str, dict]) -> dict[str, dict]:
     """주문번호별 확인 결과를 장부에 적어 저장하고, 주문번호 -> 장부 항목을 돌려준다."""
-    with _LEDGER_LOCK:
+    with LEDGER_LOCK:
         ledger = load_ledger()
         for entry in ledger:
             check = checks.get(str(entry.get("order_id")))
