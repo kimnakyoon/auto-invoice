@@ -57,6 +57,16 @@
   없다). ordItemList[] 각 항목의 invNo(송장번호)/dlvsCoCd(택배사 코드)/
   ordItemStExposNm(진행상태 텍스트)/exposAttrPrdNm(옵션)/exposPrdNm(상품명)/
   hopeDlvYn("E"면 새벽배송이라 아직 조회 불가)를 그대로 쓴다.
+- **품절취소안내는 상태명에 안 나온다 (2026-09-11 실측).** 품절이 난 주문은
+  화면의 '진행상태' 칸에 '배송준비중' 대신 "품절취소안내"(누르면 "24시간
+  후(영업일 기준)까지 재고 확보가 불가능한 경우 자동 취소(환불) 예정" 안내
+  레이어)가 그려지는데, JSON의 ordItemStExposNm은 그대로 '배송준비중'이고
+  invNo도 비어 있어 상태명만 보면 '아직 미발급'과 구분이 안 된다. 화면은
+  항목의 outstkCnlGuide(품절취소안내) 플래그로 이 칸을 바꿔 그린다 -
+  같은 상품의 정상 배송준비중 주문과 189개 필드를 대조해 이 값만 달랐다
+  (soldOut 필드는 둘 다 false, befDlvDlyGuide도 같이 참이었다). 그래서
+  송장이 없을 때는 상태명보다 이 플래그를 먼저 봐서 취소/품절로 보낸다
+  (_raise_if_soldout). 문의 등록도 같은 판정을 쓴다.
 - dlvsCoCd는 "HD" 같은 내부 코드라 사람이 읽을 수 있는 택배사명이 아니다.
   화면의 "배송현황조회" 링크(data-action="dlvTrace")를 실제로 클릭하면
   /ord/dlvcursta/popup/dlvTrace.gs?ordNo=<주문번호>&ordItemId=<상품ID> 팝업이
@@ -180,6 +190,11 @@ CHECKBOX_WAIT_TIMEOUT_MS = 5 * 60 * 1000  # 사람이 체크박스를 누르기�
 RECAPTCHA_CHALLENGE_FRAME = "iframe[src*='bframe']"
 
 NOT_YET_PATTERNS = ["결제완료", "상품준비중", "배송준비중", "주문확인중", "입금대기"]
+
+# 주문 JSON 항목의 품절취소안내 플래그(맨 위 docstring). 참이면 화면 진행상태 칸에
+# 상태명 대신 이 문구가 그려진다.
+SOLDOUT_GUIDE_FLAG = "outstkCnlGuide"
+SOLDOUT_GUIDE_LABEL = "품절취소안내"
 
 
 def extract_order_no(product_url: str) -> str:
@@ -535,6 +550,22 @@ def _read_entry_data(page, ord_no: str) -> dict:
         raise ParseError(f"주문 정보(entry-data) 파싱에 실패했습니다 (주문번호={ord_no}): {e}") from e
 
 
+def _is_soldout(item: dict) -> bool:
+    return bool(item.get(SOLDOUT_GUIDE_FLAG))
+
+
+def _raise_if_soldout(items: list[dict], ord_no: str) -> None:
+    """상품 전부가 품절취소안내면 OrderCancelled - 상태명은 '배송준비중'이라
+    raise_if_cancelled로는 못 잡는다(맨 위 docstring). 일부만 품절이면 나머지가
+    나갈 수 있으니 raise_if_cancelled_any와 같은 규칙으로 준비 중인 쪽이 이긴다."""
+    if items and all(_is_soldout(it) for it in items):
+        status_text = items[0].get("ordItemStExposNm", "알 수 없음")
+        raise OrderCancelled(
+            f"주문 화면에 '{SOLDOUT_GUIDE_LABEL}' 표시가 있습니다 (주문번호={ord_no}, "
+            f"상태={status_text}) - 재고 확보가 안 되면 자동 취소(환불) 예정이라 "
+            "취소/품절 주문인지 확인해주세요.")
+
+
 def _find_item_by_order_option(shipped: list[dict], order_option: str | None) -> dict | None:
     """샵마인 엑셀의 "주문옵션" 값으로 상품을 정확히 짚을 수 있으면 그걸
     쓴다. 매칭이 0개(표기가 서로 안 맞음)거나 2개 이상(애매함)이면 None을
@@ -564,6 +595,8 @@ def _select_item(entry: dict, ord_no: str, order_option: str | None) -> dict:
     if not shipped:
         status_text = items[0].get("ordItemStExposNm", "알 수 없음")
         # 주문상태를 정확히 읽을 수 있으니 취소/품절 판정을 먼저 한다.
+        # 품절취소안내는 상태명에 안 나오므로 플래그로 먼저 본다.
+        _raise_if_soldout(items, ord_no)
         raise_if_cancelled(status_text, ord_no)
         raise TrackingNotAvailableYet(f"아직 송장번호가 발급되지 않았습니다 (주문번호={ord_no}, 상태={status_text}).")
 
@@ -842,6 +875,7 @@ def _inquiry_item(entry: dict, ord_no: str) -> dict:
     first_error: OrderCancelled | None = None
     for item in items:
         try:
+            _raise_if_soldout([item], ord_no)
             raise_if_cancelled(item.get("ordItemStExposNm"), ord_no)
         except OrderCancelled as e:
             first_error = first_error or e
