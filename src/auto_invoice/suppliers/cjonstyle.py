@@ -123,6 +123,8 @@ LOGIN_WAIT_TIMEOUT_MS = 5 * 60 * 1000  # 로그인 대기 최대 5분 (사람이
 LOGIN_CHECK_SETTLE_MS = 15 * 1000  # orderList가 로그인/마이존 어느 쪽인지 확정될 때까지 대기
 LOGIN_FORM_RENDER_WAIT_MS = 5 * 1000  # 로그인 주소가 된 뒤 폼(입력창)이 그려질 때까지 대기
 TURNSTILE_WAIT_TIMEOUT_MS = 30 * 1000  # "사람인지 확인" 토큰이 저절로 차기를 기다리는 최대 30초
+TURNSTILE_POLL_MS = 250  # 토큰은 3~8초 사이 아무 때나 차므로 굵게 돌면 평균 그 절반을 버린다
+LOGIN_RESULT_POLL_MS = 200  # [로그인] 뒤 주소가 바뀌거나 오류 문구가 뜨기를 보는 간격
 AUTO_LOGIN_WAIT_TIMEOUT_MS = 30 * 1000  # 자동 로그인 제출 후 결과 대기 최대 30초
 TRACKING_NAV_WAIT_TIMEOUT_MS = 5 * 1000  # 배송조회 클릭 후 페이지 이동 대기 최대 5초
 TRACKING_TEXT_WAIT_TIMEOUT_MS = 5 * 1000  # 결과 페이지 본문에 값이 채워질 때까지 대기 최대 5초
@@ -188,6 +190,35 @@ def _login_check_result(page: Page) -> str:
     return ""
 
 
+def _display_order_no(order_no: str) -> str:
+    """화면의 주문번호 표기. 주문상세는 20260911015025를 "2026-09-11-015025"로 적는다
+    (2026-09-11 실측) - 붙여 쓴 번호로 기다리면 영영 안 맞아 매번 렌더 대기
+    시간(2초)을 다 채우고 주소 판정으로 떨어졌다. 14자리가 아니면 그대로 둔다."""
+    if len(order_no) == 14 and order_no.isdigit():
+        return f"{order_no[:4]}-{order_no[4:6]}-{order_no[6:8]}-{order_no[8:]}"
+    return order_no
+
+
+def _session_alive(context: BrowserContext) -> bool | None:
+    """저장된 세션이 살아 있는지 페이지 이동 없이 본다 (True/False, 판정 못 하면 None).
+
+    주문목록(LOGIN_CHECK_URL)은 세션이 있으면 200, 없으면 302로 로그인 주소에
+    보낸다(2026-09-11 실측 0.02~0.08초). 주문상세 주소는 세션이 없어도 200으로
+    껍데기를 준 뒤 자바스크립트가 홈으로 넘기므로 여기에는 못 쓴다. 예전에는
+    주문상세를 열어 주문번호가 안 뜨는 것(렌더 대기 2초)으로 로그인 필요를
+    알았는데, 이 사이트는 세션이 실행 사이를 못 버텨 매 실행 그 2.9초를 냈다.
+    """
+    try:
+        resp = context.request.get(LOGIN_CHECK_URL, max_redirects=0)
+    except Exception:  # noqa: BLE001 - 네트워크 오류면 예전처럼 화면으로 판정한다
+        return None
+    if resp.status == 200:
+        return True
+    if 300 <= resp.status < 400 and LOGIN_PATH in (resp.headers.get("location") or ""):
+        return False
+    return None
+
+
 def _wait_until_order_detail(page: Page, order_no: str) -> bool:
     """주문상세가 그려질 때까지만 기다리고, 로그인된 화면인지 알려준다.
 
@@ -199,9 +230,15 @@ def _wait_until_order_detail(page: Page, order_no: str) -> bool:
     확인된다 - 밀려나는 홈에는 그 번호가 없다. 끝내 안 보이면 예전처럼 주소로
     판정한다(주문번호를 화면에 안 적는 화면이 있을 수 있어 폴백을 남긴다).
     """
-    if common.wait_for_text(page, order_no, common.ORDER_RENDER_WAIT_MS):
+    if common.wait_for_text(page, [order_no, _display_order_no(order_no)], common.ORDER_RENDER_WAIT_MS):
         return True
     return _looks_authenticated(page)
+
+
+def _open_order_detail(page: Page, product_url: str, order_no: str) -> bool:
+    """주문상세를 열고 로그인된 화면으로 그려졌는지 돌려준다."""
+    page.goto(product_url, wait_until="domcontentloaded")
+    return _wait_until_order_detail(page, order_no)
 
 
 def _prefill_login_id(page: Page) -> None:
@@ -234,8 +271,8 @@ def _wait_for_turnstile(page: Page) -> bool:
     while elapsed_ms < TURNSTILE_WAIT_TIMEOUT_MS:
         if _turnstile_token(page):
             return True
-        page.wait_for_timeout(1000)
-        elapsed_ms += 1000
+        page.wait_for_timeout(TURNSTILE_POLL_MS)
+        elapsed_ms += TURNSTILE_POLL_MS
     return False
 
 
@@ -301,24 +338,27 @@ def _auto_login(context: BrowserContext) -> bool:
                 common.safe_print("[cjonstyle] 로그인 페이지에서 아이디 입력창을 찾지 못했습니다 - 직접 로그인으로 넘어갑니다.")
                 return False
 
-            if not _wait_for_turnstile(page):
-                common.safe_print("[cjonstyle] '사람인지 확인'이 통과되지 않았습니다 - 직접 로그인으로 넘어갑니다.")
-                return False
-
+            # 아이디·비밀번호를 먼저 친다 - Turnstile 토큰은 입력과 무관하게 위젯이
+            # 알아서 채우므로(3~8초) 그동안 타이핑(약 2초)을 끝내두면 그 시간이
+            # 겹친다. 예전에는 토큰을 다 기다린 뒤에 쳐서 둘이 그대로 더해졌다.
             page.locator(LOGIN_ID_SELECTOR).click()
             page.locator(LOGIN_ID_SELECTOR).press_sequentially(login_id, delay=80)
             page.wait_for_timeout(300)
             page.locator(LOGIN_PW_SELECTOR).click()
             page.locator(LOGIN_PW_SELECTOR).press_sequentially(login_pw, delay=80)
             page.wait_for_timeout(600)
+            if not _wait_for_turnstile(page):
+                common.safe_print("[cjonstyle] '사람인지 확인'이 통과되지 않았습니다 - 직접 로그인으로 넘어갑니다.")
+                return False
             page.locator(LOGIN_BUTTON_SELECTOR).click()
 
             elapsed_ms = 0
             while elapsed_ms < AUTO_LOGIN_WAIT_TIMEOUT_MS:
-                # 로그인이 끝나기를 기다리는 쉼 - 예전에는 _looks_like_login_page가
-                # 매번 자면서 이 역할까지 겸했다(common.looks_like_login_page 주석).
-                page.wait_for_timeout(1500)
-                if not _looks_like_login_page(page):
+                # 주소가 로그인을 벗어나거나 오류 문구가 뜨기를 촘촘히 본다 - 예전에는
+                # 1.5초 자고 _looks_like_login_page(다시 1.5초 지켜봄)로 봐서 로그인
+                # 하나에 3초가 고정으로 들었다.
+                page.wait_for_timeout(LOGIN_RESULT_POLL_MS)
+                if LOGIN_PATH not in urlparse(page.url).path:
                     # 로그인 주소를 벗어났다고 세션 쿠키까지 다 깔린 것은 아니다 -
                     # 리다이렉트 체인 도중에 복사하면 덜 깔린 쿠키가 옮겨진다.
                     # orderList를 다시 열어 로그인을 확정한 뒤에 옮긴다.
@@ -337,7 +377,7 @@ def _auto_login(context: BrowserContext) -> bool:
                 if message:
                     common.safe_print(f"[cjonstyle] 사이트가 로그인을 거부했습니다: {message}")
                     return False
-                elapsed_ms += 1500
+                elapsed_ms += LOGIN_RESULT_POLL_MS
 
             common.safe_print("[cjonstyle] 자동 로그인 결과를 30초 안에 확인하지 못했습니다 - 직접 로그인으로 넘어갑니다.")
             return False
@@ -403,7 +443,7 @@ def _click_tracking_link(page: Page, product_url: str, order_no: str, link,
         # 다음 버튼을 누르려면 주문상세가 다시 그려져 있어야 한다 - 주문번호가
         # 다시 보이면 그때가 다 그려진 때다(예전에는 여기서도 2.5초를 잤다).
         page.goto(product_url, wait_until="domcontentloaded")
-        common.wait_for_text(page, order_no, common.ORDER_RENDER_WAIT_MS)
+        common.wait_for_text(page, [order_no, _display_order_no(order_no)], common.ORDER_RENDER_WAIT_MS)
     return result
 
 
@@ -477,13 +517,17 @@ def get_tracking(
     order_no = extract_order_no(product_url)
     page = context.new_page()
     try:
-        page.goto(product_url, wait_until="domcontentloaded")
+        # 세션이 없는 것이 요청 하나로 확실하면 주문상세를 열어 보지 않고 바로
+        # 로그인한다(_session_alive). 판정을 못 하면 예전처럼 열어서 본다.
+        if _session_alive(context) is False:
+            logged_in = False
+        else:
+            logged_in = _open_order_detail(page, product_url, order_no)
 
-        if not _wait_until_order_detail(page, order_no):
+        if not logged_in:
             # 자동 로그인은 자체 크롬 창을 띄우므로 headless 실행 중에도 쓸 수 있다.
             if _auto_login(context):
-                page.goto(product_url, wait_until="domcontentloaded")
-                if not _wait_until_order_detail(page, order_no):
+                if not _open_order_detail(page, product_url, order_no):
                     raise BlockedError("자동 로그인 후에도 주문상세 페이지에 접근하지 못했습니다.")
             elif headless:
                 raise BlockedError(
@@ -499,8 +543,7 @@ def get_tracking(
                     common.safe_print("[cjonstyle] 로그인이 완료되면 자동으로 이어서 진행합니다 (최대 5분 대기).")
                     if not _wait_for_manual_login(page):
                         raise BlockedError("로그인 대기 시간(5분)이 지났습니다. 로그인 후 다시 실행해주세요.")
-                page.goto(product_url, wait_until="domcontentloaded")
-                if not _wait_until_order_detail(page, order_no):
+                if not _open_order_detail(page, product_url, order_no):
                     raise BlockedError("로그인 후에도 주문상세 페이지에 접근하지 못했습니다.")
 
         # 주문상세 화면을 떠나기 전에 주문일부터 읽어둔다 (오래된 주문을 결과에 따로 모으는 데 쓴다).
