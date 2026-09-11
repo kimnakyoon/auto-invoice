@@ -469,12 +469,24 @@ def _abort_third_party(route) -> None:
         route.abort()
 
 
+OPTION_VALUE_JS = (
+    "([sel, label]) => { const o = Array.from(document.querySelectorAll(sel + ' option'))"
+    ".find(o => o.textContent.trim() === label); return o ? o.value : null; }")
+
+
 def _option_value(page, select: str, label: str) -> str | None:
-    """select의 option 중 글자가 이 라벨인 것의 value (없으면 None)."""
-    return page.evaluate(
-        "([sel, label]) => { const o = Array.from(document.querySelectorAll(sel + ' option'))"
-        ".find(o => o.textContent.trim() === label); return o ? o.value : null; }",
-        [select, label])
+    """select의 option 중 글자가 이 라벨인 것의 value (없으면 None).
+
+    option이 뜰 때까지 기다린다 - 중분류는 대분류를 고른 뒤 ajax 응답
+    (listWebCnslCls.ssg)으로 채워지는데, _choose_type이 기다리는 expect_response는
+    응답이 **도착**하면 끝나고 option을 그리는 콜백은 그 뒤에 돌아서, 바로 읽으면
+    아직 '선택하세요'뿐일 때가 있다 (2026-09-11 실행에서 SSG 2건 중 첫 건이
+    "문의유형 목록에 [배송 일정 확인]이 없습니다 (있는 것: ['선택하세요'])"로
+    실패하고 둘째 건은 성공 - 같은 코드가 타이밍으로 갈렸다).
+    """
+    with contextlib.suppress(PlaywrightTimeoutError):
+        page.wait_for_function(OPTION_VALUE_JS, arg=[select, label], timeout=INQUIRY_STEP_WAIT_MS)
+    return page.evaluate(OPTION_VALUE_JS, [select, label])
 
 
 def _choose_type(page, select: str, label: str, *, loads: str | None) -> None:
