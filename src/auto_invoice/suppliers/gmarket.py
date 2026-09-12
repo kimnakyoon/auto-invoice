@@ -34,6 +34,16 @@
   안 걸렸다). 그래서 로그인 뒤에는 주소가 /login 바깥으로 나올 때까지
   기다리고(_wait_for_login_redirects), 그래도 로그인 페이지면 잠깐 뒤 한 번
   더 가본 다음에야 포기한다.
+  2026-09-12 14:17 실행에서는 자동 로그인이 "성공"으로 찍힌 뒤 첫 주문부터
+  "로그인 후에도 여전히 로그인 페이지"가 나 17건이 전부 실패했는데, 곧바로
+  단독으로 다시 돌리니 2.4초 만에 통과했다(일시적 거부로 보이나 사유는 남지
+  않았다). 그때의 _auto_login은 '비밀번호 칸이 없으면 성공'이라 중간 페이지
+  (loginProc)에서 True를 돌려줬고, 거기서 로그인 폼으로 되돌아온 사유(alert)는
+  잃은 채였다. 그래서 (1) 성공 판정은 주소가 로그인 흐름(/login)을 완전히
+  벗어났을 때만 하고, 그 전에 alert이 온 채 로그인 폼에 서 있으면 그 문구로
+  실패시키며, (2) 로그인 뒤 주문상세로 갔는데 다시 로그인 화면이면 한 번만
+  더 로그인해 보고, (3) 그래도 안 되면 그때 주소·제목·화면 첫 줄을 사유에
+  실어 다음에는 원인을 알 수 있게 한다(_page_summary).
 - 로그인 실패는 화면 문구가 아니라 **alert()** 으로 알려준다 (실측: 없는
   아이디로 시도하면 "아이디 확인 후 다시 입력해 주세요."). 롯데온과 같은
   방식이라, dialog 핸들러로 그 문구를 받아 실패 사유째로 올린다. 핸들러가
@@ -167,11 +177,7 @@ def _wait_for_login_redirects(page) -> None:
     로그인 페이지인지 다시 본다.
     """
     common.wait_for_url(page, lambda url: not _is_login_flow_url(url), LOGIN_REDIRECT_SETTLE_MS)
-    try:
-        page.wait_for_load_state("domcontentloaded", timeout=LOGIN_REDIRECT_SETTLE_MS)
-    except Exception:  # noqa: BLE001 - 다음 goto가 어차피 다시 확인한다
-        pass
-    page.wait_for_timeout(500)
+    _settle_after_login(page)
 
 
 def _looks_like_bot_check(page) -> bool:
@@ -199,12 +205,44 @@ def _captcha_is_visible(page) -> bool:
         return False
 
 
+def _page_summary(page) -> str:
+    """실패 사유에 실을 '지금 무슨 화면인가' 한 줄 (주소·제목·본문 첫 줄)."""
+    try:
+        text = " ".join(page.inner_text("body").split())[:120]
+    except Exception:  # noqa: BLE001 - 본문을 못 읽어도 주소·제목은 남긴다
+        text = ""
+    try:
+        title = page.title()
+    except Exception:  # noqa: BLE001
+        title = ""
+    return f"주소={page.url}, 제목={title!r}, 화면='{text}'"
+
+
+def _settle_after_login(page) -> None:
+    """리다이렉트 체인이 끝난 뒤 화면이 그려질 때까지 한 번 더 기다린다.
+
+    뒤따르는 goto가 아직 도는 체인을 끊지 않게 하려는 것이다(맨 위 docstring).
+    """
+    try:
+        page.wait_for_load_state("domcontentloaded", timeout=LOGIN_REDIRECT_SETTLE_MS)
+    except Exception:  # noqa: BLE001 - 다음 goto가 어차피 다시 확인한다
+        pass
+    page.wait_for_timeout(500)
+
+
 def _auto_login(page) -> bool:
     """GMARKET_ID/GMARKET_PW로 완전 자동 로그인한다 (사용자 명시 요청).
 
     옥션(같은 이베이코리아 통합 로그인) 어댑터와 같은 패턴이지만, 지마켓은
     로그인 실패를 화면 문구가 아니라 alert()으로 알려주기 때문에 롯데온처럼
     dialog 핸들러로 그 문구를 받아 실패 사유째로 올린다.
+
+    성공은 주소가 로그인 흐름(Login → login/loginProc)을 완전히 벗어났을
+    때만이다 - 중간 페이지에는 비밀번호 칸이 없어 '로그인 화면 아님'으로
+    보이지만 거기서 다시 로그인 폼으로 되돌아올 수 있다(맨 위 docstring,
+    2026-09-12). 그 사이 alert이 왔는데 로그인 폼에 그대로 서 있으면 그
+    문구로 바로 실패시킨다. alert이 떴더라도 로그인 자체는 된 경우(비밀번호
+    변경 안내 등)가 있어, 흐름을 벗어났으면 문구만 로그에 남기고 성공이다.
 
     비밀번호가 설정되어 있지 않거나 캡차가 요구되면 False를 돌려주고, 호출자가
     기존의 수동 로그인 방식으로 넘어간다.
@@ -225,6 +263,7 @@ def _auto_login(page) -> bool:
         dialog.dismiss()
 
     page.on("dialog", _on_dialog)
+    started = time.monotonic()
     try:
         page.fill(LOGIN_ID_SELECTOR, login_id)
         page.fill(LOGIN_PW_SELECTOR, login_pw)
@@ -235,25 +274,24 @@ def _auto_login(page) -> bool:
             # 로그인이 끝나기를 기다리는 쉼 - 예전에는 _looks_like_login_page가
             # 매번 자면서 이 역할까지 겸했다(common.looks_like_login_page 주석).
             page.wait_for_timeout(1500)
-            # 로그인 페이지를 벗어났으면 성공이다. alert이 떴더라도 로그인
-            # 자체는 된 경우(비밀번호 변경 안내 등)가 있어, 페이지 상태를
-            # alert보다 먼저 본다 (롯데온과 동일한 순서).
-            if not _looks_like_login_page(page):
-                # 로그인 폼은 벗어났지만 중간 페이지(loginProc)일 수 있다 - 원래
-                # 주소까지 돌아올 때까지 기다린 뒤에 돌려준다(맨 위 docstring).
-                _wait_for_login_redirects(page)
-                return True
-            if alerts:
-                raise BlockedError(f"지마켓 자동 로그인이 거부됐습니다: {alerts[0].strip()}")
             elapsed_ms += 1500
+            if not _is_login_flow_url(page.url):
+                _settle_after_login(page)
+                if alerts:
+                    common.safe_print(f"[gmarket] 로그인 중 안내창이 떴습니다 (로그인은 됐습니다): {alerts[0].strip()}")
+                return True
+            if alerts and _looks_like_login_page(page):
+                raise BlockedError(f"지마켓 자동 로그인이 거부됐습니다: {alerts[0].strip()}")
 
+        if alerts:
+            raise BlockedError(f"지마켓 자동 로그인이 거부됐습니다: {alerts[0].strip()}")
         if _captcha_is_visible(page):
             raise BlockedError(
                 "지마켓 로그인에 캡차가 요구됐습니다. --headless 없이 실행해 직접 로그인해주세요."
             )
         raise BlockedError(
-            "지마켓 자동 로그인 후에도 로그인 페이지에서 벗어나지 못했습니다 "
-            "(추가 본인인증을 요구받았을 수 있습니다 - 브라우저 창을 확인해주세요)."
+            f"지마켓 자동 로그인 후 {time.monotonic() - started:.0f}초가 지나도 로그인 페이지에서 벗어나지 못했습니다 "
+            f"(추가 본인인증을 요구받았을 수 있습니다 - {_page_summary(page)})."
         )
     finally:
         page.remove_listener("dialog", _on_dialog)
@@ -466,11 +504,42 @@ def _lookup_page(context: BrowserContext):
     return page
 
 
+def _login_here(page, url: str) -> bool:
+    """지금 서 있는 로그인 화면에서 로그인하고 url로 돌아온다 (자동이면 True).
+
+    자동 로그인이 원래 주소가 아닌 곳에 떨어졌으면 그 화면을 로그에 남긴다 -
+    로그인 뒤 다시 로그인 화면이 되는 일(2026-09-12)의 단서가 된다.
+    """
+    if _auto_login(page):
+        common.safe_print("[gmarket] 로그인 세션이 없어 자동 로그인했습니다.")
+        if page.url.split("?")[0].rstrip("/") != url.split("?")[0].rstrip("/"):
+            common.safe_print(f"[gmarket] 로그인 뒤 원래 주소가 아닌 곳에 떨어졌습니다 ({_page_summary(page)}).")
+        automatic = True
+    else:
+        # GMARKET_PW가 없거나 캡차가 요구된 경우 - 크롬 창이 항상 떠
+        # 있으므로(CDP) 사람이 직접 로그인할 때까지 기다린다.
+        _prefill_login_id(page)
+        common.safe_print("[gmarket] 아이디는 자동으로 입력했습니다. 뜬 크롬 창에서 비밀번호를 입력하고 로그인해주세요.")
+        common.safe_print("[gmarket] 로그인이 완료되면 자동으로 이어서 진행합니다 (최대 5분 대기).")
+        if not _wait_for_manual_login(page):
+            raise BlockedError("로그인 대기 시간(5분)이 지났습니다. 로그인 후 다시 실행해주세요.")
+        _wait_for_login_redirects(page)
+        automatic = False
+    common.goto_settled(page, url)
+    if _looks_like_login_page(page):
+        # 로그인 쿠키가 아직 다 안 붙었을 수 있다 - 잠깐 뒤 한 번만 더 가본다.
+        page.wait_for_timeout(2000)
+        common.goto_settled(page, url)
+    return automatic
+
+
 def _open_logged_in(page, url: str) -> None:
     """url을 열고, 봇 확인·로그인이 끼어들면 지나간 뒤 다시 url에 선다.
 
-    조회(get_tracking)와 문의(post_inquiry)가 같이 쓴다. 로그인 뒤에도
-    로그인 페이지면 BlockedError.
+    조회(get_tracking)와 문의(post_inquiry)가 같이 쓴다. 자동 로그인 뒤에도
+    로그인 페이지면 한 번만 더 로그인해 보고(2026-09-12 실행에서 첫 로그인이
+    '성공'으로 찍힌 뒤 바로 로그인 화면으로 되돌아왔고, 단독으로 다시 하니
+    통과했다), 그래도 로그인 페이지면 그때 화면 요약을 실어 BlockedError.
     """
     page.goto(url, wait_until="domcontentloaded")
 
@@ -484,24 +553,13 @@ def _open_logged_in(page, url: str) -> None:
         page.goto(url, wait_until="domcontentloaded")
 
     if _looks_like_login_page(page):
-        if _auto_login(page):
-            common.safe_print("[gmarket] 로그인 세션이 없어 자동 로그인했습니다.")
-        else:
-            # GMARKET_PW가 없거나 캡차가 요구된 경우 - 크롬 창이 항상 떠
-            # 있으므로(CDP) 사람이 직접 로그인할 때까지 기다린다.
-            _prefill_login_id(page)
-            common.safe_print("[gmarket] 아이디는 자동으로 입력했습니다. 뜬 크롬 창에서 비밀번호를 입력하고 로그인해주세요.")
-            common.safe_print("[gmarket] 로그인이 완료되면 자동으로 이어서 진행합니다 (최대 5분 대기).")
-            if not _wait_for_manual_login(page):
-                raise BlockedError("로그인 대기 시간(5분)이 지났습니다. 로그인 후 다시 실행해주세요.")
-            _wait_for_login_redirects(page)
-        common.goto_settled(page, url)
-        if _looks_like_login_page(page):
-            # 로그인 쿠키가 아직 다 안 붙었을 수 있다 - 잠깐 뒤 한 번만 더 가본다.
+        automatic = _login_here(page, url)
+        if _looks_like_login_page(page) and automatic:
+            common.safe_print("[gmarket] 로그인 뒤 주문상세를 열었는데 다시 로그인 화면입니다 - 한 번 더 로그인합니다.")
             page.wait_for_timeout(2000)
-            common.goto_settled(page, url)
+            _login_here(page, url)
         if _looks_like_login_page(page):
-            raise BlockedError("로그인 후에도 여전히 로그인 페이지입니다.")
+            raise BlockedError(f"로그인 후에도 여전히 로그인 페이지입니다 ({_page_summary(page)}).")
 
 
 def get_tracking(

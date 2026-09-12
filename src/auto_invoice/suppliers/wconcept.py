@@ -11,10 +11,17 @@
   Chromium(headless)에서 아이디/비밀번호를 채우고 누르면 점수 미달로 거부되고,
   그냥 실패로 끝나는 게 아니라 사이트가 **30분 간 로그인을 막는다**
   ("비정상적인 로그인 시도로 30분 간 로그인이 제한됩니다" - 2026-08-31 실측).
-  그래서 현대몰(hmall)과 같은 구조로, **로그인만 browser.real_chrome_context()로
-  띄운 진짜 크롬 창**에서 하고 성공하면 쿠키만 원래 headless 컨텍스트로 옮긴다
-  (조회는 지금까지처럼 창 없이 진행된다). 사람이 타이핑하거나 체크박스를 누를
-  일은 없다.
+  그래서 현대몰(hmall)과 같은 구조로, **로그인만 진짜 크롬 창**에서 하고
+  성공하면 쿠키만 원래 headless 컨텍스트로 옮긴다(조회는 지금까지처럼 창
+  없이 진행된다). 사람이 타이핑하거나 체크박스를 누를 일은 없다.
+  그 크롬 창은 처음엔 browser.real_chrome_context()(Playwright가 띄운 진짜
+  크롬, navigator.webdriver=true)였고 2026-08-31·09-11에는 통과했는데,
+  2026-09-12 14:18 실행에서는 28시간 만의 첫 로그인 시도 한 번에 바로 30분
+  제한이 걸렸다(점수 미달). reCAPTCHA 점수는 브라우저를 띄우는 방식이
+  좌우하므로(browser.py 두 함수 docstring, 네이버·CJ온스타일 실측) 이제는
+  **우리가 직접 실행하고 CDP로 붙은 크롬(browser.real_chrome_cdp_context,
+  navigator.webdriver=false)**에서 로그인한다. 프로필(auth/chrome_profile_
+  wconcept)은 그대로 이어 쓴다.
 - 로그인 실패 사유는 폼 안의 p.incorrect 중 **보이는 것**에 나온다(아이디/
   비밀번호 불일치, 30분 제한 등). 이 문구를 그대로 실어 BlockedError를 던진다 -
   30분 제한에 걸린 상태에서 계속 두드리면 제한만 길어지므로, 오케스트레이터가
@@ -54,6 +61,11 @@
   로그인 화면이 되는 경우도 자동 로그인으로 이어가고, (2) 둘 다 안 뜨면 한 번
   다시 열어 보고, (3) 그래도 안 되면 그때의 주소·제목·화면 첫 줄을 사유에
   실어 다음에는 원인을 알 수 있게 한다(_wait_for_order_table).
+  2026-09-12 실행에서 (3)의 요약으로 정체가 잡혔다: 세션이 만료된 채 주문상세를
+  열면 로그인 화면이 아니라 **홈(display.wconcept.co.kr/rn/women)**으로
+  떨어지고, 거기서 표를 15초 기다리다 다시 열어서야 로그인 화면이 나왔다.
+  그래서 주문상세(www.wconcept.co.kr/MyPage/...)가 아닌 주소에 서 있으면
+  기다리지 않고 바로 자동 로그인으로 간다(_left_order_detail).
 """
 
 from __future__ import annotations
@@ -87,6 +99,7 @@ SITE_KEY = "wconcept"
 REQUEST_GAP = (0.5, 1.2)
 
 HOME_URL = "https://www.wconcept.co.kr/"
+ORDER_DETAIL_HOST = "www.wconcept.co.kr"  # 주문상세·로그인이 사는 호스트 (홈은 display.wconcept.co.kr로 넘어간다)
 LOGIN_PATH = "/member/login"
 LOGIN_URL = "https://www.wconcept.co.kr/Member/Login"
 LOGIN_ID_SELECTOR = "#custId"
@@ -167,9 +180,10 @@ def _warm_up(page: Page) -> None:
 def _auto_login(context: BrowserContext) -> None:
     """WCONCEPT_ID/WCONCEPT_PW로 자동 로그인하고 쿠키를 원래 컨텍스트에 옮긴다.
 
-    로그인은 진짜 크롬 창에서만 통과한다 - 이유는 이 파일 맨 위 docstring 참고.
-    실패하면 사이트가 준 문구를 그대로 실어 BlockedError를 던진다(30분 제한에
-    걸린 채로 다시 두드리지 않게 하려는 것이다).
+    로그인은 우리가 직접 실행해 CDP로 붙은 진짜 크롬 창에서만 한다 - 이유는
+    이 파일 맨 위 docstring 참고. 실패하면 사이트가 준 문구를 그대로 실어
+    BlockedError를 던진다(30분 제한에 걸린 채로 다시 두드리지 않게 하려는
+    것이다).
     """
     login_id = os.environ.get("WCONCEPT_ID")
     login_pw = os.environ.get("WCONCEPT_PW")
@@ -179,53 +193,46 @@ def _auto_login(context: BrowserContext) -> None:
         )
 
     try:
-        login_context = browser_mod.real_chrome_context(
-            SITE_KEY, viewport=browser_mod.DESKTOP_VIEWPORT)
-    except Exception as exc:  # noqa: BLE001 - 크롬 미설치 등
+        with browser_mod.real_chrome_cdp_context(SITE_KEY) as login_context:
+            page = login_context.pages[0] if login_context.pages else login_context.new_page()
+            page.set_viewport_size(browser_mod.DESKTOP_VIEWPORT)
+
+            _warm_up(page)
+            page.goto(LOGIN_URL, wait_until="domcontentloaded")
+            page.wait_for_timeout(1500)
+
+            if not _looks_like_login_page(page):
+                # 이 크롬 프로필에 로그인이 남아 있으면 쿠키만 옮기고 끝낸다.
+                context.add_cookies(login_context.cookies())
+                return
+
+            page.locator(LOGIN_ID_SELECTOR).click()
+            page.locator(LOGIN_ID_SELECTOR).press_sequentially(login_id, delay=80)
+            page.wait_for_timeout(300)
+            page.locator(LOGIN_PW_SELECTOR).click()
+            page.locator(LOGIN_PW_SELECTOR).press_sequentially(login_pw, delay=80)
+            page.wait_for_timeout(600)
+            page.locator(LOGIN_BUTTON_SELECTOR).first.click()
+
+            elapsed_ms = 0
+            while elapsed_ms < LOGIN_WAIT_TIMEOUT_MS:
+                page.wait_for_timeout(1000)
+                if not _looks_like_login_page(page):
+                    context.add_cookies(login_context.cookies())
+                    common.safe_print("[wconcept] 자동 로그인에 성공했습니다.")
+                    return
+                message = _login_error(page)
+                if message:
+                    # 사이트가 사유를 알려준 이상 더 기다릴 이유가 없다.
+                    raise BlockedError(f"W컨셉 로그인 실패 - {message}")
+                elapsed_ms += 1000
+
+            raise BlockedError("W컨셉 자동 로그인 결과를 30초 안에 확인하지 못했습니다.")
+    except RuntimeError as exc:  # 크롬 미설치, 디버깅 포트가 안 열림 등
         raise BlockedError(
             f"W컨셉 로그인용 크롬 창을 띄우지 못했습니다({exc}) - 이 사이트는 봇 확인 때문에 "
             "설치된 진짜 크롬으로만 로그인할 수 있습니다."
         ) from exc
-
-    try:
-        page = login_context.pages[0] if login_context.pages else login_context.new_page()
-
-        _warm_up(page)
-        page.goto(LOGIN_URL, wait_until="domcontentloaded")
-        page.wait_for_timeout(1500)
-
-        if not _looks_like_login_page(page):
-            # 이 크롬 프로필에 로그인이 남아 있으면 쿠키만 옮기고 끝낸다.
-            context.add_cookies(login_context.cookies())
-            return
-
-        page.locator(LOGIN_ID_SELECTOR).click()
-        page.locator(LOGIN_ID_SELECTOR).press_sequentially(login_id, delay=80)
-        page.wait_for_timeout(300)
-        page.locator(LOGIN_PW_SELECTOR).click()
-        page.locator(LOGIN_PW_SELECTOR).press_sequentially(login_pw, delay=80)
-        page.wait_for_timeout(600)
-        page.locator(LOGIN_BUTTON_SELECTOR).first.click()
-
-        elapsed_ms = 0
-        while elapsed_ms < LOGIN_WAIT_TIMEOUT_MS:
-            page.wait_for_timeout(1000)
-            if not _looks_like_login_page(page):
-                context.add_cookies(login_context.cookies())
-                common.safe_print("[wconcept] 자동 로그인에 성공했습니다.")
-                return
-            message = _login_error(page)
-            if message:
-                # 사이트가 사유를 알려준 이상 더 기다릴 이유가 없다.
-                raise BlockedError(f"W컨셉 로그인 실패 - {message}")
-            elapsed_ms += 1000
-
-        raise BlockedError("W컨셉 자동 로그인 결과를 30초 안에 확인하지 못했습니다.")
-    finally:
-        try:
-            login_context.close()
-        except Exception:  # noqa: BLE001 - 창을 못 닫아도 결과에 영향은 없다
-            pass
 
 
 def _tracking_from_goodsflow(context: BrowserContext, member_code: str,
@@ -352,6 +359,15 @@ def _login_and_reopen(context: BrowserContext, page: Page, product_url: str) -> 
         raise BlockedError("W컨셉 로그인 후에도 여전히 로그인 페이지입니다.")
 
 
+def _left_order_detail(page: Page) -> bool:
+    """지금 주소가 주문상세(www.wconcept.co.kr/MyPage/...)도 로그인 화면도 아닌가."""
+    parsed = urlparse(page.url)
+    path = parsed.path.lower()
+    if parsed.netloc.lower() != ORDER_DETAIL_HOST:
+        return True
+    return not (path.startswith("/mypage/") or path.rstrip("/") == LOGIN_PATH)
+
+
 def _page_summary(page: Page) -> str:
     """타임아웃 사유에 실을 '지금 무슨 화면인가' 한 줄 (주소·제목·본문 첫 줄)."""
     try:
@@ -374,6 +390,12 @@ def _wait_for_order_table(context: BrowserContext, page: Page, product_url: str,
     either = page.locator(GOODS_TABLE_SELECTOR).or_(page.locator("input[type='password']")).first
     logged_in = False
     for attempt in range(2):
+        if not logged_in and _left_order_detail(page):
+            # 세션이 만료되면 로그인 화면이 아니라 홈으로 떨어진다(맨 위
+            # docstring, 2026-09-12) - 표를 기다릴 것 없이 바로 로그인한다.
+            common.safe_print(f"[wconcept] 주문상세가 아닌 곳으로 넘어갔습니다 - 세션이 만료된 것으로 보고 로그인합니다 ({_page_summary(page)}).")
+            _login_and_reopen(context, page, product_url)
+            logged_in = True
         try:
             either.wait_for(state="attached", timeout=GOODS_TABLE_TIMEOUT_MS)
         except Exception:  # noqa: BLE001 - 타임아웃: 표도 로그인 창도 안 떴다
