@@ -113,6 +113,7 @@ DEFAULT_COURIER = "택배"  # 모달에서 택배사명을 못 읽었을 때만 
 
 LOGIN_WAIT_TIMEOUT_MS = 5 * 60 * 1000  # 수동 로그인 대기 최대 5분
 AUTO_LOGIN_WAIT_TIMEOUT_MS = 30 * 1000  # 자동 로그인 후 리다이렉트 대기 최대 30초
+LOGIN_POLL_MS = 300  # 그동안 주소가 로그인 흐름을 벗어났는지 보는 간격
 # 로그인 직후 리다이렉트 체인(Login -> login/loginProc -> 원래 주소)이 끝나기를
 # 기다리는 최대 시간. 실측 0.8초, 느린 날을 감안해 넉넉히.
 LOGIN_REDIRECT_SETTLE_MS = 15 * 1000
@@ -271,10 +272,10 @@ def _auto_login(page) -> bool:
 
         elapsed_ms = 0
         while elapsed_ms < AUTO_LOGIN_WAIT_TIMEOUT_MS:
-            # 로그인이 끝나기를 기다리는 쉼 - 예전에는 _looks_like_login_page가
-            # 매번 자면서 이 역할까지 겸했다(common.looks_like_login_page 주석).
-            page.wait_for_timeout(1500)
-            elapsed_ms += 1500
+            # 주소만 보는 판정이라 촘촘히 본다 - 예전 1.5초 단위는 체인이
+            # 0.8~1.7초에 끝나는 로그인(2026-09-12 실측)을 한 박자 놓쳤다.
+            page.wait_for_timeout(LOGIN_POLL_MS)
+            elapsed_ms += LOGIN_POLL_MS
             if not _is_login_flow_url(page.url):
                 _settle_after_login(page)
                 if alerts:
@@ -504,6 +505,11 @@ def _lookup_page(context: BrowserContext):
     return page
 
 
+def _at_url(page, url: str) -> bool:
+    """지금 화면이 url(쿼리 제외)에 서 있는가."""
+    return page.url.split("?")[0].rstrip("/") == url.split("?")[0].rstrip("/")
+
+
 def _login_here(page, url: str) -> bool:
     """지금 서 있는 로그인 화면에서 로그인하고 url로 돌아온다 (자동이면 True).
 
@@ -512,7 +518,7 @@ def _login_here(page, url: str) -> bool:
     """
     if _auto_login(page):
         common.safe_print("[gmarket] 로그인 세션이 없어 자동 로그인했습니다.")
-        if page.url.split("?")[0].rstrip("/") != url.split("?")[0].rstrip("/"):
+        if not _at_url(page, url):
             common.safe_print(f"[gmarket] 로그인 뒤 원래 주소가 아닌 곳에 떨어졌습니다 ({_page_summary(page)}).")
         automatic = True
     else:
@@ -525,7 +531,10 @@ def _login_here(page, url: str) -> bool:
             raise BlockedError("로그인 대기 시간(5분)이 지났습니다. 로그인 후 다시 실행해주세요.")
         _wait_for_login_redirects(page)
         automatic = False
-    common.goto_settled(page, url)
+    if not _at_url(page, url):
+        # 로그인 뒤 원래 주소로 돌아왔으면 그대로 쓴다 - 같은 화면을 다시
+        # 여는 1초를 아낀다(뒤따르는 조회는 어차피 JSON API로 답한다).
+        common.goto_settled(page, url)
     if _looks_like_login_page(page):
         # 로그인 쿠키가 아직 다 안 붙었을 수 있다 - 잠깐 뒤 한 번만 더 가본다.
         page.wait_for_timeout(2000)

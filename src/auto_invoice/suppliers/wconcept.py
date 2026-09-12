@@ -109,6 +109,7 @@ LOGIN_BUTTON_SELECTOR = "#frmLogin button[type='submit']"
 LOGIN_ERROR_SELECTOR = "#frmLogin .incorrect"
 
 LOGIN_WAIT_TIMEOUT_MS = 30 * 1000  # 자동 로그인 제출 후 결과 대기
+LOGIN_POLL_MS = 300  # 그동안 로그인 화면을 벗어났는지 보는 간격 (1초 단위는 한 박자씩 늦었다)
 GOODS_TABLE_TIMEOUT_MS = 15 * 1000  # 주문상세의 상품 목록이 그려질 때까지
 
 GOODS_TABLE_SELECTOR = "table.tbl_order_list"
@@ -216,7 +217,7 @@ def _auto_login(context: BrowserContext) -> None:
 
             elapsed_ms = 0
             while elapsed_ms < LOGIN_WAIT_TIMEOUT_MS:
-                page.wait_for_timeout(1000)
+                page.wait_for_timeout(LOGIN_POLL_MS)
                 if not _looks_like_login_page(page):
                     context.add_cookies(login_context.cookies())
                     common.safe_print("[wconcept] 자동 로그인에 성공했습니다.")
@@ -225,7 +226,7 @@ def _auto_login(context: BrowserContext) -> None:
                 if message:
                     # 사이트가 사유를 알려준 이상 더 기다릴 이유가 없다.
                     raise BlockedError(f"W컨셉 로그인 실패 - {message}")
-                elapsed_ms += 1000
+                elapsed_ms += LOGIN_POLL_MS
 
             raise BlockedError("W컨셉 자동 로그인 결과를 30초 안에 확인하지 못했습니다.")
     except RuntimeError as exc:  # 크롬 미설치, 디버깅 포트가 안 열림 등
