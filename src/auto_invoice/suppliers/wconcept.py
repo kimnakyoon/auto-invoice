@@ -66,6 +66,19 @@
   떨어지고, 거기서 표를 15초 기다리다 다시 열어서야 로그인 화면이 나왔다.
   그래서 주문상세(www.wconcept.co.kr/MyPage/...)가 아닌 주소에 서 있으면
   기다리지 않고 바로 자동 로그인으로 간다(_left_order_detail).
+- 2026-09-13 17:52 실행에서는 그렇게 자동 로그인으로 갔는데 W컨셉 2건이 전부
+  "로그인 후에도 여전히 로그인 페이지"로 실패했다. 로그인 창(_auto_login)이
+  로그인 주소(/Member/Login)를 열어 **로그인 화면이 아니면 로그인된 것**으로
+  보고 쿠키만 옮겼는데, 만료된 세션 쿠키(.WConceptSESSION 등)가 남아 있으면
+  로그인 주소도 홈으로 넘어가서(전날 저장한 세션이 크롬 프로필과
+  auth/wconcept_state.json 양쪽에 복원된다) 로그인 안 된 쿠키가 그대로
+  옮겨졌다 - 성공/실패 문구 없이 조용히 끝난 게 그 증거다. 이제 로그인 창은
+  (1) 주문상세를 직접 열어 **상품 표가 보일 때만** 로그인된 것으로 보고,
+  (2) 표도 로그인 입력창도 아니면(홈으로 밀려남) W컨셉 쿠키를 전부 지운 뒤
+  로그인 주소를 열고, (3) 그래도 로그인 입력창이 아니면 화면 요약을 실어
+  실패한다. 옮길 때는 조회 컨텍스트의 W컨셉 쿠키도 먼저 지운다(_copy_cookies).
+  워밍업(_warm_up)은 실제로 자격 증명을 넣을 때만 한다 - 프로필 세션이 살아
+  있으면 6초쯤 아낀다.
 """
 
 from __future__ import annotations
@@ -99,7 +112,9 @@ SITE_KEY = "wconcept"
 REQUEST_GAP = (0.5, 1.2)
 
 HOME_URL = "https://www.wconcept.co.kr/"
-ORDER_DETAIL_HOST = "www.wconcept.co.kr"  # 주문상세·로그인이 사는 호스트 (홈은 display.wconcept.co.kr로 넘어간다)
+ORDER_DETAIL_HOST = "www.wconcept.co.kr"
+# 로그인 세션을 옮기거나 지울 때 W컨셉 쿠키만 고르는 도메인 패턴(.wconcept.co.kr, www, display).
+COOKIE_DOMAIN_PATTERN = re.compile(r"wconcept\.co\.kr$")  # 주문상세·로그인이 사는 호스트 (홈은 display.wconcept.co.kr로 넘어간다)
 LOGIN_PATH = "/member/login"
 LOGIN_URL = "https://www.wconcept.co.kr/Member/Login"
 LOGIN_ID_SELECTOR = "#custId"
@@ -111,6 +126,7 @@ LOGIN_ERROR_SELECTOR = "#frmLogin .incorrect"
 LOGIN_WAIT_TIMEOUT_MS = 30 * 1000  # 자동 로그인 제출 후 결과 대기
 LOGIN_POLL_MS = 300  # 그동안 로그인 화면을 벗어났는지 보는 간격 (1초 단위는 한 박자씩 늦었다)
 GOODS_TABLE_TIMEOUT_MS = 15 * 1000  # 주문상세의 상품 목록이 그려질 때까지
+LOGIN_CHECK_TIMEOUT_MS = 8 * 1000  # 로그인 창에서 주문상세를 열어 표/로그인 입력창 중 하나가 뜰 때까지
 
 GOODS_TABLE_SELECTOR = "table.tbl_order_list"
 
@@ -178,13 +194,36 @@ def _warm_up(page: Page) -> None:
     page.wait_for_timeout(2000)
 
 
-def _auto_login(context: BrowserContext) -> None:
+def _copy_cookies(context: BrowserContext, login_context: BrowserContext) -> None:
+    """로그인 창의 쿠키를 조회 컨텍스트로 옮긴다 - 조회 쪽의 W컨셉 쿠키는 먼저 지운다.
+
+    같은 이름은 add_cookies가 덮어쓰지만, 경로가 다른 옛 세션 쿠키가 남아
+    서버가 그쪽을 먼저 읽는 일이 없게 깨끗이 비우고 넣는다.
+    """
+    context.clear_cookies(domain=COOKIE_DOMAIN_PATTERN)
+    context.add_cookies(login_context.cookies())
+
+
+def _wait_table_or_login(page: Page, timeout_ms: int) -> None:
+    """주문상세의 상품 표 또는 로그인 입력창 중 먼저 뜨는 쪽을 기다린다(둘 다 안 뜨면 그냥 넘어간다)."""
+    either = page.locator(GOODS_TABLE_SELECTOR).or_(page.locator("input[type='password']")).first
+    try:
+        either.wait_for(state="attached", timeout=timeout_ms)
+    except Exception:  # noqa: BLE001 - 홈 등 제3의 화면: 호출한 쪽이 주소로 가른다
+        pass
+
+
+def _auto_login(context: BrowserContext, product_url: str) -> None:
     """WCONCEPT_ID/WCONCEPT_PW로 자동 로그인하고 쿠키를 원래 컨텍스트에 옮긴다.
 
     로그인은 우리가 직접 실행해 CDP로 붙은 진짜 크롬 창에서만 한다 - 이유는
     이 파일 맨 위 docstring 참고. 실패하면 사이트가 준 문구를 그대로 실어
     BlockedError를 던진다(30분 제한에 걸린 채로 다시 두드리지 않게 하려는
     것이다).
+
+    로그인 여부는 로그인 주소가 아니라 **주문상세(product_url)에 상품 표가
+    보이는가**로 판정한다 - 만료된 세션이 남아 있으면 로그인 주소가 홈으로
+    넘어가 '로그인 화면이 아니다 = 로그인됐다'가 거짓이 된다(2026-09-13).
     """
     login_id = os.environ.get("WCONCEPT_ID")
     login_pw = os.environ.get("WCONCEPT_PW")
@@ -198,14 +237,24 @@ def _auto_login(context: BrowserContext) -> None:
             page = login_context.pages[0] if login_context.pages else login_context.new_page()
             page.set_viewport_size(browser_mod.DESKTOP_VIEWPORT)
 
+            # 프로필에 로그인이 살아 있는지는 주문상세가 실제로 열리는지로 본다.
+            page.goto(product_url, wait_until="domcontentloaded")
+            _wait_table_or_login(page, LOGIN_CHECK_TIMEOUT_MS)
+            if page.locator(GOODS_TABLE_SELECTOR).count():
+                _copy_cookies(context, login_context)
+                common.safe_print("[wconcept] 크롬 프로필에 남아 있던 로그인 세션을 옮겼습니다.")
+                return
+
+            if not _looks_like_login_page(page):
+                # 만료된 세션이 남아 홈 등으로 밀려난 것이다 - 쿠키를 비우고 로그인 화면으로.
+                common.safe_print(f"[wconcept] 프로필의 세션이 만료된 것으로 보여 쿠키를 지우고 로그인합니다 ({_page_summary(page)}).")
+                login_context.clear_cookies(domain=COOKIE_DOMAIN_PATTERN)
+
             _warm_up(page)
             page.goto(LOGIN_URL, wait_until="domcontentloaded")
             page.wait_for_timeout(1500)
-
             if not _looks_like_login_page(page):
-                # 이 크롬 프로필에 로그인이 남아 있으면 쿠키만 옮기고 끝낸다.
-                context.add_cookies(login_context.cookies())
-                return
+                raise BlockedError(f"W컨셉 로그인 화면이 열리지 않았습니다 ({_page_summary(page)}).")
 
             page.locator(LOGIN_ID_SELECTOR).click()
             page.locator(LOGIN_ID_SELECTOR).press_sequentially(login_id, delay=80)
@@ -219,7 +268,7 @@ def _auto_login(context: BrowserContext) -> None:
             while elapsed_ms < LOGIN_WAIT_TIMEOUT_MS:
                 page.wait_for_timeout(LOGIN_POLL_MS)
                 if not _looks_like_login_page(page):
-                    context.add_cookies(login_context.cookies())
+                    _copy_cookies(context, login_context)
                     common.safe_print("[wconcept] 자동 로그인에 성공했습니다.")
                     return
                 message = _login_error(page)
@@ -352,12 +401,13 @@ def _scrape_tracking_from_page(page: Page, context: BrowserContext, order_no: st
 
 def _login_and_reopen(context: BrowserContext, page: Page, product_url: str) -> None:
     common.safe_print("[wconcept] 로그인 세션이 없어 자동 로그인을 시도합니다.")
-    _auto_login(context)
+    _auto_login(context, product_url)
     # 로그인 후에는 주문상세로 돌아오지 않는다(리다이렉트 값에 orderno가
     # 빠져 있다) - 항상 원래 주소로 다시 들어간다.
     page.goto(product_url, wait_until="domcontentloaded")
     if _looks_like_login_page(page):
-        raise BlockedError("W컨셉 로그인 후에도 여전히 로그인 페이지입니다.")
+        # 로그인 창은 통과했는데 조회 컨텍스트만 튕긴다면 쿠키 옮기기 문제다 - 화면을 남긴다.
+        raise BlockedError(f"W컨셉 로그인 후에도 여전히 로그인 페이지입니다 ({_page_summary(page)}).")
 
 
 def _left_order_detail(page: Page) -> bool:
