@@ -78,7 +78,9 @@
   로그인 주소를 열고, (3) 그래도 로그인 입력창이 아니면 화면 요약을 실어
   실패한다. 옮길 때는 조회 컨텍스트의 W컨셉 쿠키도 먼저 지운다(_copy_cookies).
   워밍업(_warm_up)은 실제로 자격 증명을 넣을 때만 한다 - 프로필 세션이 살아
-  있으면 6초쯤 아낀다.
+  있으면 6초쯤 아낀다. 홈으로 밀려난 경우 표/입력창 대기(8초)는 주소를 보고
+  즉시 빠져나오고, 로그인 폼을 연 뒤의 고정 1.5초는 reCAPTCHA 배지 iframe이
+  그려질 때까지의 대기로 바꿨다(RECAPTCHA_READY_SELECTOR).
 """
 
 from __future__ import annotations
@@ -127,6 +129,13 @@ LOGIN_WAIT_TIMEOUT_MS = 30 * 1000  # 자동 로그인 제출 후 결과 대기
 LOGIN_POLL_MS = 300  # 그동안 로그인 화면을 벗어났는지 보는 간격 (1초 단위는 한 박자씩 늦었다)
 GOODS_TABLE_TIMEOUT_MS = 15 * 1000  # 주문상세의 상품 목록이 그려질 때까지
 LOGIN_CHECK_TIMEOUT_MS = 8 * 1000  # 로그인 창에서 주문상세를 열어 표/로그인 입력창 중 하나가 뜰 때까지
+LOGIN_CHECK_POLL_MS = 100
+# 로그인 폼의 reCAPTCHA Enterprise(보이지 않는 위젯, 제출 버튼이 button.g-recaptcha)가
+# 준비됐다는 표시 - 우측 아래 배지 안의 anchor iframe. 예전엔 폼을 연 뒤 무조건
+# 1.5초를 잤는데, 빨리 뜨면 그만큼 낭비고 늦게 뜨면 위젯 없이 제출해 오류(30분
+# 잠금으로 이어질 수 있다)가 났을 것이다. 배지가 그려질 때까지만 기다린다.
+RECAPTCHA_READY_SELECTOR = ".grecaptcha-badge iframe[src*='recaptcha']"
+RECAPTCHA_READY_TIMEOUT_MS = 10 * 1000
 
 GOODS_TABLE_SELECTOR = "table.tbl_order_list"
 
@@ -205,12 +214,37 @@ def _copy_cookies(context: BrowserContext, login_context: BrowserContext) -> Non
 
 
 def _wait_table_or_login(page: Page, timeout_ms: int) -> None:
-    """주문상세의 상품 표 또는 로그인 입력창 중 먼저 뜨는 쪽을 기다린다(둘 다 안 뜨면 그냥 넘어간다)."""
-    either = page.locator(GOODS_TABLE_SELECTOR).or_(page.locator("input[type='password']")).first
+    """주문상세의 상품 표 또는 로그인 입력창 중 먼저 뜨는 쪽을 기다린다.
+
+    홈 등 주문상세가 아닌 곳으로 밀려났으면(만료된 세션) 표도 입력창도 영영
+    안 뜨므로 그 즉시 돌아온다 - timeout_ms를 통째로 허비하지 않는다. 판정은
+    호출한 쪽이 한다.
+    """
+    elapsed_ms = 0
+    while True:
+        if (page.locator(GOODS_TABLE_SELECTOR).count()
+                or page.locator("input[type='password']").count()
+                or _left_order_detail(page)
+                or elapsed_ms >= timeout_ms):
+            return
+        page.wait_for_timeout(LOGIN_CHECK_POLL_MS)
+        elapsed_ms += LOGIN_CHECK_POLL_MS
+
+
+def _wait_recaptcha_ready(page: Page) -> None:
+    """로그인 폼의 reCAPTCHA 위젯(배지 iframe)이 그려질 때까지 기다린다.
+
+    안 그려지면 제출하지 않는다 - 위젯 없이 보낸 로그인은 실패로 찍히고 그게
+    쌓이면 30분 제한이다.
+    """
     try:
-        either.wait_for(state="attached", timeout=timeout_ms)
-    except Exception:  # noqa: BLE001 - 홈 등 제3의 화면: 호출한 쪽이 주소로 가른다
-        pass
+        page.locator(RECAPTCHA_READY_SELECTOR).first.wait_for(
+            state="attached", timeout=RECAPTCHA_READY_TIMEOUT_MS)
+    except Exception as exc:  # noqa: BLE001 - 타임아웃
+        raise BlockedError(
+            f"W컨셉 로그인 폼의 reCAPTCHA가 {RECAPTCHA_READY_TIMEOUT_MS // 1000}초 안에 준비되지 않아 "
+            f"제출하지 않았습니다 ({_page_summary(page)})."
+        ) from exc
 
 
 def _auto_login(context: BrowserContext, product_url: str) -> None:
@@ -252,9 +286,9 @@ def _auto_login(context: BrowserContext, product_url: str) -> None:
 
             _warm_up(page)
             page.goto(LOGIN_URL, wait_until="domcontentloaded")
-            page.wait_for_timeout(1500)
-            if not _looks_like_login_page(page):
+            if not _looks_like_login_page(page):  # 입력창은 form_wait만큼 기다려준다
                 raise BlockedError(f"W컨셉 로그인 화면이 열리지 않았습니다 ({_page_summary(page)}).")
+            _wait_recaptcha_ready(page)
 
             page.locator(LOGIN_ID_SELECTOR).click()
             page.locator(LOGIN_ID_SELECTOR).press_sequentially(login_id, delay=80)
