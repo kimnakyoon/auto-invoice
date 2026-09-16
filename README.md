@@ -475,8 +475,12 @@ python scripts/run_all.py --stop-before-apply   # 일괄등록까지만, 마지�
   밖 form 안에 있다. 누르면 `POST /mypage/mall-qna`(multipart: typeCode1·typeCode2·orderId·…)가 가고
   모달 "1:1 문의 작성이 완료되었습니다."가 뜬다(주소는 그대로). 등록 전후의 확인은 [1:1 문의 내역]
   JSON(`GET /mypage/mall-qna/fetch?page=N`)에서 `orderId`+제목으로 - 첫 실등록(사용자가 고른 141741348
-  김용식 → 문의번호 8382376 '답변대기', 한 건 약 2초), 같은 주문 재시도 1.0초에 AlreadyInquired.
-  3개월보다 오래된 주문은 폼의 주문번호 목록에 없어 남길 수 없다(ParseError).
+  김용식 → 문의번호 8382376 '답변대기'), 같은 주문 재시도 1.0초에 AlreadyInquired.
+  3개월보다 오래된 주문은 폼의 주문번호 목록에 없어 남길 수 없다(ParseError). 문의 화면에는
+  `page.route`로 광고·분석 호스트(googletagmanager·blux.ai·criteo·facebook·daangn…)와 이미지를
+  끊어 한 건 1.4~1.6초 → 0.9초. 그 `page.route` 때문에 시험용 `context.route` 차단이 안 먹어
+  시험 두 번이 실등록됐고(같은 문의 세 건, 사이트에 삭제 기능 없음) - 시험은 어댑터의
+  `_guard_inquiry_page`를 바꿔 끼워서 한다.
 - **결과는 바탕화면 `문의결과_*.xlsx`** 로도 남긴다 (`save_result_excel`). 송장조회
   결과 엑셀과 같은 생김새이고, 정렬은 실패 → 미지원 사이트 넘김 → 남김 →
   이미 남긴 주문 순 - 앞의 둘이 사람이 직접 남겨야 하는 건이다. 같은 파일의

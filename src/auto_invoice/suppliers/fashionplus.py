@@ -403,6 +403,11 @@ def get_tracking(
 #   모달 "1:1 문의 작성이 완료되었습니다."를 읽은 뒤 목록 첫 쪽에 오늘 자로 올라갔는지
 #   확인한다(주소는 /write에 그대로 머문다). [SMS 답변수신] 체크는 숨은 input이 아니라
 #   label을 눌러야 켜지고, [문의하기] 버튼(.mm_foot)은 .m_modal-inquiry-inner 밖 form 안에 있다.
+# - 문의 화면에는 page.route(_guard_inquiry_page)로 광고·분석 호스트와 이미지를 끊는다 - 한 건
+#   1.4~1.6초 → 0.9초(주문상세 0.57→0.23초, 폼 0.44→0.14초). 주의: page.route가 걸린 페이지에는
+#   context.route가 불리지 않으므로, 시험에서 등록 POST를 막으려면 context.route가 아니라 이
+#   함수를 바꿔 끼워야 한다(2026-09-16 그걸 놓쳐 시험 두 번이 실등록돼 같은 문의가 세 건 남았고,
+#   사이트에 삭제 기능이 없어 되돌리지 못했다).
 QNA_WRITE_URL = "https://www.fashionplus.co.kr/mypage/mall-qna/write"
 QNA_LIST_URL = "https://www.fashionplus.co.kr/mypage/mall-qna"
 QNA_LIST_API = "https://www.fashionplus.co.kr/mypage/mall-qna/fetch?page={page_no}"
@@ -427,6 +432,23 @@ QNA_HISTORY_TRIES = 3        # 등록 직후 목록에 아직 없으면 잠깐 �
 QNA_HISTORY_RETRY_GAP_SEC = 1.5
 QNA_STATE_ANSWERED = "답변완료"
 QNA_STATE_WAITING = "답변대기"
+# 문의 화면에서 통과시키는 호스트. 주문상세·문의 폼은 광고·분석 스크립트(googletagmanager,
+# blux.ai, criteo, facebook, daangn, megadata …)를 20곳 넘게 부르는데 문의에는 하나도 필요 없다.
+INQUIRY_ALLOWED_HOSTS = ("fashionplus.co.kr",)
+# 송장조회용 컨텍스트가 막는 무거운 리소스(browser.BLOCKED_RESOURCE_TYPES와 같은 값). page.route를
+# 걸면 context.route는 불리지 않아(롯데아이몰 실측) 여기서 같이 막아야 이미지 150건이 다시 안 간다.
+INQUIRY_HEAVY_RESOURCES = {"image", "media", "font"}
+
+
+def _guard_inquiry_page(route) -> None:
+    """문의 화면 전용 라우팅 - 패션플러스 밖 호스트와 이미지·폰트는 끊어 화면을 가볍게 한다."""
+    request = route.request
+    host = urlparse(request.url).netloc.lower()
+    allowed = any(host == h or host.endswith("." + h) for h in INQUIRY_ALLOWED_HOSTS)
+    if allowed and request.resource_type not in INQUIRY_HEAVY_RESOURCES:
+        route.continue_()
+    else:
+        route.abort()
 
 
 def _inquiry_text(recipient_name: str) -> str:
@@ -585,6 +607,7 @@ def post_inquiry(context: BrowserContext, product_url: str, recipient_name: str,
     order_no = extract_order_no(product_url)
     message = _inquiry_text(recipient_name)
     page = context.new_page()
+    page.route("**/*", _guard_inquiry_page)   # 광고·분석 스크립트를 끊으면 화면이 더 빨리 뜬다
     try:
         _goto_logged_in(page, ORDER_DETAIL_URL.format(order_no=order_no), headless)
         try:
