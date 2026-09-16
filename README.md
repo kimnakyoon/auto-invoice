@@ -198,7 +198,7 @@ python scripts/run_all.py --stop-before-apply   # 일괄등록까지만, 마지�
 - **장부로 중복을 막는다.** 남긴 주문은 `logs/inquiries.json` 에 마켓
   주문번호로 적고, 다시 돌려도 그 주문은 넘긴다. 한 건 남길 때마다 바로
   적어서 도중에 멈춰도 남긴 건은 장부에 있다.
-- **어댑터에 `post_inquiry`가 있는 사이트만** 남긴다 (지금은 롯데온·지마켓·SSG·네이버·GSSHOP·롯데아이몰·NS홈쇼핑·11번가). 나머지는
+- **어댑터에 `post_inquiry`가 있는 사이트만** 남긴다 (지금은 롯데온·지마켓·SSG·네이버·GSSHOP·롯데아이몰·NS홈쇼핑·11번가·패션플러스). 나머지는
   '아직 지원하지 않음'으로 결과에 남겨 사람이 직접 하게 한다. 사이트별로
   브라우저 하나를 열어 한 건씩, 송장조회와 같은 요청 간격으로 남긴다.
   송장조회처럼 `WANTS_CDP_CHROME` 어댑터(지마켓)는 우리가 직접 띄운 진짜
@@ -464,6 +464,19 @@ python scripts/run_all.py --stop-before-apply   # 일괄등록까지만, 마지�
   신청"과 안내문의 "준비"가 늘 있어 `raise_if_cancelled`가 헛짚었다). 첫 실등록(사용자가 고른
   20260915101097648 김보민 → 문의번호 205258625 '미답변', 비밀글, 한 건 2.4초), 같은 주문 두 번째는
   0.8초 만에 AlreadyInquired.
+- **패션플러스는 사람이 하던 순서** 주문상세 → 왼쪽 메뉴 [1:1 문의하기] → 1차 문의유형 '배송문의'
+  → 2차 '단순 배송일 문의' → 주문번호에서 그 주문 → 문의 상품(하나 뜸) → 문의 제목·내용에
+  `수령인 배송 언제 시작하나요?` → [SMS 수집을 동의하며, SMS 답변수신] 체크 → 휴대폰 번호 →
+  [문의하기] → 왼쪽 메뉴 [1:1 문의 내역]에서 확인 을 대신한다(사용자 요청 2026-09-16). 실측: 폼
+  (`/mypage/mall-qna/write`)은 Vue 화면이라 `GET /mypage/mall-qna/fetch-order-info`(최근 3개월 주문,
+  330KB)로 주문번호·상품 선택지를 채우고, `<select>`에 id가 없어 바로 앞 제목(`h6.mm_text-label`)으로
+  찾는다(1차 value=4, 2차 value=11, 주문번호 select의 value가 주문번호, 상품 select의 value는 옵션 id).
+  [SMS 답변수신]은 숨은 input이 아니라 label을 눌러야 켜지고, [문의하기] 버튼은 `.m_modal-inquiry-inner`
+  밖 form 안에 있다. 누르면 `POST /mypage/mall-qna`(multipart: typeCode1·typeCode2·orderId·…)가 가고
+  모달 "1:1 문의 작성이 완료되었습니다."가 뜬다(주소는 그대로). 등록 전후의 확인은 [1:1 문의 내역]
+  JSON(`GET /mypage/mall-qna/fetch?page=N`)에서 `orderId`+제목으로 - 첫 실등록(사용자가 고른 141741348
+  김용식 → 문의번호 8382376 '답변대기', 한 건 약 2초), 같은 주문 재시도 1.0초에 AlreadyInquired.
+  3개월보다 오래된 주문은 폼의 주문번호 목록에 없어 남길 수 없다(ParseError).
 - **결과는 바탕화면 `문의결과_*.xlsx`** 로도 남긴다 (`save_result_excel`). 송장조회
   결과 엑셀과 같은 생김새이고, 정렬은 실패 → 미지원 사이트 넘김 → 남김 →
   이미 남긴 주문 순 - 앞의 둘이 사람이 직접 남겨야 하는 건이다. 같은 파일의
@@ -524,6 +537,10 @@ python scripts/run_all.py --stop-before-apply   # 일괄등록까지만, 마지�
   - **11번가**: [상품 Q&A] 목록 한 응답에 상태·질문·답변(`dl.answer` 첫 `dd`)·`(답변일 : ...)`이 다
     있어 상세가 없다. 주문일부터의 기간으로 POST해 첫 쪽에서 주문번호+문구(또는 장부의 문의번호)로
     고른다(2026-09-16 실측 0.1초).
+  - **패션플러스**: [1:1 문의 내역] JSON(`GET /mypage/mall-qna/fetch?page=N`, 20건 최신순,
+    `x-requested-with: XMLHttpRequest` 없으면 400)의 items[]에 문의번호(`id`)·`orderId`·`title`·
+    `isAnswered`·`answerContent`·`answeredAt`이 다 있어 상세가 없다. 주문번호+문구(또는 장부의
+    문의번호)로 고른다(2026-09-16 실측 0.25초).
 
 ### 기다리는 시간은 '시계'가 아니라 '화면'을 보고 정한다
 
