@@ -36,6 +36,7 @@ from . import (
     ssg,
     thehyundai,
     wconcept,
+    zigzag,
 )
 
 _ADAPTERS: dict[str, object] = {}
@@ -70,6 +71,7 @@ register(shinsegaetv)
 register(halfclub)
 register(elandmall)
 register(galleria)
+register(zigzag)
 # 새 공급사 추가 예시:
 # from . import newsupplier
 # register(newsupplier)
