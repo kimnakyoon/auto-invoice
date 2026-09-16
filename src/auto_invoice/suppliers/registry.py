@@ -19,6 +19,7 @@ from . import (
     elandmall,
     elevenst,
     fashionplus,
+    galleria,
     gmarket,
     gsshop,
     halfclub,
@@ -68,6 +69,7 @@ register(kr4910)
 register(shinsegaetv)
 register(halfclub)
 register(elandmall)
+register(galleria)
 # 새 공급사 추가 예시:
 # from . import newsupplier
 # register(newsupplier)
