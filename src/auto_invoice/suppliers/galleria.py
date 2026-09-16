@@ -45,8 +45,12 @@
   쿠키만으로 바로 조회된다. 로그인 세션(SESSION 쿠키)은 브라우저 세션 쿠키라 서버가
   끊으면 다시 로그인한다.
 
-샵마인 엑셀의 "상품URL"이 어떤 꼴이든 세 가지로 받는다:
-  1. ord_no=<주문번호> 가 있으면(주문상세 주소) 그 상세를 바로 연다
+샵마인 엑셀의 "상품URL"은 실측(2026-09-16 실행)으로 /mypage/initOrderDetail.action?ord_no=…
+꼴이지만, 어떤 꼴이든 세 가지로 받는다:
+  1. ord_no=<주문번호> 가 있으면(주문상세 주소) 그 상세를 바로 연다. 이번에 조회할 주문이
+     2건 이상이면 prepare_batch가 가장 오래된 주문일부터 오늘까지의 목록을 한 번 받아 캐시해
+     두고(상세 95KB/건 대신 목록 27KB/5건), 캐시로 답한 주문은 요청을 안 보낸 것으로
+     표시해 오케스트레이터가 간격을 두지 않는다(sent_request=False)
   2. goods_no=<상품번호> 가 있으면(상품 상세 주소 /goods/initDetailGoods.action?goods_no=…)
      주문목록에서 그 상품 줄만 후보로 본다
   3. 둘 다 없으면(주문목록 주소 등) 주문목록 전체가 후보다
@@ -182,6 +186,11 @@ class DeliInfo:
 
 # 컨텍스트(=이번 실행의 브라우저)별로 읽어둔 주문목록. 키는 (컨텍스트, 기간 일수).
 _listed_orders: dict[tuple[int, int], list[ListedOrder]] = {}
+# prepare_batch가 주문번호별로 읽어둔 목록 (주문번호 URL 경로용). 캐시에 있으면 주문상세를
+# 열지 않는다 - 상세는 한 건에 95KB인데 목록은 5건에 27KB다.
+_listed_by_no: dict[int, dict[str, ListedOrder]] = {}
+# 1건이면 목록이나 상세나 요청 하나라 이득이 없다.
+LIST_PREFETCH_MIN_ORDERS = 2
 # 주문상세에서 읽은 (주문번호 -> 가려진 수령인) - 같은 실행에서 두 번 열지 않는다.
 _recipients: dict[tuple[int, str], str] = {}
 
@@ -420,6 +429,34 @@ def _load_list(context: BrowserContext, days: int) -> list[ListedOrder]:
     return _listed_orders[key]
 
 
+def prepare_batch(context: BrowserContext, orders, headless: bool = True) -> None:
+    """이번에 조회할 주문번호가 2건 이상이면 가장 오래된 주문일부터 오늘까지의 목록을
+    한 번 받아 캐시한다 (이랜드몰과 같은 방식).
+
+    오케스트레이터가 이 공급사의 첫 조회 전에 한 번 불러준다. 실패하면 아무것도
+    읽지 않은 것과 같아서 모든 주문이 주문상세 경로로 간다 - 그래서 어떤 예외도
+    밖으로 내보내지 않는다. 캐시로 답한 주문은 요청을 안 보냈으므로(sent_request=False)
+    오케스트레이터가 간격도 두지 않는다.
+    """
+    wanted = {no for no in (extract_order_no(o.product_url) for o in orders) if no}
+    if len(wanted) < LIST_PREFETCH_MIN_ORDERS:
+        return
+    dates = [d for d in (order_date_from_no(no) for no in wanted) if d is not None]
+    today = date.today()
+    floor = today - timedelta(days=LIST_MAX_DAYS)
+    # 주문번호에서 날짜를 못 읽은 주문이 하나라도 있으면 상한까지 다 받는다.
+    oldest = min(dates) if dates and len(dates) == len(wanted) else floor
+    try:
+        listed = _fetch_list(context, max(oldest, floor), today)
+    except Exception as e:  # noqa: BLE001 - 미리 읽기는 실패해도 주문별 경로가 있다
+        common.safe_print(f"[galleria] 주문목록 미리 읽기 실패 - 주문별로 조회합니다: {e}")
+        return
+    _listed_by_no[id(context)] = {o.order_no: o for o in listed}
+    hit = len(wanted & set(_listed_by_no[id(context)]))
+    common.safe_print(f"[galleria] 주문목록 {len(listed)}건을 미리 읽었습니다 "
+                      f"- 조회 대상 {len(wanted)}건 중 {hit}건이 목록에 있습니다.")
+
+
 def _fetch_detail(context: BrowserContext, order_no: str) -> str:
     html = _get_html(context, DETAIL_URL.format(order_no=order_no))
     if ERROR_PAGE_MARKER in html and not ROW_PATTERN.search(html):
@@ -579,9 +616,15 @@ def _raise_for_unshipped(row: OrderRow, order_no: str) -> None:
 
 
 def _result_for_row(context: BrowserContext, order_no: str, row: OrderRow,
-                    info: DeliInfo | None) -> TrackingResult:
+                    info: DeliInfo | None, *, sent_request: bool = True) -> TrackingResult:
+    """sent_request: 이 줄을 얻기까지 요청을 보냈는가 (prepare_batch 캐시면 False).
+    발송된 줄은 어차피 배송정보 요청을 보내므로 결과는 늘 True다."""
     if not row.shipped:
-        _raise_for_unshipped(row, order_no)
+        try:
+            _raise_for_unshipped(row, order_no)
+        except AdapterError as e:
+            e.sent_request = sent_request
+            raise
     info = info or fetch_deli_info(context, order_no, row.detail_no)
     return TrackingResult(tracking_no=info.tracking_no, courier=info.courier,
                           delivery_note=eta_mod.from_text(row.date_note) or (row.date_note or None))
@@ -589,18 +632,22 @@ def _result_for_row(context: BrowserContext, order_no: str, row: OrderRow,
 
 def _lookup_by_order_no(context: BrowserContext, order_no: str,
                         order_option: str | None) -> TrackingResult:
-    rows = parse_rows(_fetch_detail(context, order_no))
+    cached = _listed_by_no.get(id(context), {}).get(order_no)
+    if cached is not None:
+        rows, sent_request = cached.rows, False
+    else:
+        rows, sent_request = parse_rows(_fetch_detail(context, order_no)), True
     if not rows:
         raise ParseError(f"주문상세에서 상품 줄을 읽지 못했습니다 (주문번호={order_no}).")
     row = select_row(rows, order_option)
     if row is not None:
-        return _result_for_row(context, order_no, row, None)
+        return _result_for_row(context, order_no, row, None, sent_request=sent_request)
 
     # 옵션으로 특정할 수 없으면 발송된 줄을 전부 보고 송장이 하나뿐인지 본다
     # (다른 어댑터와 같은 안전 규칙). 발송된 줄이 없으면 전부를 상태 판정에 쓴다.
     shipped = [r for r in rows if r.shipped]
     if not shipped:
-        _raise_for_unshipped(rows[0], order_no)
+        _result_for_row(context, order_no, rows[0], None, sent_request=sent_request)
     results = [_result_for_row(context, order_no, r, None) for r in shipped]
     if len({r.tracking_no for r in results}) > 1:
         raise ParseError(
