@@ -1,14 +1,14 @@
-"""남긴 1:1 문의에 공급사 답변이 달렸는지 확인해 장부에 적고, 최신 송장조회 결과 엑셀의 '사유' 칸에 붙인다.
+"""남긴 1:1 문의에 공급사 답변이 달렸는지 확인해 장부에 적고, 바탕화면에 '문의내역' 시트만 든 문의 결과 엑셀을 만든다.
 
-    python scripts/check_answers.py                 # 최근 문의 전부 확인 + 바탕화면 최신 결과 엑셀 갱신
+    python scripts/check_answers.py                 # 최근 문의 전부 확인 + 바탕화면 문의결과_*.xlsx('문의내역' 시트)
     python scripts/check_answers.py --no-excel      # 장부만 갱신
     python scripts/check_answers.py --site lotteon  # 한 사이트만
     python scripts/check_answers.py --force         # 이미 답변을 받은 문의도 다시 확인
-    python scripts/check_answers.py --excel 바탕화면\송장조회결과_20260911_101500.xlsx
 
 [문의] 버튼(inquiry.run)이 문의를 남긴 뒤 같은 확인을 스스로 하므로(오늘 남긴 것은
 제외), 이 스크립트는 문의를 남기지 않고 답변만 바로 보고 싶을 때 쓴다. 송장조회는
-답변을 보지 않는다(사용자 요청 2026-09-11).
+답변을 보지 않고(사용자 요청 2026-09-11), 송장조회 결과 엑셀도 건드리지 않는다(사용자
+요청 2026-09-16 - 답변은 문의 결과 엑셀의 '문의내역' 시트로).
 """
 
 import argparse
@@ -26,38 +26,34 @@ from auto_invoice import inquiry, inquiry_answers  # noqa: E402
 
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__.split("\n")[0])
-    parser.add_argument("--excel", default=None,
-                        help="사유 칸을 고칠 송장조회결과 엑셀 (기본: 바탕화면에서 가장 최근 파일)")
-    parser.add_argument("--no-excel", action="store_true", help="엑셀은 건드리지 않고 장부만 갱신")
+    parser.add_argument("--no-excel", action="store_true", help="엑셀은 만들지 않고 장부만 갱신")
     parser.add_argument("--site", action="append", default=None, help="이 사이트만 (여러 번 줄 수 있음)")
     parser.add_argument("--force", action="store_true", help="이미 답변을 받은 문의도 다시 확인")
     parser.add_argument("--headless", action="store_true", help="브라우저 창 없이 (로그인 세션이 있을 때만)")
     args = parser.parse_args()
 
+    before = inquiry_answers.answered_ids(inquiry_answers.ledger_by_id())
     by_id = inquiry_answers.refresh(None, headless=args.headless, force=args.force,
                                     sites=set(args.site) if args.site else None, log=print)
     answered = [e for e in by_id.values() if (e.get("answer_check") or {}).get("answer")]
+    new_ids = inquiry_answers.answered_ids(by_id) - before
     print()
-    print(f"장부 {len(by_id)}건 중 답변 받은 문의 {len(answered)}건")
+    print(f"장부 {len(by_id)}건 중 답변 받은 문의 {len(answered)}건 (이번에 새로 읽은 답변 {len(new_ids)}건)")
     for e in answered:
         check = e["answer_check"]
         first = next((ln for ln in inquiry_answers.condense_answer(check["answer"], e.get("message") or "").splitlines()
                       if ln.strip()), "")
-        print(f"  {e['site']} {e['order_id']} {e.get('recipient_name') or ''}: "
+        mark = "새 " if e["order_id"] in new_ids else ""
+        print(f"  {mark}{e['site']} {e['order_id']} {e.get('recipient_name') or ''}: "
               f"{check.get('answered_on') or ''} {first[:90]}")
 
     if args.no_excel:
         return
-    path = Path(args.excel) if args.excel else inquiry.find_latest_result_excel()
-    if path is None or not path.exists():
-        print("송장조회결과 엑셀이 없어 사유 칸은 고치지 않았습니다.")
+    run = inquiry.InquiryRun(answer_entries=inquiry_answers.recent_entries(by_id), new_answer_ids=set(new_ids))
+    if not run.answer_entries:
+        print(f"최근 {inquiry_answers.ANSWER_LOOKBACK_DAYS}일에 남긴 문의가 없어 엑셀은 만들지 않았습니다.")
         return
-    try:
-        changed = inquiry_answers.update_excel(path, by_id)
-    except PermissionError:
-        print(f"엑셀이 열려 있어 고치지 못했습니다 - 닫고 다시 실행해주세요: {path}")
-        return
-    print(f"{path.name}: 사유 칸 {changed}개 갱신")
+    inquiry.save_result_excel(run, log=print)
 
 
 if __name__ == "__main__":

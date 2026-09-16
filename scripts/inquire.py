@@ -5,7 +5,8 @@
     python scripts/inquire.py --no-answers       # 남기기만, 답변 확인은 건너뜀
     python scripts/inquire.py --excel 바탕화면\송장조회결과_20260904_092714.xlsx
 
-답변 확인은 읽은 송장조회결과 엑셀의 '사유' 칸을 제자리에서 고친다 - 엑셀은 닫아둘 것.
+답변 확인 결과는 문의 결과 엑셀(바탕화면 문의결과_*.xlsx)의 '문의내역' 시트에 실린다 -
+송장조회결과 엑셀은 건드리지 않는다.
 """
 
 import argparse

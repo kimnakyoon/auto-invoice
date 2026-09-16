@@ -235,42 +235,6 @@ def _write_entries_sheet(ws, entries: list[ReportEntry], applied_label: str,
                           f"{max(ws.max_row, _HEADER_ROW)}")
 
 
-# 문의 답변 메모(inquiry_answers.note_for)가 사유 칸에 붙을 때의 글자색 - 답변이 온
-# 건은 눈에 띄게, 답변대기는 원래 사유와 같은 색. 메모는 [문의] 실행이 이미 저장된
-# 결과 엑셀에 inquiry_answers.update_excel로 제자리에서 붙인다 (조회 때는 안 붙는다).
-_ANSWERED_FONT = Font(color="0B6B2E", bold=True)
-_NOTE_PREFIX = "[문의"
-_ANSWER_MARK = "[문의 답변"
-
-
-def compose_reason(note: str | None, reason: str | None) -> str:
-    """사유 칸 글자 - 원래 사유(한 줄) 아래에 문의 메모(답변은 여러 줄)를 붙인다."""
-    reason = (reason or "").strip()
-    if not note:
-        return reason
-    return f"{reason}\n{note}" if reason else note
-
-
-def strip_note(reason: str) -> str:
-    """전에 붙인 문의 메모를 뗀 원래 사유 (update_excel이 같은 칸을 다시 고칠 때).
-
-    메모는 줄 머리의 "[문의"로 시작하고 원래 사유는 그 위 줄이다.
-    """
-    if reason.startswith(_NOTE_PREFIX):
-        return ""
-    idx = reason.find("\n" + _NOTE_PREFIX)
-    return reason[:idx].rstrip() if idx >= 0 else reason
-
-
-def style_reason_cell(cell, note: str | None) -> None:
-    """문의 메모가 붙은 사유 칸은 줄바꿈을 살리고, 답변이 온 건은 진한 녹색으로 (update_excel이 쓴다)."""
-    if not note:
-        return
-    cell.alignment = Alignment(wrap_text=True, vertical="center")
-    if note.startswith(_ANSWER_MARK):
-        cell.font = _ANSWERED_FONT
-
-
 def _order_is_old(entry: ReportEntry) -> bool:
     """주문일이 오늘과 STALE_DAYS 이상 벌어졌는가 (결과가 무엇이든).
 

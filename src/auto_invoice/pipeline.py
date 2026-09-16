@@ -254,7 +254,8 @@ def lookup_tracking(result: PipelineResult, *, limit=None, headless=False,
                               on_checkpoint=on_checkpoint)
 
     # 남긴 1:1 문의의 답변은 여기서 보지 않는다 - [문의] 버튼(inquiry.run)이 문의를 남긴
-    # 뒤에 확인해 이 결과 엑셀의 '사유' 칸을 제자리에서 고친다(사용자 요청 2026-09-11).
+    # 뒤에 확인해 문의 결과 엑셀의 '문의내역' 시트에 싣는다(사용자 요청 2026-09-11·2026-09-16) -
+    # 이 송장조회 결과 엑셀은 건드리지 않는다.
     result.lookup_counts = report.summary()
     result.lookup_entries = list(report.entries)
     result.lookup_failure_lines = report.failure_lines()

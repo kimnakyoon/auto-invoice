@@ -18,12 +18,12 @@
 버튼을 하루에 두 번 누르거나, 같은 엑셀로 다시 돌려도 이미 남긴 주문은 건너뛴다.
 
 사이트마다 문의 화면이 달라서 어댑터에 post_inquiry(context, product_url,
-recipient_name, headless)가 있는 사이트만 처리하고(지금은 롯데온·지마켓·SSG·네이버·GSSHOP·롯데아이몰·NS홈쇼핑), 없는
+recipient_name, headless)가 있는 사이트만 처리하고(지금은 롯데온·지마켓·SSG·네이버·GSSHOP·롯데아이몰·NS홈쇼핑·11번가), 없는
 사이트는 '아직 지원 안 함'으로 결과에 남긴다 - 사람이 그 건은 직접 남긴다.
 어댑터에 prepare_inquiries(context, product_urls, headless)가 더 있으면 그
 사이트의 첫 문의 전에 한 번 불러 배치를 미리 훑게 한다(롯데온은 주문목록
 API로 문의 화면 주소를 읽어 주문마다 상세를 여는 일을 던다). 어댑터가
-AlreadyInquired를 내면(지마켓·SSG·네이버·GSSHOP·롯데아이몰·NS홈쇼핑은 등록 전에 문의내역을 뒤져 사람이 직접 남긴
+AlreadyInquired를 내면(지마켓·SSG·네이버·GSSHOP·롯데아이몰·NS홈쇼핑·11번가는 등록 전에 문의내역을 뒤져 사람이 직접 남긴
 같은 문의를 찾는다) 그 주문은 '넘김'으로 적고 장부에도 올려, 다음 실행부터는
 문의내역을 다시 뒤지지 않는다. 송장조회처럼 WANTS_CDP_CHROME 어댑터(지마켓)는
 우리가 직접 띄운 진짜 크롬(CDP)에서 남긴다 - 번들 크로미엄은 봇 확인에 걸린다.
@@ -31,8 +31,10 @@ AlreadyInquired를 내면(지마켓·SSG·네이버·GSSHOP·롯데아이몰·NS
 문의를 남긴 뒤에는 전에 남긴 문의의 답변도 가져온다 (inquiry_answers, 사용자 요청
 2026-09-11 - 송장조회 때가 아니라 [문의]를 눌렀을 때). 사이트별 브라우저를 닫기 전에
 그 사이트의 답 없는 문의를 같은 세션으로 읽고, 이번에 남길 게 없던 사이트는 따로
-병렬로 읽은 뒤, 읽은 송장조회 결과 엑셀의 '사유' 칸에 답변/답변대기를 제자리에서
-붙인다. 남길 문의가 없어도 답변 확인은 한다.
+병렬로 읽은 뒤, 최근 14일 안에 남긴 문의 전부를 이번 문의 결과 엑셀(문의결과_*.xlsx)의
+'문의내역' 시트에 상태(새 답변·답변·답변대기·확인 못 함·오늘 남김)·답변과 함께 싣는다.
+송장조회 결과 엑셀은 건드리지 않는다(사용자 요청 2026-09-16 - 그 전에는 그 엑셀의 '사유'
+칸을 제자리에서 고쳤다). 남길 문의가 없어도 답변 확인은 한다.
 """
 
 from __future__ import annotations
@@ -131,6 +133,10 @@ class InquiryRun:
     stopped_reason: str | None = None
     # 전에 남긴 문의의 답변 확인 (inquiry_answers) - 요약에 그대로 싣는 줄들.
     answer_lines: list[str] = field(default_factory=list)
+    # 결과 엑셀 '문의내역' 시트에 실을 장부 항목(최근 14일에 남긴 문의 전부)과, 그중
+    # 이번 실행에서 처음 답변을 읽은 주문번호(시트에서 '새 답변'으로 표시).
+    answer_entries: list[dict] = field(default_factory=list)
+    new_answer_ids: set[str] = field(default_factory=set)
 
     def counts(self) -> dict[str, int]:
         out = {"success": 0, "fail": 0, "skip": 0}
@@ -287,7 +293,8 @@ def run(excel_path: str | Path | None = None, *, limit: int | None = None,
     몰아치지 않도록 송장조회와 같은 요청 간격을 지킨다). 한 사이트가 로그인
     등으로 막히면 그 사이트의 나머지는 바로 넘기고 다른 사이트는 계속한다.
     dry_run이면 무엇을 남길지만 보여주고 아무것도 남기지 않는다(답변 확인도 안 한다).
-    check_answers면 남긴 뒤 답변을 확인해 결과 엑셀 '사유' 칸을 고친다(_check_answers).
+    check_answers면 남긴 뒤 전에 남긴 문의의 답변을 확인해 result.answer_entries에 모은다 -
+    save_result_excel이 문의 결과 엑셀의 '문의내역' 시트로 쓴다(_AnswerCheck).
     """
     result = InquiryRun()
     path, targets, by_site, skipped = plan(excel_path)
@@ -408,18 +415,12 @@ def _report_answers(result: InquiryRun, by_id: dict[str, dict], *, before: set[s
         result.answer_lines.append(
             f"  {e['site']} {e['order_id']} ({e.get('recipient_name') or ''}) "
             f"{check.get('answered_on') or ''}: {first[:90]}")
-    path = result.excel_path
-    if path is None or not path.exists():
-        return
-    try:
-        changed = inquiry_answers.update_excel(path, by_id)
-    except PermissionError:
-        result.answer_lines.append(f"{path.name}이 열려 있어 '사유' 칸을 고치지 못했습니다 - 닫고 "
-                                   "python scripts/check_answers.py 를 돌리면 됩니다.")
-    except Exception as e:  # noqa: BLE001
-        result.answer_lines.append(f"{path.name} '사유' 칸 갱신 실패 - {e}")
-    else:
-        result.answer_lines.append(f"{path.name}: '사유' 칸 {changed}개에 문의 답변/상태를 붙였습니다.")
+    # 시트에 실을 것은 여기서 모아두고, 파일은 save_result_excel이 문의 결과와 함께 쓴다.
+    result.new_answer_ids = {e["order_id"] for e in new_answers}
+    result.answer_entries = inquiry_answers.recent_entries(by_id)
+    result.answer_lines.append(
+        f"최근 {inquiry_answers.ANSWER_LOOKBACK_DAYS}일에 남긴 문의 {len(result.answer_entries)}건의 "
+        f"답변/상태는 문의 결과 엑셀 '{ANSWERS_SHEET_NAME}' 시트에 실립니다.")
 
 
 def _message_for(target: InquiryTarget) -> str:
@@ -594,10 +595,39 @@ _INQ_COLORS = {
 _INQ_ACTIONS = {
     "실패": "문의를 남기지 못함 - 상품URL을 열어 직접 남겨주세요 (문의 내용 칸의 문구 그대로)",
     "넘김": "이미 남긴 주문이거나 아직 자동화하지 않은 사이트 - 사유 칸 참고 (미지원 사이트는 직접 남겨주세요)",
-    "남김": "공급사 사이트에 문의가 올라감 - 답변은 문자/알림톡으로 옴",
+    "남김": "공급사 사이트에 문의가 올라감 - 답변은 문자/알림톡으로 오고, 다음 [문의] 실행의 '문의내역' 시트에도 실림",
 }
 _INQ_HEADER_ROW = 3
 _UNSUPPORTED_MARK = "지원하지 않음"
+
+# '문의내역' 시트 - 전에 남긴 문의(최근 14일)의 답변/상태 (inquiry_answers). 사용자 요청
+# (2026-09-16)으로 송장조회 결과 엑셀의 '사유' 칸 대신 여기에 모은다. 정렬은 사람이 볼
+# 순서로: 새 답변(이번에 처음 읽은 답) -> 답변대기 -> 확인 못 함 -> 답변(전에 읽은 답) ->
+# 오늘 남김. 같은 묶음 안에서는 최근 문의가 위.
+ANSWERS_SHEET_NAME = "문의내역"
+ANSWERS_HEADERS = ["상태", "마켓 주문번호", "수령인", "사이트", "주문일", "문의일", "문의 내용",
+                   "답변일", "답변 (핵심 문장)", "사이트 문의 상태", "상품URL"]
+ANSWERS_WIDTHS = [10, 22, 12, 12, 12, 12, 34, 12, 70, 28, 60]
+_ANS_COL_STATE = ANSWERS_HEADERS.index("상태")
+_ANS_COL_ORDER_ID = ANSWERS_HEADERS.index("마켓 주문번호")
+_ANS_COL_ANSWER = ANSWERS_HEADERS.index("답변 (핵심 문장)")
+_ANS_COL_SITE_STATE = ANSWERS_HEADERS.index("사이트 문의 상태")
+_ANS_COLORS = {
+    "새 답변": ("188038", "FFFFFF", "E6F4EA"),
+    "답변대기": ("5F6368", "FFFFFF", "F1F3F4"),
+    "확인 못 함": ("D93025", "FFFFFF", "FCE8E6"),
+    "답변": ("81C995", "FFFFFF", "F3FAF5"),
+    "오늘 남김": ("1A73E8", "FFFFFF", "E8F0FE"),
+}
+_ANS_ORDER = ["새 답변", "답변대기", "확인 못 함", "답변", "오늘 남김"]
+_ANS_ACTIONS = {
+    "새 답변": "이번에 처음 읽은 공급사 답변 - '답변' 칸을 보고 기다릴지 정하세요",
+    "답변대기": "문의는 올라갔지만 아직 답이 없음 - 다음 [문의] 실행 때 다시 확인",
+    "확인 못 함": "사이트를 읽지 못함('사이트 문의 상태' 칸의 사유) - 직접 문의내역을 열어보세요",
+    "답변": "전 실행에서 이미 읽은 답변 (참고용)",
+    "오늘 남김": "오늘 남긴 문의 - 답이 있을 수 없어 확인하지 않음",
+}
+_ANSWER_FONT = Font(color="0B6B2E", bold=True)
 
 
 def result_label(r: InquiryResult) -> str:
@@ -617,13 +647,32 @@ def _inq_sort_key(r: InquiryResult) -> tuple[int, str]:
 
 
 def write_inquiry_excel(run_result: InquiryRun, path: str | Path) -> Path:
+    """문의 결과 엑셀 - '문의결과'(이번에 남긴 것), '문의내역'(전에 남긴 문의의 답변/상태), '요약'.
+
+    이번에 남길 게 없었으면 '문의결과' 시트는 빼고(check_answers.py는 답변만 본다),
+    확인한 문의가 없으면 '문의내역' 시트를 뺀다. 둘 다 없으면 빈 '문의결과' 시트.
+    """
     path = Path(path)
-    rows = sorted(run_result.results, key=_inq_sort_key)
     wb = Workbook()
-    ws = wb.active
-    ws.title = INQUIRY_SHEET_NAME
-    last_col = len(INQUIRY_HEADERS)
     now = datetime.now()
+    first = wb.active
+    if run_result.results or not run_result.answer_entries:
+        first.title = INQUIRY_SHEET_NAME
+        _write_results_sheet(first, run_result, now)
+        first = None
+    if run_result.answer_entries:
+        ws = first if first is not None else wb.create_sheet(ANSWERS_SHEET_NAME)
+        ws.title = ANSWERS_SHEET_NAME
+        _write_answers_sheet(ws, run_result, now)
+    _write_inquiry_summary(wb.create_sheet(INQUIRY_SUMMARY_SHEET_NAME), run_result, now)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    wb.save(path)
+    return path
+
+
+def _write_results_sheet(ws, run_result: InquiryRun, now: datetime) -> None:
+    rows = sorted(run_result.results, key=_inq_sort_key)
+    last_col = len(INQUIRY_HEADERS)
 
     ws.merge_cells(start_row=1, start_column=1, end_row=1, end_column=last_col)
     head = ws.cell(row=1, column=1, value=f"문의 결과  {now:%Y-%m-%d %H:%M}   전체 {len(rows)}건")
@@ -676,10 +725,93 @@ def write_inquiry_excel(run_result: InquiryRun, path: str | Path) -> Path:
     ws.auto_filter.ref = (f"A{_INQ_HEADER_ROW}:{get_column_letter(last_col)}"
                           f"{max(ws.max_row, _INQ_HEADER_ROW)}")
 
-    _write_inquiry_summary(wb.create_sheet(INQUIRY_SUMMARY_SHEET_NAME), run_result, now)
-    path.parent.mkdir(parents=True, exist_ok=True)
-    wb.save(path)
-    return path
+
+def answer_status(run_result: InquiryRun, entry: dict) -> str:
+    from . import inquiry_answers  # 순환 import라 여기서
+
+    return inquiry_answers.status_of(entry, new_ids=run_result.new_answer_ids)
+
+
+def _ans_sort_key(run_result: InquiryRun, entry: dict) -> tuple[int, str, str]:
+    label = answer_status(run_result, entry)
+    rank = _ANS_ORDER.index(label) if label in _ANS_ORDER else len(_ANS_ORDER)
+    # 최근 문의가 위 - 문의 시각을 뒤집어 정렬한다.
+    posted = str(entry.get("posted_at") or "")
+    return rank, "".join(chr(0xFFFF - ord(c)) for c in posted), str(entry.get("site") or "")
+
+
+def answer_counts(run_result: InquiryRun) -> dict[str, int]:
+    counts = {label: 0 for label in _ANS_ORDER}
+    for entry in run_result.answer_entries:
+        label = answer_status(run_result, entry)
+        counts[label] = counts.get(label, 0) + 1
+    return counts
+
+
+def _write_answers_sheet(ws, run_result: InquiryRun, now: datetime) -> None:
+    from . import inquiry_answers  # 순환 import라 여기서
+
+    rows = sorted(run_result.answer_entries, key=lambda e: _ans_sort_key(run_result, e))
+    last_col = len(ANSWERS_HEADERS)
+
+    ws.merge_cells(start_row=1, start_column=1, end_row=1, end_column=last_col)
+    head = ws.cell(row=1, column=1,
+                   value=f"문의내역 (최근 {inquiry_answers.ANSWER_LOOKBACK_DAYS}일에 남긴 문의)  "
+                         f"{now:%Y-%m-%d %H:%M}   전체 {len(rows)}건")
+    head.font = Font(bold=True, size=14, color="FFFFFF")
+    head.fill = _TITLE_FILL
+    head.alignment = Alignment(horizontal="left", vertical="center", indent=1)
+    ws.row_dimensions[1].height = 30
+
+    ws.merge_cells(start_row=2, start_column=1, end_row=2, end_column=last_col)
+    counts = answer_counts(run_result)
+    cell = ws.cell(row=2, column=1, value="     ".join(f"{label} {counts[label]}건" for label in _ANS_ORDER))
+    cell.font = Font(bold=True, size=11, color="3C4043")
+    cell.alignment = Alignment(horizontal="left", vertical="center", indent=1)
+    ws.row_dimensions[2].height = 22
+
+    ws.append(ANSWERS_HEADERS)
+    for c in ws[_INQ_HEADER_ROW]:
+        c.font = Font(bold=True, color="202124")
+        c.fill = _HEADER_FILL
+        c.alignment = Alignment(horizontal="center", vertical="center")
+        c.border = _CELL_BORDER
+    ws.row_dimensions[_INQ_HEADER_ROW].height = 22
+
+    for i, e in enumerate(rows):
+        label = answer_status(run_result, e)
+        check = e.get("answer_check") or {}
+        ws.append([label, str(e.get("order_id") or ""), e.get("recipient_name") or "", e.get("site") or "",
+                   str(e.get("order_date") or "")[:10], str(e.get("posted_at") or "")[:10],
+                   e.get("message") or "", check.get("answered_on") or "",
+                   inquiry_answers.answer_text_of(e), inquiry_answers.site_state_of(e),
+                   e.get("product_url") or ""])
+        row = ws[ws.max_row]
+        badge_fill, badge_font, row_fill = _ANS_COLORS.get(label, ("5F6368", "FFFFFF", "FFFFFF"))
+        group_end = (i + 1 == len(rows)
+                     or _ans_sort_key(run_result, rows[i + 1])[0] != _ans_sort_key(run_result, e)[0])
+        border = Border(left=_THIN, right=_THIN, top=_THIN,
+                        bottom=_GROUP_LINE if group_end else _THIN)
+        for c in row:
+            c.fill = PatternFill("solid", fgColor=row_fill)
+            c.border = border
+            c.alignment = Alignment(vertical="center")
+        badge = row[_ANS_COL_STATE]
+        badge.fill = PatternFill("solid", fgColor=badge_fill)
+        badge.font = Font(bold=True, color=badge_font)
+        badge.alignment = Alignment(horizontal="center", vertical="center")
+        row[_ANS_COL_ORDER_ID].number_format = _TEXT_FORMAT
+        answer_cell = row[_ANS_COL_ANSWER]
+        answer_cell.alignment = Alignment(wrap_text=True, vertical="center")
+        if answer_cell.value:
+            answer_cell.font = _ANSWER_FONT
+        row[_ANS_COL_SITE_STATE].alignment = Alignment(wrap_text=True, vertical="center")
+
+    for i, width in enumerate(ANSWERS_WIDTHS, start=1):
+        ws.column_dimensions[get_column_letter(i)].width = width
+    ws.freeze_panes = f"A{_INQ_HEADER_ROW + 1}"
+    ws.auto_filter.ref = (f"A{_INQ_HEADER_ROW}:{get_column_letter(last_col)}"
+                          f"{max(ws.max_row, _INQ_HEADER_ROW)}")
 
 
 def _write_inquiry_summary(ws, run_result: InquiryRun, now: datetime) -> None:
@@ -706,11 +838,30 @@ def _write_inquiry_summary(ws, run_result: InquiryRun, now: datetime) -> None:
         row[1].font = Font(bold=True)
         row[1].alignment = Alignment(horizontal="center", vertical="center")
 
+    if run_result.answer_entries:
+        _write_summary_band(ws, ws.max_row + 2, f"'{ANSWERS_SHEET_NAME}' 시트 - 전에 남긴 문의의 답변/상태")
+        counts = answer_counts(run_result)
+        for label in _ANS_ORDER:
+            ws.append([label, counts[label], _ANS_ACTIONS[label]])
+            row = ws[ws.max_row]
+            badge_fill, badge_font, row_fill = _ANS_COLORS[label]
+            for c in row[:3]:
+                c.fill = PatternFill("solid", fgColor=row_fill)
+                c.border = _CELL_BORDER
+                c.alignment = Alignment(vertical="center", wrap_text=True)
+            row[0].fill = PatternFill("solid", fgColor=badge_fill)
+            row[0].font = Font(bold=True, color=badge_font)
+            row[0].alignment = Alignment(horizontal="center", vertical="center")
+            row[1].font = Font(bold=True)
+            row[1].alignment = Alignment(horizontal="center", vertical="center")
+
     _write_summary_band(ws, ws.max_row + 2, "실행 정보")
     info = [("실행 시각", f"{now:%Y-%m-%d %H:%M:%S}"),
             ("문의 기준", f"송장조회 결과 엑셀 '{STALE_SHEET_NAME}' 시트의 지난 일수 {TARGET_DAYS_TEXT} 건"),
             ("읽은 결과 엑셀", str(run_result.excel_path or "")),
             ("문의 장부", str(LEDGER_PATH))]
+    if run_result.answer_lines:
+        info.append(("답변 확인", "\n".join(run_result.answer_lines)))
     if run_result.stopped_reason:
         info.append(("멈춘 이유", run_result.stopped_reason))
     for name, value in info:
@@ -725,12 +876,12 @@ def _write_inquiry_summary(ws, run_result: InquiryRun, now: datetime) -> None:
 
 def save_result_excel(run_result: InquiryRun, *, out_dir: Path | None = None,
                       log: LogFn = print) -> Path | None:
-    """이번 문의 결과를 바탕화면 '문의결과_시각.xlsx'로 남긴다.
+    """이번 문의 결과와 전에 남긴 문의의 답변/상태('문의내역' 시트)를 바탕화면 '문의결과_시각.xlsx'로 남긴다.
 
-    결과가 한 건도 없으면(엑셀이 없어 시작도 못 함) 만들지 않는다. 저장에
+    결과도 확인한 문의도 한 건 없으면(엑셀이 없어 시작도 못 함) 만들지 않는다. 저장에
     실패해도 문의 결과 자체를 덮으면 안 되므로 경고 한 줄만 남기고 None.
     """
-    if not run_result.results:
+    if not run_result.results and not run_result.answer_entries:
         return None
     out_dir = out_dir or RESULT_DIR
     path = out_dir / f"문의결과_{datetime.now():%Y%m%d_%H%M%S}.xlsx"
@@ -740,5 +891,12 @@ def save_result_excel(run_result: InquiryRun, *, out_dir: Path | None = None,
         log(f"경고: 문의 결과 엑셀을 저장하지 못했습니다 - {e}")
         return None
     run_result.result_excel_path = saved
-    log(f"문의 결과 엑셀: {saved}")
+    sheets = []
+    if run_result.results:
+        sheets.append(f"'{INQUIRY_SHEET_NAME}' {len(run_result.results)}건")
+    if run_result.answer_entries:
+        counts = answer_counts(run_result)
+        sheets.append(f"'{ANSWERS_SHEET_NAME}' {len(run_result.answer_entries)}건"
+                      f" (새 답변 {counts['새 답변']}, 답변대기 {counts['답변대기']})")
+    log(f"문의 결과 엑셀: {saved} ({', '.join(sheets)})")
     return saved

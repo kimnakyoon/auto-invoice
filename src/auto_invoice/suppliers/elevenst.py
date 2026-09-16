@@ -37,16 +37,21 @@
 
 from __future__ import annotations
 
+import contextlib
 import os
 import re
+from datetime import date, datetime
 from urllib.parse import parse_qs, urlparse
 
 from dotenv import load_dotenv
 from playwright.sync_api import BrowserContext, Page
+from playwright.sync_api import Error as PlaywrightError
+from playwright.sync_api import TimeoutError as PlaywrightTimeoutError
 
 from ..models import TrackingResult
 from . import common
 from .base import (
+    AlreadyInquired,
     BlockedError,
     ParseError,
     TrackingNotAvailableYet,
@@ -316,15 +321,7 @@ def get_tracking(
     order_no = extract_order_no(product_url)
     page = context.new_page()
     try:
-        page.goto(product_url, wait_until="domcontentloaded")
-
-        if _looks_like_login_page(page):
-            common.safe_print("[11st] 로그인 세션이 없어 자동 로그인을 시도합니다.")
-            if not _auto_login(page):
-                raise BlockedError("11번가 자동 로그인 후에도 로그인 페이지에서 벗어나지 못했습니다.")
-            page.goto(product_url, wait_until="domcontentloaded")
-            if _looks_like_login_page(page):
-                raise BlockedError("11번가 로그인 후에도 여전히 로그인 페이지입니다.")
+        _goto_logged_in(page, product_url)
 
         # 화면이 아직 덜 그려진 채로 읽으면 '아직 미발급'으로 잘못 넘길 수 있다
         # (조용히 틀리는 쪽이라 특히 위험하다). 그 주문의 주문번호가 화면에
@@ -335,3 +332,318 @@ def get_tracking(
         return with_order_date(page, lambda: _scrape_tracking_from_page(context, page, order_no, order_option))
     finally:
         page.close()
+
+
+# ---------------------------------------------------------------------------
+# 1:1 문의 남기기 / 답변 확인 (inquiry.py, inquiry_answers.py) - 사용자 요청 2026-09-16
+# ---------------------------------------------------------------------------
+# 사람이 하던 순서: 주문상세 → 왼쪽 메뉴 [주문/배송조회] → 그 주문의 [배송문의] → 팝업(내용
+# 칸에 "주문번호 : N / 상품명 : ..."이 미리 적혀 있다)에 "○○○ 배송 언제 시작하나요?"를
+# 이어 적고 [등록] → 왼쪽 메뉴 [상품 Q&A]에서 올라갔는지 확인.
+#
+# 실측(2026-09-16):
+# - [배송문의]는 javascript:goQnaWrite(ordNo, prdNo, prdNm, isEmart) - 숨은 폼 forQnaFrm
+#   (orderNo·prdNo·prdNm, acceptCharset euc-kr)을 새 창으로 POST해 상품문의 폼
+#   (ProductQnaForm.tmall?method=insertProductQnAForm&...&qnaPathLoc=private)을 연다. 주문목록에
+#   그 주문이 있어야 버튼이 보이고(배송중·배송준비중에만, 배송완료는 [판매자문의]뿐) 기본
+#   목록은 최근 주문만 보여주므로, 여기서는 주문상세(product_url)에서 상품번호(a.product_info의
+#   content-no)와 상품명을 읽어 같은 폼을 우리가 직접 POST한다 - 새 창을 잡을 필요도 없다.
+# - 폼(frmMain)은 euc-kr 문서. 내용 textarea#brdInfoCont에 "주문번호 : N\n상품명 : ...\n"이
+#   미리 들어 있고(사용자 지시: 그대로 두고 문구를 이어 적는다), 답변수신 메일은 채워져 있으며
+#   [등록](#btnSave)은 내용 검사 → 개인정보 필터(동기 ajax, 걸리면 비밀글 alert) →
+#   ProductQnaInsert.tmall?method=insertProductQnA 로 POST한다. 미리 적힌 문구에 주문번호가
+#   들어 있어서 문의내역에서 우리 문의를 주문번호로 바로 찾을 수 있다.
+# - [상품 Q&A](MyProductQnaAction.tmall?method=getMyProductQnaList)는 POST/GET 어느 쪽이든
+#   startDate·endDate(YYYY/MM/DD)·answerStatus(ALL)·curPage로 10건씩 최신순, euc-kr 응답.
+#   줄마다 상태(Icon_1 미답변 / Icon_2 답변완료)·viewContent('contentArea_i','문의번호')·
+#   작성일, 접힌 영역 #contentArea_i에 질문(dl.question dt)과 답변(dl.answer 첫 dd 본문,
+#   다음 dd "(답변일 : YYYY-MM-DD HH:MM)")이 있다. 전체 건수는 스크립트의
+#   parseInt('N')(totalCount).
+QNA_FORM_URL = ("https://www.11st.co.kr/product/ProductQnaForm.tmall?method=insertProductQnAForm"
+                "&isSSL=Y&hostUrl=www.11st.co.kr&isSohoPrd=false&qnaPathLoc=private")
+QNA_INSERT_URL_MARK = "ProductQnaInsert.tmall"
+QNA_LIST_URL = "https://www.11st.co.kr/product/MyProductQnaAction.tmall?method=getMyProductQnaList"
+QNA_CONTENT_SELECTOR = "#brdInfoCont"
+QNA_SUBMIT_SELECTOR = "#btnSave"
+QNA_PAGE_SIZE = 10
+QNA_MAX_PAGES = 5            # 최대 50건 - 조회 기간을 주문일부터로 좁히므로 보통 한 쪽이다.
+QNA_STEP_WAIT_MS = 10 * 1000
+QNA_HISTORY_TRIES = 3        # 등록 직후 목록에 아직 없으면 잠깐 뒤 다시 본다.
+QNA_HISTORY_RETRY_GAP_SEC = 1.5
+PRODUCT_INFO_SELECTOR = "a.product_info[ord-no='{order_no}']"
+QNA_ORDER_NO_PATTERN = re.compile(r"주문번호\s*:\s*(\d+)")
+QNA_TOTAL_PATTERN = re.compile(r"var totalCount\s*=\s*parseInt\('(\d+)'\)")
+QNA_ROW_PATTERN = re.compile(
+    r'<span class="Icon_\d">\s*<span>\s*(?P<state>[^<]*?)\s*</span>\s*</span>.*?'
+    r"viewContent\('contentArea_(?P<idx>\d+)','(?P<id>\d+)'.*?</button>.*?"
+    r"<td><p>(?P<written>\d{4}-\d{2}-\d{2} \d{2}:\d{2})</p></td>", re.S)
+QNA_QUESTION_PATTERN = re.compile(r'<dl class="question">\s*<dt>(.*?)</dt>', re.S)
+QNA_ANSWER_BLOCK_PATTERN = re.compile(r'<dl class="answer">(.*?)</dl>', re.S)
+QNA_ANSWER_TEXT_PATTERN = re.compile(r"<dd>(.*?)</dd>", re.S)
+QNA_ANSWER_DATE_PATTERN = re.compile(r"답변일\s*:\s*(\d{4}-\d{2}-\d{2}(?: \d{2}:\d{2})?)")
+
+
+def _inquiry_text(recipient_name: str) -> str:
+    return f"{recipient_name.strip()} 배송 언제 시작하나요?"
+
+
+def _goto_logged_in(page: Page, url: str) -> None:
+    """주소를 열고, 로그인 화면이면 자동 로그인한 뒤 다시 연다 (get_tracking과 같은 경로)."""
+    page.goto(url, wait_until="domcontentloaded")
+    if _looks_like_login_page(page):
+        common.safe_print("[11st] 로그인 세션이 없어 자동 로그인을 시도합니다.")
+        if not _auto_login(page):
+            raise BlockedError("11번가 자동 로그인 후에도 로그인 페이지에서 벗어나지 못했습니다.")
+        page.goto(url, wait_until="domcontentloaded")
+        if _looks_like_login_page(page):
+            raise BlockedError("11번가 로그인 후에도 여전히 로그인 페이지입니다.")
+
+
+def _fetch_qna_page(context: BrowserContext, since: date, page_no: int) -> str | None:
+    """[상품 Q&A] 목록 한 쪽(HTML, euc-kr을 푼 것). 로그인이 풀렸거나 못 읽으면 None."""
+    try:
+        response = context.request.post(QNA_LIST_URL, form={
+            "flag": "myPrdQna", "curPage": str(page_no), "memNo": "0", "answerStatus": "ALL",
+            "searchGubun": "01", "searchTxt": "",
+            "startDate": since.strftime("%Y/%m/%d"), "endDate": date.today().strftime("%Y/%m/%d"),
+        })
+    except Exception:  # noqa: BLE001 - 통신 실패는 '못 읽음'
+        return None
+    if not response.ok or "login.11st.co.kr" in response.url:
+        return None
+    html = response.body().decode("cp949", "replace")
+    return html if 'name="frmMain"' in html else None
+
+
+def _qna_rows(html: str) -> list[dict]:
+    """목록 HTML의 줄마다 {inquiry_id, state, written_at, question, order_no, answer, answered_on}."""
+    rows: list[dict] = []
+    for m in QNA_ROW_PATTERN.finditer(html):
+        block_m = re.search(rf'<div id="contentArea_{m.group("idx")}".*?</td>', html, re.S)
+        block = block_m.group(0) if block_m else ""
+        q = QNA_QUESTION_PATTERN.search(block)
+        question = common.html_to_text(q.group(1)) if q else ""
+        answer = answered_on = None
+        a = QNA_ANSWER_BLOCK_PATTERN.search(block)
+        if a:
+            dds = QNA_ANSWER_TEXT_PATTERN.findall(a.group(1))
+            answer = common.html_to_text(dds[0]) if dds else None
+            d = QNA_ANSWER_DATE_PATTERN.search(a.group(1))
+            answered_on = d.group(1) if d else None
+        o = QNA_ORDER_NO_PATTERN.search(question)
+        rows.append({
+            "inquiry_id": m.group("id"),
+            "state": m.group("state").strip(),
+            "written_at": datetime.strptime(m.group("written"), "%Y-%m-%d %H:%M"),
+            "question": question,
+            "order_no": o.group(1) if o else None,
+            "answer": answer or None,
+            "answered_on": answered_on,
+        })
+    return rows
+
+
+def _same_message(question: str, message: str) -> bool:
+    return re.sub(r"\s+", "", message) in re.sub(r"\s+", "", question)
+
+
+def _find_listed_qna(context: BrowserContext, order_no: str, message: str, since: date, *,
+                     max_pages: int = QNA_MAX_PAGES, inquiry_id: str | None = None,
+                     first_html: str | None = None) -> dict | None:
+    """[상품 Q&A]에서 since 이후에 쓴, 이 주문번호가 적힌 우리 문구의 문의를 찾는다 (최신순).
+
+    문의번호(inquiry_id)가 있으면 그 줄이면 바로 맞는다. 목록을 못 읽으면 ParseError -
+    모르는 채로 등록하지 않는다.
+    """
+    for page_no in range(1, max_pages + 1):
+        html = first_html if (page_no == 1 and first_html is not None) else _fetch_qna_page(context, since, page_no)
+        if html is None:
+            raise ParseError("[상품 Q&A] 목록을 읽지 못했습니다 (로그인 세션이 없거나 화면이 바뀜).")
+        rows = _qna_rows(html)
+        if not rows:
+            return None
+        for row in rows:
+            if row["written_at"].date() < since:
+                return None
+            if (inquiry_id and row["inquiry_id"] == inquiry_id) or (
+                    row["order_no"] == order_no and _same_message(row["question"], message)):
+                return row
+        total_m = QNA_TOTAL_PATTERN.search(html)
+        total = int(total_m.group(1)) if total_m else 0
+        if page_no * QNA_PAGE_SIZE >= total:
+            return None
+    return None
+
+
+def _describe_listed(row: dict) -> str:
+    return f"{row['state'] or '상태 모름'} {row['written_at']:%Y-%m-%d %H:%M} (문의번호 {row['inquiry_id']})"
+
+
+def _confirm_qna_listed(context: BrowserContext, order_no: str, message: str) -> str:
+    """[상품 Q&A] 첫 쪽에 이 주문의 우리 문의가 오늘 자로 올라갔는지 확인한다."""
+    for attempt in range(1, QNA_HISTORY_TRIES + 1):
+        found = _find_listed_qna(context, order_no, message, date.today(), max_pages=1)
+        if found is not None:
+            return _describe_listed(found)
+        if attempt < QNA_HISTORY_TRIES:
+            common.sleep(QNA_HISTORY_RETRY_GAP_SEC)
+    raise ParseError(
+        f"[등록]을 눌렀지만 [상품 Q&A]에서 확인되지 않았습니다. 다시 남기기 전에 11번가 "
+        f"나의 11번가 → 상품 Q&A에 '{message}'가 있는지 직접 확인해주세요.")
+
+
+def _order_date_of(order_no: str) -> date:
+    """주문번호 앞 8자리가 주문일(YYYYMMDD) - 20260915101097648은 2026-09-15 주문."""
+    try:
+        return datetime.strptime(order_no[:8], "%Y%m%d").date()
+    except ValueError:
+        raise ParseError(f"주문번호에서 주문일을 읽을 수 없습니다 (ordNo={order_no}).") from None
+
+
+ORDER_ITEMS_START = "주문상품정보"
+ORDER_ITEMS_END = "배송지 정보"
+
+
+def _order_items_text(area_text: str) -> str:
+    """주문상세 본문에서 '주문 상품 정보' 표(번호·상품/옵션정보·…·주문/배송상태) 구간만."""
+    start = area_text.find(ORDER_ITEMS_START)
+    end = area_text.find(ORDER_ITEMS_END, start if start >= 0 else 0)
+    if start < 0:
+        return area_text
+    return area_text[start:end] if end > start else area_text[start:]
+
+
+def _read_product(page: Page, order_no: str) -> tuple[str, str]:
+    """주문상세의 상품 링크(a.product_info)에서 (상품번호, 상품명)."""
+    link = page.locator(PRODUCT_INFO_SELECTOR.format(order_no=order_no)).first
+    try:
+        link.wait_for(state="attached", timeout=common.ORDER_RENDER_WAIT_MS)
+    except PlaywrightTimeoutError:
+        raise ParseError(f"주문상세에서 상품 정보를 찾지 못했습니다 (ordNo={order_no}).") from None
+    prd_no = (link.get_attribute("content-no") or "").strip()
+    prd_nm = next((ln.strip() for ln in link.inner_text().splitlines() if ln.strip()), "")
+    if not prd_no or not prd_nm:
+        raise ParseError(f"주문상세의 상품번호/상품명을 읽지 못했습니다 (ordNo={order_no}, prdNo={prd_no!r}).")
+    return prd_no, prd_nm
+
+
+OPEN_QNA_FORM_JS = """([url, orderNo, prdNo, prdNm]) => {
+    const f = document.createElement('form');
+    f.method = 'post'; f.action = url; f.acceptCharset = 'euc-kr';
+    for (const [k, v] of [['orderNo', orderNo], ['prdNo', prdNo], ['prdNm', prdNm]]) {
+        const i = document.createElement('input'); i.type = 'hidden'; i.name = k; i.value = v; f.appendChild(i);
+    }
+    document.body.appendChild(f); f.submit();
+}"""
+
+
+def _open_qna_form(page: Page, order_no: str, prd_no: str, prd_nm: str) -> str:
+    """[배송문의]가 여는 상품문의 폼을 같은 탭에 열고, 미리 적힌 내용을 돌려준다."""
+    with page.expect_navigation(wait_until="domcontentloaded", timeout=QNA_STEP_WAIT_MS):
+        page.evaluate(OPEN_QNA_FORM_JS, [QNA_FORM_URL, order_no, prd_no, prd_nm])
+    if _looks_like_login_page(page):
+        raise BlockedError("상품문의 폼을 여는데 로그인 화면으로 넘어갔습니다.")
+    try:
+        page.locator(QNA_CONTENT_SELECTOR).wait_for(state="visible", timeout=QNA_STEP_WAIT_MS)
+    except PlaywrightTimeoutError:
+        raise ParseError(f"상품문의 폼이 뜨지 않았습니다 (url={page.url}).") from None
+    prefilled = page.locator(QNA_CONTENT_SELECTOR).input_value()
+    if order_no not in prefilled:
+        raise ParseError(f"상품문의 폼에 미리 적힌 내용에 이 주문번호가 없습니다 (ordNo={order_no}, 내용={prefilled!r}).")
+    return prefilled
+
+
+def post_inquiry(context: BrowserContext, product_url: str, recipient_name: str,
+                 headless: bool = False) -> str:
+    """[배송문의] 폼에 "○○○ 배송 언제 시작하나요?"를 이어 적어 [등록]하고, [상품 Q&A]에서 확인한 문구를 돌려준다.
+
+    주문상세에서 취소/품절이면 남기지 않고, 받는사람이 수령인과 다르면 엉뚱한 주문이라
+    멈춘다. [상품 Q&A]에 이 주문의 같은 문의가 주문일 이후에 이미 있으면 AlreadyInquired.
+    미리 적힌 "주문번호 : N / 상품명 : ..."은 그대로 두고 그 아래 줄에 문구를 적는다(사용자
+    지시). 등록 뒤 [상품 Q&A] 첫 쪽에 오늘 자로 올라갔는지 확인한다.
+    """
+    order_no = extract_order_no(product_url)
+    message = _inquiry_text(recipient_name)
+    order_date = _order_date_of(order_no)
+    page = context.new_page()
+    try:
+        _goto_logged_in(page, product_url)
+        if not common.wait_for_text(page, order_no, common.ORDER_RENDER_WAIT_MS):
+            raise ParseError(f"주문상세가 그려지지 않았습니다 (ordNo={order_no}).")
+        area_text = _order_area_text(page)
+        # 취소/품절 판정은 '주문 상품 정보' 표 구간만 본다 - 왼쪽 메뉴의 "취소/반품/교환 신청"과
+        # 안내문의 "준비"가 본문 전체에는 늘 있어 raise_if_cancelled가 헛짚는다(2026-09-16 실측).
+        raise_if_cancelled(_order_items_text(area_text), order_no)
+        if recipient_name.strip() and recipient_name.strip() not in area_text:
+            raise ParseError(f"주문상세의 받는사람이 수령인 '{recipient_name}'과 다릅니다 (ordNo={order_no}).")
+        prd_no, prd_nm = _read_product(page, order_no)
+
+        existing = _find_listed_qna(context, order_no, message, order_date)
+        if existing is not None:
+            raise AlreadyInquired(f"[상품 Q&A]에 이미 같은 문의가 있습니다: {_describe_listed(existing)}")
+
+        prefilled = _open_qna_form(page, order_no, prd_no, prd_nm)
+        content = prefilled if prefilled.endswith("\n") else prefilled + "\n"
+        content += message
+        box = page.locator(QNA_CONTENT_SELECTOR)
+        box.fill(content)
+        if box.input_value() != content:
+            raise ParseError("문의 내용이 입력되지 않았습니다.")
+
+        dialogs: list[tuple[str, str]] = []
+
+        def _on_dialog(dialog) -> None:
+            dialogs.append((dialog.type, dialog.message))
+            dialog.accept()   # 개인정보 탐지 안내(비밀글 전환)·완료 안내 모두 닫는다
+
+        page.on("dialog", _on_dialog)
+        page.locator(QNA_SUBMIT_SELECTOR).click()
+        with contextlib.suppress(PlaywrightTimeoutError, PlaywrightError):
+            page.wait_for_url(lambda url: QNA_INSERT_URL_MARK in url, wait_until="commit",
+                              timeout=QNA_STEP_WAIT_MS)
+        # 등록 응답이 alert이나 화면 글자로 오면 사유에 같이 적는다(없어도 목록 확인이 기준).
+        with contextlib.suppress(PlaywrightError):
+            page.wait_for_load_state("domcontentloaded", timeout=QNA_STEP_WAIT_MS)
+        blocked = [m for t, m in dialogs if "입력" in m and ("불가" in m or "하세요" in m)]
+        if blocked:
+            raise ParseError(f"[등록]이 거부되었습니다: {blocked[0]}")
+        listed = _confirm_qna_listed(context, order_no, message)
+        # 실측 alert 두 개: "상품 Q&A에 개인정보로 탐지되는 내용이 포함되어 있어 비밀글로 게시됩니다.
+        # 개인정보 탐지 항목:이름," 그리고 "등록 완료 되었습니다." - 완료 문구만 앞에 싣고 비밀글은 표시만.
+        done = next((m.strip().splitlines()[0] for _, m in dialogs if "완료" in m), "등록")
+        secret = " (비밀글)" if any("비밀글" in m for _, m in dialogs) else ""
+        return f"{done}{secret} · 상품 Q&A 확인: {listed}"
+    finally:
+        page.close()
+
+
+def fetch_inquiry_answer(context: BrowserContext, product_url: str, recipient_name: str, *,
+                         since: date, inquiry_id: str | None = None, headless: bool = False) -> dict | None:
+    """이 주문에 남긴 상품 Q&A의 상태·답변 - {inquiry_id, state, written_on, answer, answered_on}, 없으면 None.
+
+    [상품 Q&A] 목록(request)으로 세션을 확인하고(없으면 화면을 열어 자동 로그인) 주문일부터의
+    목록에서 이 주문번호가 적힌 우리 문구의 줄을 찾는다 - 목록에 답변까지 같이 오므로
+    상세를 열 일이 없다.
+    """
+    order_no = extract_order_no(product_url)
+    message = _inquiry_text(recipient_name)
+    html = _fetch_qna_page(context, since, 1)
+    if html is None:
+        page = context.new_page()
+        try:
+            _goto_logged_in(page, QNA_LIST_URL)
+        finally:
+            page.close()
+        html = _fetch_qna_page(context, since, 1)
+        if html is None:
+            raise BlockedError("11번가 [상품 Q&A]를 읽지 못했습니다 (로그인 세션이 없습니다).")
+    found = _find_listed_qna(context, order_no, message, since, inquiry_id=inquiry_id, first_html=html)
+    if found is None:
+        return None
+    return {
+        "inquiry_id": found["inquiry_id"],
+        "state": found["state"],
+        "written_on": f"{found['written_at']:%Y-%m-%d}",
+        "answer": found["answer"],
+        "answered_on": (found["answered_on"] or "")[:10] or None,
+    }

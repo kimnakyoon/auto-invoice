@@ -1,9 +1,9 @@
-"""남긴 1:1 문의에 공급사 답변이 달렸는지 확인해 장부에 적고, 송장조회 결과 엑셀의 '사유' 칸에 싣는다.
+"""남긴 1:1 문의에 공급사 답변이 달렸는지 확인해 장부에 적고, 문의 결과 엑셀의 '문의내역' 시트에 싣는다.
 
 왜 필요한가: [문의] 버튼으로 "○○○ 배송 언제 시작하나요?"를 남기면 공급사가
 하루 안팎에 "9/15까지 재고 확보 후 발송" 같은 답을 단다. 그 답을 보려면 사람이
 사이트마다 문의내역을 열어야 했다. 다음 날 [문의]를 누를 때 그 답을 같이 가져와
-결과 엑셀에 붙여두면 '주문일지연'에 남은 건을 기다리면 되는지 한눈에 판단할 수 있다.
+문의 결과 엑셀에 모아두면 '주문일지연'에 남은 건을 기다리면 되는지 한눈에 판단할 수 있다.
 
 언제 확인하나 - [문의] 버튼(inquiry.run)을 눌렀을 때다 (사용자 요청 2026-09-11 - 그 전엔
 송장조회가 조회 직후에 했다). 문의를 남기는 김에 전에 남긴 문의의 답을 읽는다:
@@ -22,11 +22,14 @@
     상세를 열고, 없으면 등록 때와 같은 방법으로 문의내역을 뒤진다.
   - 결과는 장부 항목의 answer_check에 적는다 {checked_at, state, inquiry_id, answer,
     answered_on, problem}. 답변이 온 문의는 다시 묻지 않는다(답변이 바뀌는 일은 없다).
-  - update_excel이 [문의]가 읽은 송장조회 결과 엑셀(바탕화면 최신)의 두 시트 '사유' 칸에
-    원래 사유 아래 줄로 "[문의 답변 2026.09.11] ..."(진한 녹색) 또는
-    "[문의 09-10 남김 - 답변대기]"를 제자리에서 붙인다(result_excel.compose_reason). 전에
-    붙인 메모는 떼고 다시 붙여 여러 번 돌려도 한 줄만 남는다.
-  - scripts/check_answers.py는 같은 확인을 [문의] 없이 따로 돌린다.
+  - 확인이 끝나면 최근 ANSWER_LOOKBACK_DAYS일 안에 남긴 문의 전부(recent_entries - 답변
+    받은 것·답변대기·확인 못 함·오늘 남긴 것)를 문의 결과 엑셀(바탕화면 문의결과_*.xlsx)의
+    '문의내역' 시트에 한 줄씩 싣는다(inquiry.write_inquiry_excel). 송장조회 결과 엑셀은
+    건드리지 않는다 - 사용자 요청(2026-09-16): "송장조회결과 엑셀에 정리하지 말고 문의내역
+    엑셀에 정리해줘". 그 전에는 update_excel이 송장조회 결과 엑셀 두 시트의 '사유' 칸에
+    "[문의 답변 ...]" 메모를 제자리에서 붙였는데(엑셀이 열려 있으면 못 고쳤다) 그 경로는 지웠다.
+  - scripts/check_answers.py는 같은 확인을 [문의] 없이 따로 돌리고 '문의내역' 시트만 든
+    문의 결과 엑셀을 새로 만든다.
 
 읽기만 한다 - 문의내역 목록·상세는 GET(롯데아이몰 상세 레이어·NS홈쇼핑 상세는 화면이
 쓰는 조회용 POST)이고 등록 주소는 건드리지 않는다. 롯데온은 화면에서 항목을 펼치면
@@ -40,26 +43,22 @@ import re
 import time
 from concurrent.futures import ThreadPoolExecutor
 from datetime import date, datetime, timedelta
-from pathlib import Path
 from typing import Callable
 
-from openpyxl import load_workbook
 from playwright.sync_api import sync_playwright
 
 from . import browser as browser_mod
 from .inquiry import LEDGER_LOCK, LEDGER_PATH, load_ledger, posted_order_ids, save_ledger
-from .result_excel import SHEET_NAME, STALE_SHEET_NAME, compose_reason, strip_note, style_reason_cell
 from .suppliers import common
 from .suppliers.base import AdapterError, BlockedError
 from .suppliers.registry import get_adapter
 
 # 이보다 오래전에 남긴 문의는 더 묻지 않는다 - 그때쯤이면 주문이 나갔거나 취소됐다.
 ANSWER_LOOKBACK_DAYS = 14
-# 사유 칸에 싣는 답변 글자 수 상한 - 사이트 안내문이 길어도 핵심은 앞쪽에 있다.
+# '문의내역' 시트 '답변' 칸에 싣는 답변 글자 수 상한 - 사이트 안내문이 길어도 핵심은 앞쪽에 있다.
 ANSWER_MAX_CHARS = 700
 # 어댑터 확인 문구에서 문의번호를 꺼내는 표식 ("... (문의번호 20538665, 배송/배송일정)").
 INQUIRY_ID_PATTERN = re.compile(r"문의번호\s*(\d+)")
-NOTE_PREFIX = "[문의"
 
 LogFn = Callable[[str], None]
 
@@ -97,19 +96,58 @@ def needs_check(entry: dict, today: date | None = None, *, force: bool = False) 
     return posted is not None and (today or date.today()) - posted <= timedelta(days=ANSWER_LOOKBACK_DAYS)
 
 
-def note_for(entry: dict) -> str:
-    """사유 칸에 붙일 메모(답변은 여러 줄) - result_excel.compose_reason이 원래 사유 아래에 붙인다."""
+# 문의 결과 엑셀 '문의내역' 시트의 '상태' 칸 (inquiry.write_inquiry_excel이 색을 입힌다).
+STATE_NEW_ANSWER = "새 답변"     # 이번 실행에서 처음 읽은 답변
+STATE_ANSWERED = "답변"          # 전 실행에서 이미 읽어둔 답변
+STATE_WAITING = "답변대기"
+STATE_UNCHECKED = "확인 못 함"   # 사이트를 못 읽었다 (로그인·화면 변경 등)
+STATE_TODAY = "오늘 남김"        # 오늘 남긴 문의 - 답이 있을 수 없어 묻지 않았다
+
+
+def status_of(entry: dict, *, new_ids: set[str] | frozenset[str] = frozenset(),
+              today: date | None = None) -> str:
+    """장부 항목 하나의 '상태' 칸 글자."""
     check = entry.get("answer_check") or {}
-    posted = str(entry.get("posted_at") or "")[:10]
-    posted_short = posted[5:] if len(posted) == 10 else posted
     if check.get("answer"):
-        when = f" {check['answered_on'].replace('-', '.')}" if check.get("answered_on") else ""
-        return f"{NOTE_PREFIX} 답변{when}] {_shorten(condense_answer(check['answer'], str(entry.get('message') or '')))}"
+        return STATE_NEW_ANSWER if str(entry.get("order_id")) in new_ids else STATE_ANSWERED
     if check.get("problem"):
-        return f"{NOTE_PREFIX} {posted_short} 남김 - 답변 확인 못 함: {check['problem']}]"
-    if check.get("state"):
-        return f"{NOTE_PREFIX} {posted_short} 남김 - {check['state']}]"
-    return f"{NOTE_PREFIX} {posted_short} 남김 - 답변 아직 확인 안 함]"
+        return STATE_UNCHECKED
+    if not check and _posted_on(entry) == (today or date.today()):
+        return STATE_TODAY
+    return STATE_WAITING
+
+
+def site_state_of(entry: dict) -> str:
+    """사이트가 보여준 문의 상태 그대로('접수완료'·'답변준비중'·'미답변' ...), 못 읽었으면 그 사유."""
+    check = entry.get("answer_check") or {}
+    if check.get("problem"):
+        return f"확인 못 함: {check['problem']}"
+    if not check:
+        return "아직 확인 안 함"
+    return str(check.get("state") or "")
+
+
+def answer_text_of(entry: dict) -> str:
+    """'답변' 칸 - 인사말을 걷어낸 핵심 문장만(condense_answer), 길면 자른다. 원문은 장부에 그대로."""
+    check = entry.get("answer_check") or {}
+    if not check.get("answer"):
+        return ""
+    return _shorten(condense_answer(check["answer"], str(entry.get("message") or "")))
+
+
+def recent_entries(by_id: dict[str, dict], *, today: date | None = None) -> list[dict]:
+    """'문의내역' 시트에 실을 장부 항목 - 최근 ANSWER_LOOKBACK_DAYS일 안에 남긴 문의 전부.
+
+    답변을 받은 것도 싣는다(답변대기만 보이면 답이 온 건이 시트에서 사라져 사람이 다시
+    찾아야 한다). 그보다 오래된 문의는 needs_check도 더 묻지 않으므로 시트에서도 뺀다.
+    """
+    today = today or date.today()
+    out: list[dict] = []
+    for entry in by_id.values():
+        posted = _posted_on(entry)
+        if posted is not None and today - posted <= timedelta(days=ANSWER_LOOKBACK_DAYS):
+            out.append(entry)
+    return out
 
 
 def _shorten(text: str) -> str:
@@ -122,7 +160,7 @@ def _shorten(text: str) -> str:
 # --------------------------------------------------------------------------
 # 답변에서 인사말·상투구를 걷어내고 핵심 문장만 남기기 (사용자 요청 2026-09-11)
 # --------------------------------------------------------------------------
-# 장부에는 답변 원문을 그대로 두고 사유 칸에 실을 때만 줄인다 - 규칙을 고쳐도 다시
+# 장부에는 답변 원문을 그대로 두고 시트에 실을 때만 줄인다 - 규칙을 고쳐도 다시
 # 읽어올 필요가 없다. 규칙은 2026-09-11까지 받은 답변 51건(7개 사이트)으로 맞췄다:
 #   - 줄을 문장으로 나눈다. 사이트가 문장 중간에서 줄을 끊어 보내기도 해서(GS샵
 #     "먼저 문의하신 내용에 대해 바로 확인해" / "드리지 못해 죄송합니다.") 마침표·
@@ -375,7 +413,7 @@ def _first_line(text: str, limit: int = 80) -> str:
 
 
 # --------------------------------------------------------------------------
-# 결과에 싣기
+# [문의]가 사이트별 브라우저를 닫기 전에 부르는 확인, 실행 전후 비교용 도우미
 # --------------------------------------------------------------------------
 
 def check_site_with_context(site: str, adapter, context, *, headless: bool,
@@ -408,47 +446,3 @@ def answered_ids(by_id: dict[str, dict]) -> set[str]:
 
 def ledger_by_id() -> dict[str, dict]:
     return _ledger_by_id()
-
-
-def update_excel(path: str | Path, by_id: dict[str, dict]) -> int:
-    """이미 저장된 송장조회 결과 엑셀의 '사유' 칸에 문의 메모를 제자리에서 붙인다 (고친 칸 수).
-
-    두 시트('송장조회결과'·'주문일지연') 모두, '마켓 주문번호'가 장부에 있는 줄만.
-    전에 붙인 메모("[문의 ...]" 첫 줄)는 떼고 새로 붙여 여러 번 돌려도 한 줄만 남는다.
-    """
-    path = Path(path)
-    wb = load_workbook(path)
-    changed = 0
-    try:
-        for sheet_name in (SHEET_NAME, STALE_SHEET_NAME):
-            if sheet_name not in wb.sheetnames:
-                continue
-            ws = wb[sheet_name]
-            header_row, col_id, col_reason = _find_columns(ws)
-            if header_row is None:
-                continue
-            for row in ws.iter_rows(min_row=header_row + 1):
-                order_id = str(row[col_id].value or "").strip()
-                entry = by_id.get(order_id)
-                if entry is None:
-                    continue
-                cell = row[col_reason]
-                note = note_for(entry)
-                new_value = compose_reason(note, strip_note(str(cell.value or "")))
-                if cell.value != new_value:
-                    cell.value = new_value
-                    style_reason_cell(cell, note)
-                    changed += 1
-        if changed:
-            wb.save(path)
-    finally:
-        wb.close()
-    return changed
-
-
-def _find_columns(ws) -> tuple[int | None, int, int]:
-    for row in ws.iter_rows(min_row=1, max_row=5):
-        values = [str(c.value).strip() if c.value is not None else "" for c in row]
-        if "마켓 주문번호" in values and "사유" in values:
-            return row[0].row, values.index("마켓 주문번호"), values.index("사유")
-    return None, -1, -1
